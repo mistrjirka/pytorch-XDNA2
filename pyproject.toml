@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=78"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch-xdna2"
+version = "0.1.0"
+description = "Experimental first-class PyTorch device backend for AMD XDNA2 / Ryzen AI"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "torch>=2.14,<2.15",
+  "ninja>=1.11",
+]
+keywords = ["pytorch", "amd", "xdna", "xdna2", "ryzen-ai", "npu"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.scripts]
+torch-xdna2-build = "xdna_train._build:main"
+
+[tool.setuptools.packages.find]
+include = ["xdna_train*"]
+
+[tool.setuptools.package-data]
+xdna_train = [
+  "_native/*.cpp",
+  "_vendor/xrt_shim/*.cpp",
+  "_vendor/xrt_shim/*.h",
+  "_artifacts/train_gemm_64x32x96/*",
+  "_artifacts/conv3x3_patch40_128/*",
+  "_artifacts/fullframe_strix_b4_m96/*",
+]

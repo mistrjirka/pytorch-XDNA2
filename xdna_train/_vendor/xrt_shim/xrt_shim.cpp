@@ -1,0 +1,535 @@
+// C ABI shim over the C++ xrt:: classes. Mirrors the exact dispatch sequence our pyxrt runners
+// use (register_xclbin -> hw_context -> kernel -> bo -> variadic kernel() run). docs/12.
+#include "xrt_shim.h"
+#include <string>
+#include <utility>
+#include <exception>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <vector>
+
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_bo.h"
+#include "xrt/xrt_kernel.h"
+#include "xrt/xrt_hw_context.h"
+#include "xrt/experimental/xrt_xclbin.h"
+#include "xrt/experimental/xrt_elf.h"
+#include "xrt/experimental/xrt_ext.h"
+#include "xrt/experimental/xrt_module.h"
+
+// Build the one-entry {"priority": value} cfg_param map for a QOS_PRIORITY_* level (never called
+// with QOS_PRIORITY_NONE -- every call site below branches NONE to the plain 2-arg hw_context ctor
+// instead, so the unconfigured path never goes through the cfg_param overload at all and stays
+// byte-identical to before QoS existed).
+static xrt::hw_context::cfg_param_type qos_cfg(int qos_priority) {
+  xrt::hw_context::cfg_param_type cfg;
+  cfg["priority"] = static_cast<uint32_t>(qos_priority);
+  return cfg;
+}
+
+struct ShimDevice { xrt::device dev; };
+struct ShimKernel { xrt::hw_context ctx; xrt::kernel kern; };
+struct ShimBo     { xrt::bo bo; };
+// `args` participates in ownership of the argument BOs: set_arg records only a device address
+// and a bo_id set, so neither XRT nor the driver keeps them alive for the run's lifetime.
+struct ShimRun    { xrt::run run; std::vector<xrt::bo> args; std::string label; };
+// Full-ELF kernel: own the elf + hw_context so they outlive the ext::kernel that references them.
+struct ShimElfKernel { xrt::elf elf; xrt::hw_context ctx; xrt::ext::kernel kern; std::string name; };
+// Persistent-context path: ctx owns the partition (built once); ShimElfKernel2 borrows it.
+struct ShimElfCtx     { xrt::elf base_elf; xrt::hw_context ctx; };
+struct ShimElfKernel2 { xrt::elf elf; xrt::module mod; xrt::ext::kernel kern; std::string name; };
+
+// Per-sub-step timing of the ELF load path (attribution of the per-token re-registration cost),
+// gated by env XRT_SHIM_ELF_TIMING so it is a true no-op in production.
+static bool elf_timing() {
+  static const bool on = std::getenv("XRT_SHIM_ELF_TIMING") != nullptr;
+  return on;
+}
+using shim_clock = std::chrono::steady_clock;
+static double ms_since(shim_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(shim_clock::now() - t0).count();
+}
+
+// Sized, not guessed -- and deliberately far above any healthy dispatch rather than tight, because
+// this deadline exists to bound a HANG, not to police latency. Reference points on this box: the
+// shipped Qwen3-0.6B fused decode step is one dispatch at ~55 ms, the fused Whisper decode step
+// 43.91 ms, and Gemma-4-12B projects ~236 ms/token. 30 s is ~127x the largest of those, so it
+// cannot fire on healthy work, and it turns an unbounded stall into a 30 s named error.
+// shim_dispatch_max_wait_ms() reports the longest wait actually observed, so this can be re-sized
+// against measurement instead of re-argued.
+#define NPU_DISPATCH_TIMEOUT_DEFAULT_MS 30000
+
+// --- dispatch deadline ------------------------------------------------------------------------
+// EVERY wait here used to be a bare `wait2()`, which XRT defines as `wait2(milliseconds{0})` --
+// "default block until run completes" (xrt/xrt_kernel.h). With no deadline, a wedged graph stalls
+// the host forever and the ONLY thing that can end it is the kernel driver's TDR: our diagnosis of
+// a hang was entirely the driver's, and any stall class the TDR does not cover had no owner at all.
+// That is what int4+FUSE_MLP_O=1 cost to find.
+//
+// The two abnormal outcomes are kept DISTINCT on purpose:
+//   cv_status::timeout -> the device never answered inside the deadline (wedged / deadlocked)
+//   command_error      -> the device answered abnormally, ERT_CMD_STATE_* in the message
+// Collapsing them would lose the difference between a deadlock and a rejection, which is the
+// first thing anyone debugging either one needs to know.
+//
+// NPU_DISPATCH_TIMEOUT_MS overrides the default; 0 restores the old block-forever behaviour for
+// anyone deliberately waiting on something longer than the default.
+static long dispatch_timeout_ms() {
+  static const long ms = [] {
+    const char* e = std::getenv("NPU_DISPATCH_TIMEOUT_MS");
+    if (!e || !*e) return static_cast<long>(NPU_DISPATCH_TIMEOUT_DEFAULT_MS);
+    char* end = nullptr;
+    long v = std::strtol(e, &end, 10);
+    return (end && *end == '\0' && v >= 0) ? v : static_cast<long>(NPU_DISPATCH_TIMEOUT_DEFAULT_MS);
+  }();
+  return ms;
+}
+
+static const char* ert_state_name(ert_cmd_state st) {
+  switch (st) {
+    case ERT_CMD_STATE_NEW:        return "NEW";
+    case ERT_CMD_STATE_QUEUED:     return "QUEUED";
+    case ERT_CMD_STATE_RUNNING:    return "RUNNING";
+    case ERT_CMD_STATE_COMPLETED:  return "COMPLETED";
+    case ERT_CMD_STATE_ERROR:      return "ERROR";
+    case ERT_CMD_STATE_ABORT:      return "ABORT";
+    case ERT_CMD_STATE_SUBMITTED:  return "SUBMITTED";
+    case ERT_CMD_STATE_TIMEOUT:    return "TIMEOUT";
+    case ERT_CMD_STATE_NORESPONSE: return "NORESPONSE";
+    case ERT_CMD_STATE_SKERROR:    return "SKERROR";
+    case ERT_CMD_STATE_SKCRASHED:  return "SKCRASHED";
+    default:                       return "UNKNOWN";
+  }
+}
+
+// Longest single wait this process has seen, so the default above can be RE-SIZED against measured
+// dispatches rather than re-guessed. Read via shim_dispatch_max_wait_ms().
+static std::atomic<double> g_max_wait_ms{0.0};
+
+static void note_wait(double ms) {
+  double prev = g_max_wait_ms.load(std::memory_order_relaxed);
+  while (ms > prev && !g_max_wait_ms.compare_exchange_weak(prev, ms, std::memory_order_relaxed)) {}
+}
+
+double shim_dispatch_max_wait_ms(void) { return g_max_wait_ms.load(std::memory_order_relaxed); }
+
+// `what` names the dispatch (entry point, plus the kernel/design name where the caller has one).
+// A timeout that cannot say WHICH dispatch wedged is only marginally better than a hang.
+// `run.state()` is itself a device call and can throw once the command is in a bad state, so it is
+// only ever read defensively -- a diagnostic that takes the process down is not a diagnostic.
+static std::string state_or(const xrt::run& run, const char* fallback) {
+  try { return ert_state_name(run.state()); } catch (...) { return fallback; }
+}
+
+static void wait_deadline(const xrt::run& run, const std::string& what) {
+  const long ms = dispatch_timeout_ms();
+  auto t0 = shim_clock::now();
+  if (ms == 0) {                    // opt-out: original block-forever semantics
+    run.wait2();
+    note_wait(ms_since(t0));
+    return;
+  }
+  // MEASURED on this box (XRT + amdxdna): an EXPIRED deadline does NOT come back as
+  // cv_status::timeout the way xrt_kernel.h's contract reads. The qds backend throws
+  // "qds_device::wait() unexpected command state" from inside wait2, because the command is still
+  // RUNNING when the wait gives up. So both exits are handled, and both are re-thrown with the
+  // same attribution -- relying on the documented return value alone would have produced a
+  // deadline that fires and still cannot say what wedged, which is most of the original problem.
+  try {
+    if (run.wait2(std::chrono::milliseconds{ms}) == std::cv_status::timeout) {
+      throw std::runtime_error("wait2 returned cv_status::timeout");
+    }
+  } catch (const xrt::run::command_error& e) {
+    // The device ANSWERED, abnormally. This is not a deadline event and must not be reported as
+    // one: it can arrive long before `ms` (a driver TDR is the common case), and "the device
+    // rejected this" is a different finding from "the device is wedged". The ert state is the
+    // whole payload, so it leads.
+    throw std::runtime_error(
+        "dispatch '" + what + "' failed: command state "
+        + ert_state_name(e.get_command_state()) + " after "
+        + std::to_string(static_cast<long>(ms_since(t0))) + " ms: " + e.what());
+  } catch (const std::exception& e) {
+    // MEASURED on this box (XRT + amdxdna): an EXPIRED deadline does NOT come back as
+    // cv_status::timeout the way xrt_kernel.h's contract reads. The qds backend throws
+    // "qds_device::wait() unexpected command state" from inside wait2, because the command is
+    // still RUNNING when the wait gives up. Relying on the documented return value alone would
+    // have produced a deadline that fires and still cannot say what wedged -- most of the
+    // original problem. Elapsed time, not the exception type, decides which story this is.
+    //
+    // NOTE the command is still IN FLIGHT on the deadline path: XRT documents that after a
+    // timeout it is the caller's responsibility to abort it, and we do not -- there is no abort
+    // in this ABI, and this path reports a wedged device rather than recovering from one. Treat
+    // the process as unusable for further dispatches once it fires.
+    const long waited = static_cast<long>(ms_since(t0));
+    const std::string where = "dispatch '" + what + "' (command state "
+                            + state_or(run, "UNREADABLE") + ", waited "
+                            + std::to_string(waited) + " ms): " + e.what();
+    if (waited + 1 >= ms) {
+      throw std::runtime_error(
+          "deadline: " + where + " -- NPU_DISPATCH_TIMEOUT_MS changes it, 0 disables it");
+    }
+    throw std::runtime_error("wait failed before the deadline: " + where);
+  }
+  note_wait(ms_since(t0));
+}
+
+static thread_local std::string g_err;
+static void set_err(const char* s) { g_err = s ? s : "null"; }
+
+const char* shim_last_error(void) { return g_err.c_str(); }
+
+// Variadic so commas inside the body aren't parsed as extra macro arguments.
+#define GUARD_PTR(...) \
+  try { __VA_ARGS__ } \
+  catch (const std::exception& e) { set_err(e.what()); return nullptr; } \
+  catch (...) { set_err("unknown C++ exception"); return nullptr; }
+
+#define GUARD_INT(...) \
+  try { __VA_ARGS__ } \
+  catch (const std::exception& e) { set_err(e.what()); return -1; } \
+  catch (...) { set_err("unknown C++ exception"); return -1; }
+
+ShimDevice* shim_device_open(unsigned int index) {
+  GUARD_PTR( return new ShimDevice{ xrt::device(index) }; )
+}
+void shim_device_close(ShimDevice* d) { delete d; }
+
+ShimKernel* shim_kernel_load(ShimDevice* d, const char* xclbin_path, const char* kernel_name,
+                             int qos_priority) {
+  GUARD_PTR(
+    xrt::xclbin xb(std::string(xclbin_path ? xclbin_path : ""));
+    auto uuid = d->dev.register_xclbin(xb);
+    // QOS_PRIORITY_NONE keeps the exact old 2-arg ctor (no cfg_param overload involved at all),
+    // so an empty/default caller is byte-identical to before QoS existed.
+    xrt::hw_context ctx = (qos_priority == QOS_PRIORITY_NONE)
+                             ? xrt::hw_context(d->dev, uuid)
+                             : xrt::hw_context(d->dev, uuid, qos_cfg(qos_priority));
+    std::string name = (kernel_name && kernel_name[0])
+                         ? std::string(kernel_name)
+                         : xb.get_kernels().front().get_name();
+    xrt::kernel k(ctx, name);
+    return new ShimKernel{ std::move(ctx), std::move(k) };
+  )
+}
+void shim_kernel_close(ShimKernel* k) { delete k; }
+
+int shim_kernel_group_id(ShimKernel* k, int arg_index) {
+  GUARD_INT( return static_cast<int>(k->kern.group_id(arg_index)); )
+}
+
+static xrt::bo::flags to_flags(int f) {
+  switch (f) {
+    case 1:  return xrt::bo::flags::cacheable;
+    case 2:  return xrt::bo::flags::host_only;
+    default: return xrt::bo::flags::normal;
+  }
+}
+
+ShimBo* shim_bo_alloc(ShimDevice* d, ShimKernel* /*k*/, size_t nbytes, int flag, int group_id) {
+  GUARD_PTR( return new ShimBo{ xrt::bo(d->dev, nbytes, to_flags(flag), group_id) }; )
+}
+// Sub-buffer view: a device-side [offset, offset+size) window of `parent`, sharing its memory
+// (XRT-native xrt::bo(parent, size, offset)). Lets a kernel read/write a slice of a larger BO with
+// no host round-trip -- e.g. a chunk of a chunk-major fc2 A buffer, or a KV-cache slice.
+ShimBo* shim_bo_subbuffer(ShimBo* parent, size_t size, size_t offset) {
+  GUARD_PTR( return new ShimBo{ xrt::bo(parent->bo, size, offset) }; )
+}
+void shim_bo_free(ShimBo* b) { delete b; }
+
+int shim_bo_write(ShimBo* b, const void* src, size_t nbytes, size_t offset) {
+  GUARD_INT( b->bo.write(src, nbytes, offset); return 0; )
+}
+int shim_bo_read(ShimBo* b, void* dst, size_t nbytes, size_t offset) {
+  GUARD_INT( b->bo.read(dst, nbytes, offset); return 0; )
+}
+int shim_bo_sync_to_device(ShimBo* b) {
+  GUARD_INT( b->bo.sync(XCL_BO_SYNC_BO_TO_DEVICE); return 0; )
+}
+int shim_bo_sync_from_device(ShimBo* b) {
+  GUARD_INT( b->bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE); return 0; )
+}
+
+int shim_run_matmul8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                     ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace) {
+  GUARD_INT(
+    auto run = k->kern(opcode, instr->bo, instr_count,
+                       a->bo, b->bo, c->bo, tmp->bo, trace->bo);
+    wait_deadline(run, "matmul8");
+    return 0;
+  )
+}
+
+int shim_run_dwconv6(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                     ShimBo* x, ShimBo* w, ShimBo* y) {
+  GUARD_INT(
+    auto run = k->kern(opcode, instr->bo, instr_count, x->bo, w->bo, y->bo);
+    wait_deadline(run, "dwconv6");
+    return 0;
+  )
+}
+
+// MHA host ABI: kernel(opcode, instr, instr_count, Q, K, V, O) — 4 data BOs (the IRON MHA op's
+// rt.sequence(Q, K, V, O)). Same structure as shim_run_matmul8, one fewer data arg.
+int shim_run_mha7(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                  ShimBo* q, ShimBo* kk, ShimBo* v, ShimBo* o) {
+  GUARD_INT(
+    auto run = k->kern(opcode, instr->bo, instr_count, q->bo, kk->bo, v->bo, o->bo);
+    wait_deadline(run, "mha7");
+    return 0;
+  )
+}
+
+// BD-onchip conveyor ABI: (opcode, instr, count, qpv, p, k, v, ctx). 5 data BOs (the 4th conveyor
+// stage adds p), mirroring the IRON rt.sequence(qpv, p, k, v, ctx). Blocks until the run completes.
+int shim_run_bd8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                 ShimBo* qpv, ShimBo* p, ShimBo* kk, ShimBo* v, ShimBo* ctx) {
+  GUARD_INT(
+    auto run = k->kern(opcode, instr->bo, instr_count, qpv->bo, p->bo, kk->bo, v->bo, ctx->bo);
+    wait_deadline(run, "bd8");
+    return 0;
+  )
+}
+
+// Generic xclbin/instr dispatch: (opcode, instr, instr_count, data[0..n_data)). k->kern(...) above
+// needs a compile-time-fixed arg count, so this builds the run explicitly (same set_arg loop
+// shim_run_elf uses) with the (opcode, instr, count) prefix every fixed-arity variant shares.
+int shim_run_kernel(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                    ShimBo* const* data, size_t n_data) {
+  GUARD_INT(
+    xrt::run run(k->kern);
+    run.set_arg(0, opcode);
+    run.set_arg(1, instr->bo);
+    run.set_arg(2, instr_count);
+    for (size_t i = 0; i < n_data; ++i) {
+      run.set_arg(static_cast<int>(3 + i), data[i]->bo);
+    }
+    run.start();
+    wait_deadline(run, "kernel");
+    return 0;
+  )
+}
+
+// xrt::kernel::operator() constructs a run AND starts it (enqueues the command); the wait is
+// separate. So building the run here = the async "start"; the host returns immediately while the
+// NPU executes. Same arg layout as shim_run_matmul8.
+ShimRun* shim_run_matmul8_start(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                                ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace) {
+  GUARD_PTR(
+    auto run = k->kern(opcode, instr->bo, instr_count,
+                       a->bo, b->bo, c->bo, tmp->bo, trace->bo);
+    return new ShimRun{ std::move(run),
+                        { instr->bo, a->bo, b->bo, c->bo, tmp->bo, trace->bo },
+                        "matmul8_start" };
+  )
+}
+
+int shim_run_wait(ShimRun* r) {
+  GUARD_INT(
+    wait_deadline(r->run, r->label);
+    return 0;
+  )
+}
+
+void shim_run_free(ShimRun* r) { delete r; }
+
+// --- Fused full-ELF dispatch (IRON FusedMLIROperator path) ---------------------------------------
+
+ShimElfKernel* shim_elf_kernel_load(ShimDevice* d, const void* elf_bytes, size_t nbytes,
+                                    const char* kernel_name, int qos_priority) {
+  GUARD_PTR(
+    const bool tm = elf_timing();
+    auto t0 = shim_clock::now();
+    // xrt::elf copies the bytes (data,size ctor), so the caller's buffer can be reused/patched.
+    xrt::elf elf(elf_bytes, nbytes);
+    double t_elf = tm ? ms_since(t0) : 0.0; auto t1 = shim_clock::now();
+    // QOS_PRIORITY_NONE keeps the plain 2-arg ctor; the cfg_param overload additionally requires
+    // an access_mode, so declare `shared` (the 2-arg ctor's implicit default) to keep the ONLY
+    // change the priority field.
+    xrt::hw_context ctx = (qos_priority == QOS_PRIORITY_NONE)
+                             ? xrt::hw_context(d->dev, elf)
+                             : xrt::hw_context(d->dev, elf, qos_cfg(qos_priority),
+                                               xrt::hw_context::access_mode::shared);
+    double t_ctx = tm ? ms_since(t1) : 0.0; auto t2 = shim_clock::now();
+    std::string name = (kernel_name && kernel_name[0]) ? std::string(kernel_name)
+                                                       : std::string("main:sequence");
+    xrt::ext::kernel k(ctx, name);
+    double t_kern = tm ? ms_since(t2) : 0.0;
+    if (tm) {
+      std::fprintf(stderr, "[XRT_SHIM_ELF] load: elf=%.3f hw_context=%.3f ext_kernel=%.3f ms\n",
+                   t_elf, t_ctx, t_kern);
+    }
+    return new ShimElfKernel{ std::move(elf), std::move(ctx), std::move(k), name };
+  )
+}
+
+void shim_elf_kernel_close(ShimElfKernel* k) { delete k; }
+
+int shim_run_elf(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) {
+  GUARD_INT(
+    xrt::run run(k->kern);
+    for (size_t i = 0; i < n_bos; ++i) {
+      run.set_arg(static_cast<int>(i), bos[i]->bo);
+    }
+    run.start();
+    wait_deadline(run, "elf:" + k->name);
+    return 0;
+  )
+}
+
+// Async "start" of the full-ELF dispatch: set args + run.start() enqueues the command and returns
+// immediately; the host registers the next token's position-only ELF while the NPU runs, then
+// shim_run_wait blocks for completion. Same ShimRun handle as the matmul async path.
+ShimRun* shim_run_elf_start(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) {
+  GUARD_PTR(
+    xrt::run run(k->kern);
+    std::vector<xrt::bo> args;
+    args.reserve(n_bos);
+    for (size_t i = 0; i < n_bos; ++i) {
+      run.set_arg(static_cast<int>(i), bos[i]->bo);
+      args.push_back(bos[i]->bo);
+    }
+    run.start();
+    return new ShimRun{ std::move(run), std::move(args), "elf_start:" + k->name };
+  )
+}
+
+// --- Persistent-hw_context path ---------------------------------------------------------------
+
+ShimElfCtx* shim_elf_ctx_open(ShimDevice* d, const void* base_elf, size_t nbytes, int qos_priority) {
+  GUARD_PTR(
+    xrt::elf elf(base_elf, nbytes);
+    // partition config ONCE — the recurring cost we hoist out. This context stays resident for the
+    // life of the caller's token loop, so it is the context where a background/best-effort caller
+    // actually wants QOS_PRIORITY_LOW declared (see xrt_shim.h).
+    xrt::hw_context ctx = (qos_priority == QOS_PRIORITY_NONE)
+                             ? xrt::hw_context(d->dev, elf)
+                             : xrt::hw_context(d->dev, elf, qos_cfg(qos_priority),
+                                               xrt::hw_context::access_mode::shared);
+    return new ShimElfCtx{ std::move(elf), std::move(ctx) };
+  )
+}
+
+void shim_elf_ctx_close(ShimElfCtx* c) { delete c; }
+
+ShimElfKernel2* shim_elf_kernel_rebind(ShimElfCtx* c, const void* elf_bytes, size_t nbytes,
+                                       const char* kernel_name) {
+  GUARD_PTR(
+    const bool tm = elf_timing();
+    auto t0 = shim_clock::now();
+    xrt::elf elf(elf_bytes, nbytes);
+    double t_elf = tm ? ms_since(t0) : 0.0; auto t1 = shim_clock::now();
+    xrt::module mod(elf);
+    double t_mod = tm ? ms_since(t1) : 0.0; auto t2 = shim_clock::now();
+    std::string name = (kernel_name && kernel_name[0]) ? std::string(kernel_name)
+                                                       : std::string("main:sequence");
+    xrt::ext::kernel k(c->ctx, mod, name);   // bind patched module onto the resident context
+    double t_kern = tm ? ms_since(t2) : 0.0;
+    if (tm) {
+      std::fprintf(stderr, "[XRT_SHIM_ELF] rebind: elf=%.3f module=%.3f ext_kernel=%.3f ms\n",
+                   t_elf, t_mod, t_kern);
+    }
+    return new ShimElfKernel2{ std::move(elf), std::move(mod), std::move(k), name };
+  )
+}
+
+void shim_elf_kernel2_close(ShimElfKernel2* k) { delete k; }
+
+int shim_run_elf2(ShimElfKernel2* k, ShimBo* const* bos, size_t n_bos) {
+  GUARD_INT(
+    xrt::run run(k->kern);
+    for (size_t i = 0; i < n_bos; ++i) {
+      run.set_arg(static_cast<int>(i), bos[i]->bo);
+    }
+    run.start();
+    wait_deadline(run, "elf2:" + k->name);
+    return 0;
+  )
+}
+
+// --- Resident full-ELF runner with ctrl-scratchpad parameters --------------------------------------
+
+struct ShimElfResident {
+  xrt::elf elf;
+  xrt::hw_context ctx;
+  xrt::ext::kernel kern;
+  xrt::run run;
+  std::string name;       // kernel/design name, so a wedged dispatch names itself
+  xrt::bo scratchpad;     // ctrl scratchpad BO (from the run), empty if the ELF has none
+  uint8_t* scratch_map;   // host mapping of the scratchpad (nullptr if none)
+  size_t scratch_size;
+};
+
+ShimElfResident* shim_elf_resident_open(ShimDevice* d, const void* elf_bytes, size_t nbytes,
+                                        const char* kernel_name, int qos_priority) {
+  GUARD_PTR(
+    xrt::elf elf(elf_bytes, nbytes);
+    xrt::hw_context ctx = (qos_priority == QOS_PRIORITY_NONE)
+                             ? xrt::hw_context(d->dev, elf)
+                             : xrt::hw_context(d->dev, elf, qos_cfg(qos_priority),
+                                               xrt::hw_context::access_mode::shared);
+    std::string name = (kernel_name && kernel_name[0]) ? std::string(kernel_name)
+                                                       : std::string("main:sequence");
+    xrt::ext::kernel k(ctx, name);
+    xrt::run run(k);
+    // get_ctrl_scratchpad_bo throws if the ELF has no scratchpad section — that means this ELF is not
+    // a scratchpad-parameter build, so the caller must use the patch path. Surface as NULL.
+    xrt::bo sp = run.get_ctrl_scratchpad_bo();
+    uint8_t* mp = sp.map<uint8_t*>();
+    size_t sz = sp.size();
+    return new ShimElfResident{ std::move(elf), std::move(ctx), std::move(k), std::move(run),
+                                name, std::move(sp), mp, sz };
+  )
+}
+
+ShimElfResident* shim_elf_resident_open_named(ShimElfResident* base, const char* kernel_name) {
+  if (!base) { set_err("resident_open_named: null base"); return nullptr; }
+  GUARD_PTR(
+    // xrt::elf and xrt::hw_context are refcounted handles, so copying them here shares the ONE
+    // registered context rather than creating a second. That sharing is the whole point: a
+    // hw_context is the expensive object (16 of them device-wide) and a variant must not spend one.
+    xrt::ext::kernel k(base->ctx, std::string(kernel_name));
+    xrt::run run(k);
+    xrt::bo sp = run.get_ctrl_scratchpad_bo();
+    uint8_t* mp = sp.map<uint8_t*>();
+    size_t sz = sp.size();
+    return new ShimElfResident{ base->elf, base->ctx, std::move(k), std::move(run),
+                                std::string(kernel_name), std::move(sp), mp, sz };
+  )
+}
+
+void shim_elf_resident_close(ShimElfResident* r) { delete r; }
+
+size_t shim_elf_resident_scratchpad_size(ShimElfResident* r) {
+  return r ? r->scratch_size : 0;
+}
+
+int shim_elf_resident_bind(ShimElfResident* r, ShimBo* const* bos, size_t n_bos) {
+  GUARD_INT(
+    for (size_t i = 0; i < n_bos; ++i) {
+      r->run.set_arg(static_cast<int>(i), bos[i]->bo);
+    }
+    return 0;
+  )
+}
+
+int shim_elf_resident_write(ShimElfResident* r, size_t offset, const void* data, size_t len) {
+  GUARD_INT(
+    if (!r->scratch_map) { set_err("resident has no ctrl scratchpad"); return -1; }
+    if (offset + len > r->scratch_size) { set_err("scratchpad write out of range"); return -1; }
+    std::memcpy(r->scratch_map + offset, data, len);
+    return 0;
+  )
+}
+
+int shim_elf_resident_dispatch(ShimElfResident* r) {
+  GUARD_INT(
+    r->scratchpad.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    r->run.start();
+    wait_deadline(r->run, "resident:" + r->name);
+    return 0;
+  )
+}

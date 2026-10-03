@@ -1,0 +1,161 @@
+/* Minimal C ABI over the C++ xrt:: classes (the same surface pyxrt wraps), so Rust can drive
+ * the XDNA2 NPU via FFI without exposing C++ name-mangling/ABI. See internal notes.
+ * Every fallible call returns NULL / nonzero and stashes a message in shim_last_error(). */
+#pragma once
+#include <stddef.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct ShimDevice    ShimDevice;
+typedef struct ShimKernel    ShimKernel;
+typedef struct ShimBo        ShimBo;
+typedef struct ShimRun       ShimRun;
+typedef struct ShimElfKernel ShimElfKernel;
+
+/* xrt::hw_context::cfg_param_type "priority" values (amdxdna_uapi.h AMDXDNA_QOS_*). Passed as the
+ * qos_priority arg below; QOS_PRIORITY_NONE (-1) means "no cfg_param map at all" -- the plain 2-arg
+ * hw_context ctor, byte-identical to before QoS existed. Any other value builds a one-entry
+ * {"priority": value} map and uses the QoS-aware overload. See docs/12 (kernel kit) for the tuple's
+ * remaining fields (gops/fps/latency/...), not yet plumbed -- priority alone is independently useful
+ * (xdna-driver src/shim/hwctx.cpp:258-259 gates it before the rest of the tuple validates).
+ * qos-priority-is-a-scheduling-knob: priority reaches the firmware scheduler, not just DPM. */
+#define QOS_PRIORITY_NONE     (-1)
+#define QOS_PRIORITY_REALTIME 0x100
+#define QOS_PRIORITY_HIGH     0x180
+#define QOS_PRIORITY_NORMAL   0x200
+#define QOS_PRIORITY_LOW      0x280
+
+ShimDevice* shim_device_open(unsigned int index);
+void        shim_device_close(ShimDevice*);
+
+/* Load xclbin -> register with device -> hw_context -> kernel. NULL/empty kernel_name uses the
+ * first kernel in the xclbin (what our pyxrt runners do). qos_priority: QOS_PRIORITY_NONE for the
+ * old unconfigured context, else one of the QOS_PRIORITY_* levels above. Returns NULL on failure. */
+ShimKernel* shim_kernel_load(ShimDevice*, const char* xclbin_path, const char* kernel_name,
+                             int qos_priority);
+void        shim_kernel_close(ShimKernel*);
+int         shim_kernel_group_id(ShimKernel*, int arg_index); /* -1 on error */
+
+/* flag: 0=normal, 1=cacheable (instr), 2=host_only (data) */
+ShimBo*     shim_bo_alloc(ShimDevice*, ShimKernel*, size_t nbytes, int flag, int group_id);
+ShimBo*     shim_bo_subbuffer(ShimBo* parent, size_t size, size_t offset);
+void        shim_bo_free(ShimBo*);
+int         shim_bo_write(ShimBo*, const void* src, size_t nbytes, size_t offset); /* 0 ok */
+int         shim_bo_read (ShimBo*, void* dst, size_t nbytes, size_t offset);
+int         shim_bo_sync_to_device(ShimBo*);
+int         shim_bo_sync_from_device(ShimBo*);
+
+/* whole_array / matmul host ABI: kernel(opcode, instr, instr_count, A, B, C, tmp, trace).
+ * Creates a run, dispatches, waits for completion. 0 on success. */
+int shim_run_matmul8(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                     ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace);
+
+/* depthwise-conv1d host ABI: kernel(opcode, instr, instr_count, X, W, Y) — no tmp/trace. */
+int shim_run_dwconv6(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                     ShimBo* x, ShimBo* w, ShimBo* y);
+
+/* MHA host ABI: kernel(opcode, instr, instr_count, Q, K, V, O) — 4 data BOs. */
+int shim_run_mha7(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                  ShimBo* q, ShimBo* kk, ShimBo* v, ShimBo* o);
+
+/* BD-onchip conveyor ABI: kernel(opcode, instr, instr_count, qpv, p, K, V, ctx) — 5 data BOs
+ * (the 4th conveyor stage computes BD on-chip, adding the p input). */
+int shim_run_bd8(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                 ShimBo* qpv, ShimBo* p, ShimBo* kk, ShimBo* v, ShimBo* ctx);
+
+/* Generic xclbin/instr dispatch host ABI: kernel(opcode, instr, instr_count, data[0..n_data)).
+ * Same (opcode, instr, count) prefix as the fixed-arity variants above, but for an arbitrary
+ * data-arg count -- e.g. the S2 codec's streamed designs, which take 2 or 3 data BOs
+ * (in_tiles[, resident], out) depending on whether the design has a resident operand. */
+int shim_run_kernel(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                    ShimBo* const* data, size_t n_data);
+
+/* ASYNC split of shim_run_matmul8: _start submits the run (xrt::kernel::operator() enqueues +
+ * starts execution) and returns a run handle WITHOUT waiting, so the host can do other work (prep
+ * the next dispatch, post-process the previous) while the NPU computes. _wait blocks for completion.
+ * Returns NULL/-1 on failure (message in shim_last_error). Free the handle with shim_run_free. */
+ShimRun* shim_run_matmul8_start(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                                ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace);
+int      shim_run_wait(ShimRun*); /* 0 = completed, -1 = error/not-completed */
+/* Longest single dispatch wait this process has seen, in ms. Exists so the dispatch deadline
+   (NPU_DISPATCH_TIMEOUT_MS) can be re-sized against measured dispatches rather than re-guessed. */
+double   shim_dispatch_max_wait_ms(void);
+void     shim_run_free(ShimRun*);
+
+/* --- Fused full-ELF dispatch (the IRON FusedMLIROperator path) ----------------------------------
+ * A full ELF carries its own instructions+config (no xclbin, no insts BO). Mirrors IRON's
+ * fusion.py FullELFCallable: xrt::elf(bytes) -> hw_context(device, elf) -> ext::kernel(ctx, name).
+ * kernel_name NULL/empty defaults to "main:sequence" (IRON's device:sequence default). The ELF bytes
+ * are copied in, so the caller may patch+reload its own buffer freely. Returns NULL on failure.
+ * qos_priority: see QOS_PRIORITY_* above. */
+ShimElfKernel* shim_elf_kernel_load(ShimDevice*, const void* elf_bytes, size_t nbytes,
+                                    const char* kernel_name, int qos_priority);
+void           shim_elf_kernel_close(ShimElfKernel*);
+
+/* Dispatch a full-ELF kernel with N buffer-object args (run.set_arg(i, bo) for i in 0..n_bos),
+ * start + wait. The fused-arena ABI passes exactly 3 BOs (input, output, scratch), but this is
+ * generic-N to match IRON's variadic set_arg loop. 0 on success. */
+int shim_run_elf(ShimElfKernel*, ShimBo* const* bos, size_t n_bos);
+
+/* ASYNC split of shim_run_elf (the PIPE lever): _start submits the ELF run (set_arg + run.start())
+ * and returns a run handle WITHOUT waiting, so the host can register the NEXT token's position-only
+ * patched ELF while this dispatch executes on the NPU. Wait via shim_run_wait, free via shim_run_free
+ * (the same ShimRun handle the matmul async path uses). The ShimElfKernel and all BOs must outlive the
+ * returned ShimRun. Returns NULL on failure (message in shim_last_error). */
+ShimRun* shim_run_elf_start(ShimElfKernel*, ShimBo* const* bos, size_t n_bos);
+
+/* --- Persistent-hw_context full-ELF path (kills per-token re-registration) -----------------------
+ * The standard shim_elf_kernel_load above rebuilds the WHOLE hw_context per patched ELF — on aie2p
+ * that re-runs the NPU partition config (~20 ms/token, measured). This split builds the hw_context
+ * ONCE from a base ELF (shim_elf_ctx_open), then per token rebuilds only a lightweight xrt::module
+ * (patched bytes) + xrt::ext::kernel bound to the SAME context (shim_elf_kernel_rebind). The ctrlcode
+ * rides the ERT run packet, so a same-shape patched module reuses the resident partition. If the
+ * 20 ms is partition config (not ctrlcode upload) this removes most of it. The context must outlive
+ * every kernel rebound onto it. ShimElfKernel2 borrows the ctx; close it before the ctx. */
+typedef struct ShimElfCtx     ShimElfCtx;
+typedef struct ShimElfKernel2 ShimElfKernel2;
+/* qos_priority: see QOS_PRIORITY_* above -- this is the context that stays resident, so this is
+ * where a background/best-effort caller actually wants to declare LOW_PRIORITY. */
+ShimElfCtx*     shim_elf_ctx_open(ShimDevice*, const void* base_elf, size_t nbytes, int qos_priority);
+void            shim_elf_ctx_close(ShimElfCtx*);
+ShimElfKernel2* shim_elf_kernel_rebind(ShimElfCtx*, const void* elf_bytes, size_t nbytes,
+                                       const char* kernel_name);
+void            shim_elf_kernel2_close(ShimElfKernel2*);
+int             shim_run_elf2(ShimElfKernel2*, ShimBo* const* bos, size_t n_bos);
+
+/* --- Resident full-ELF runner with ctrl-scratchpad parameters (Option C: kills re-registration) ---
+ * Registers a CONSTANT full ELF ONCE (elf -> hw_context -> ext::kernel -> run), binds the arena BOs
+ * once, and fetches the ELF's ctrl scratchpad BO (xrt::run::get_ctrl_scratchpad_bo, valid only if the
+ * ELF was built with aiex.scratchpad_parameter). Per dispatch the host writes the per-token parameter
+ * word(s) (e.g. KV-write offset, softmax mask length) into the mapped scratchpad and dispatches — no
+ * ELF patch, no re-registration. `shim_elf_resident_open` returns NULL if the ELF has no scratchpad
+ * (so the caller can fall back). scratchpad_size()==0 likewise signals no scratchpad. */
+typedef struct ShimElfResident ShimElfResident;
+ShimElfResident* shim_elf_resident_open(ShimDevice*, const void* elf_bytes, size_t nbytes,
+                                        const char* kernel_name, int qos_priority);
+void             shim_elf_resident_close(ShimElfResident*);
+/* A SECOND named control code out of the SAME ELF, on the SAME hw_context.
+ *
+ * One full ELF can carry several runtime sequences, each emitted as its own control code and
+ * resolved by XRT as `main:<name>`; the context is registered once by the ELF, and every variant
+ * is another `xrt::ext::kernel` against it. So a caller can pre-create one resident per variant at
+ * load and pick per dispatch -- no re-registration, no second context, no artifact swap. Each
+ * variant gets its OWN run and therefore its OWN ctrl scratchpad, so bind() and the per-dispatch
+ * scratchpad writes must go to the variant that will actually be dispatched.
+ *
+ * Returns NULL if the ELF has no such kernel name (or no scratchpad, as `open`). */
+ShimElfResident* shim_elf_resident_open_named(ShimElfResident* base, const char* kernel_name);
+size_t           shim_elf_resident_scratchpad_size(ShimElfResident*);
+/* Bind the N arena BOs to run args 0..N once (same handles reused every dispatch). 0 on success. */
+int              shim_elf_resident_bind(ShimElfResident*, ShimBo* const* bos, size_t n_bos);
+/* Write `len` bytes at byte `offset` into the host-mapped ctrl scratchpad (no device sync yet). */
+int              shim_elf_resident_write(ShimElfResident*, size_t offset, const void* data, size_t len);
+/* Sync the scratchpad to device, start the bound run, wait for completion. 0 on success. */
+int              shim_elf_resident_dispatch(ShimElfResident*);
+
+const char* shim_last_error(void);
+
+#ifdef __cplusplus
+}
+#endif

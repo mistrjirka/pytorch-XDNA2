@@ -1,0 +1,9 @@
+tile=64x32x96
+dtype=bf16xbf16_f32acc_bf16out
+context=base.xclbin
+fwd=256x768x3072
+dx=256x3072x768
+dw=3072x256x768
+k_loop_rtp=1
+k_read_late=1
+wa_c_depth=1
