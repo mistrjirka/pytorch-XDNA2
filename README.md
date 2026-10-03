@@ -49,6 +49,12 @@ With uv:
 uv pip install "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
 ```
 
+Install the PyTorch build you want first (for example ROCm on AMD systems). If you are force-reinstalling only this backend and want to preserve that PyTorch build, use:
+
+```bash
+uv pip install --reinstall --no-deps "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
+```
+
 Or add it to a uv project:
 
 ```bash
@@ -125,9 +131,9 @@ It avoids materializing large decoder intermediates when the following supported
 On the development Ryzen AI 9 365 / Strix machine, XRT 2.21.75, BF16, 16 CPU threads, performance power profile, the real full-frame DRIVE `MyNet(3,1,7)` training+validation loop has recently measured approximately:
 
 ```text
-CPU BF16:               0.149 - 0.154 it/s
-XDNA BF16 core path:    ~0.183 it/s
-XDNA + virtual decoder: 0.185 - 0.186 it/s in matched ABBA runs
+CPU BF16:               0.151 - 0.155 it/s
+XDNA + virtual decoder: 0.179 - 0.182 it/s in the latest installed-package ABBA run
+Mean speedup:            ~1.18x end-to-end
 ```
 
 The metric is the notebook metric:
