@@ -46,19 +46,19 @@ The Python package does **not** install the kernel driver or XRT.
 With uv:
 
 ```bash
-uv pip install "git+https://github.com/mistrjirka/torch-xdna2.git"
+uv pip install "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
 ```
 
 Or add it to a uv project:
 
 ```bash
-uv add "git+https://github.com/mistrjirka/torch-xdna2.git"
+uv add "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
 ```
 
 With pip:
 
 ```bash
-pip install "git+https://github.com/mistrjirka/torch-xdna2.git"
+pip install "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
 ```
 
 The first import builds a small native bridge against the **exact installed PyTorch ABI** and caches it under `~/.cache/torch-xdna2/`. Validated XDNA instruction streams are bundled with the package.
