@@ -198,4 +198,4 @@ python -m xdna_train
 
 ## License
 
-No open-source license has been selected yet.
+Project code is MIT licensed. Bundled/generated third-party components retain their own licenses; see `THIRD_PARTY_NOTICES.md` and `LICENSES/`.

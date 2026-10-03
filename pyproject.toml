@@ -7,6 +7,8 @@ name = "torch-xdna2"
 version = "0.1.0"
 description = "Experimental first-class PyTorch device backend for AMD XDNA2 / Ryzen AI"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSES/*"]
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "torch>=2.14,<2.15",
