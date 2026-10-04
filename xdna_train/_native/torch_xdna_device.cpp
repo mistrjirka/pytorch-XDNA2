@@ -2382,6 +2382,22 @@ at::Tensor add_tensor_xdna(
   return out;
 }
 
+
+at::Tensor& add_out_xdna(
+    const at::Tensor& self,
+    const at::Tensor& other,
+    const at::Scalar& alpha,
+    at::Tensor& out) {
+  ensure_host_current(self);
+  ensure_host_current(other);
+  auto self_cpu = cpu_alias(self);
+  auto other_cpu = cpu_alias(other);
+  auto out_cpu = cpu_alias(out);
+  at::add_out(out_cpu, self_cpu, other_cpu, alpha);
+  mark_host_dirty(out);
+  return out;
+}
+
 bool lazy_decoder_values_enabled() {
   const char* raw = std::getenv("XDNA_LAZY_DECODER_VALUES");
   return raw != nullptr && raw[0] != 0 && std::strcmp(raw, "0") != 0;
@@ -3482,6 +3498,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("leaky_relu", TORCH_FN(leaky_relu_xdna));
   m.impl("leaky_relu_backward", TORCH_FN(leaky_relu_backward_xdna));
   m.impl("add.Tensor", TORCH_FN(add_tensor_xdna));
+  m.impl("add.out", TORCH_FN(add_out_xdna));
   m.impl("cat", TORCH_FN(cat_xdna));
   m.impl("upsample_nearest2d", TORCH_FN(upsample_nearest2d_xdna));
   m.impl("native_batch_norm", TORCH_FN(native_batch_norm_xdna));

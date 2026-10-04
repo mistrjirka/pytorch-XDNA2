@@ -85,3 +85,20 @@ def test_batch4_cpu_dw_chunking_matches_unsplit_reference(monkeypatch) -> None:
     split = backward_dw()
 
     torch.testing.assert_close(split, unsplit, rtol=0.02, atol=0.002)
+
+
+def test_add_out_matches_cpu() -> None:
+    torch.manual_seed(20261004)
+    a_cpu = (torch.randn(4, 128, 146, 141) * 0.01).bfloat16().contiguous(
+        memory_format=torch.channels_last
+    )
+    b_cpu = (torch.randn(4, 128, 146, 141) * 0.01).bfloat16().contiguous(
+        memory_format=torch.channels_last
+    )
+    a = a_cpu.to('xdna')
+    b = b_cpu.to('xdna')
+    out = torch.empty_like(a)
+    torch.add(a, b, alpha=0.5, out=out)
+    torch.xdna.synchronize()
+    expected = torch.add(a_cpu, b_cpu, alpha=0.5)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)

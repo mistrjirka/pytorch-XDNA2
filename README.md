@@ -109,6 +109,7 @@ The current backend uses PyTorch `PrivateUse1` renamed to `xdna` and provides:
 - BF16 rectangular GEMM forward/dX/dW on XDNA2;
 - BF16 3x3 Conv forward/dX families for validated training geometries;
 - channels-last layout preservation through important compatibility operations;
+- native mapped-storage `add.out` support for autograd gradient accumulation, avoiding a large generic CPU-fallback boundary;
 - CPU `dW` overlapped with dependency-critical NPU `dX` when that is faster;
 - batch-4 CPU `dW` reduction split into batch-1 oneDNN calls by default, reducing shared LPDDR/fabric pressure during NPU `dX` overlap;
 - full-frame batch-4 decoder/residual programs for the current Strix training path.
@@ -155,6 +156,8 @@ Mean speedup vs CPU:                   ~1.38x end-to-end
 In the latest package-level ABBA bracket, the q4 resident full-frame path alone averaged about 0.2038 it/s; adding the validated conv11 q4 dX path averaged about 0.2111 it/s. The large 256→128 @ 584 decoder dX itself improved from roughly 615 ms to roughly 469 ms, while preserving BF16 numerical agreement with the CPU reference.
 
 A later same-package ABBA test of the batch-split CPU dW scheduler measured 0.20295 it/s enabled versus 0.19823 it/s disabled (+2.4% throughput in that run). On the isolated 256→128 @ 584 backward region, the same change reduced median wall time from about 659 ms to about 621–623 ms while keeping the NPU dX path unchanged and preserving BF16 training loss.
+
+The next generic fallback audit found seven large `aten::add.out` calls in backward costing about 60–66 ms per step through the generic fallback. Registering a mapped-storage `add.out` implementation removed that fallback; a short interleaved NIS check measured roughly 0.2117 it/s with the native overload versus 0.2053 it/s without it, with unchanged loss.
 
 The metric is the notebook metric:
 
