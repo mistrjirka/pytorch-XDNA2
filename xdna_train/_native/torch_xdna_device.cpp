@@ -6,6 +6,14 @@
 #include <ATen/ops/convolution_ops.h>
 #include <ATen/ops/convolution_backward_ops.h>
 #include <ATen/ops/mm_ops.h>
+#include <ATen/ops/mul_ops.h>
+#include <ATen/ops/div_ops.h>
+#include <ATen/ops/sqrt_ops.h>
+#include <ATen/ops/addcmul_ops.h>
+#include <ATen/ops/addcdiv_ops.h>
+#include <ATen/ops/lerp_ops.h>
+#include <ATen/ops/sigmoid_ops.h>
+#include <ATen/ops/sub_ops.h>
 #include <ATen/ExpandUtils.h>
 #include <ATen/ops/add.h>
 #include <ATen/ops/cat.h>
@@ -2457,6 +2465,133 @@ at::Tensor& add_out_xdna(
   return out;
 }
 
+
+at::Tensor& mul_out_xdna(
+    const at::Tensor& self,
+    const at::Tensor& other,
+    at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::mul.out");
+  ensure_host_current(self);
+  ensure_host_current(other);
+  auto self_cpu = cpu_alias(self);
+  auto other_cpu = cpu_alias(other);
+  auto out_cpu = cpu_alias(out);
+  at::_ops::mul_out::call(self_cpu, other_cpu, out_cpu);
+  mark_host_dirty(out);
+  return out;
+}
+
+at::Tensor& div_out_xdna(
+    const at::Tensor& self,
+    const at::Tensor& other,
+    at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::div.out");
+  ensure_host_current(self);
+  ensure_host_current(other);
+  auto self_cpu = cpu_alias(self);
+  auto other_cpu = cpu_alias(other);
+  auto out_cpu = cpu_alias(out);
+  at::_ops::div_out::call(self_cpu, other_cpu, out_cpu);
+  mark_host_dirty(out);
+  return out;
+}
+
+at::Tensor& sqrt_out_xdna(
+    const at::Tensor& self,
+    at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::sqrt.out");
+  ensure_host_current(self);
+  auto self_cpu = cpu_alias(self);
+  auto out_cpu = cpu_alias(out);
+  at::_ops::sqrt_out::call(self_cpu, out_cpu);
+  mark_host_dirty(out);
+  return out;
+}
+
+at::Tensor& addcmul_out_xdna(
+    const at::Tensor& self,
+    const at::Tensor& tensor1,
+    const at::Tensor& tensor2,
+    const at::Scalar& value,
+    at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::addcmul.out");
+  ensure_host_current(self);
+  ensure_host_current(tensor1);
+  ensure_host_current(tensor2);
+  auto self_cpu = cpu_alias(self);
+  auto tensor1_cpu = cpu_alias(tensor1);
+  auto tensor2_cpu = cpu_alias(tensor2);
+  auto out_cpu = cpu_alias(out);
+  at::_ops::addcmul_out::call(
+      self_cpu, tensor1_cpu, tensor2_cpu, value, out_cpu);
+  mark_host_dirty(out);
+  return out;
+}
+
+at::Tensor& addcdiv_out_xdna(
+    const at::Tensor& self,
+    const at::Tensor& tensor1,
+    const at::Tensor& tensor2,
+    const at::Scalar& value,
+    at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::addcdiv.out");
+  ensure_host_current(self);
+  ensure_host_current(tensor1);
+  ensure_host_current(tensor2);
+  auto self_cpu = cpu_alias(self);
+  auto tensor1_cpu = cpu_alias(tensor1);
+  auto tensor2_cpu = cpu_alias(tensor2);
+  auto out_cpu = cpu_alias(out);
+  at::_ops::addcdiv_out::call(
+      self_cpu, tensor1_cpu, tensor2_cpu, value, out_cpu);
+  mark_host_dirty(out);
+  return out;
+}
+
+at::Tensor& lerp_scalar_out_xdna(
+    const at::Tensor& self,
+    const at::Tensor& end,
+    const at::Scalar& weight,
+    at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::lerp.Scalar_out");
+  ensure_host_current(self);
+  ensure_host_current(end);
+  auto self_cpu = cpu_alias(self);
+  auto end_cpu = cpu_alias(end);
+  auto out_cpu = cpu_alias(out);
+  at::_ops::lerp_Scalar_out::call(self_cpu, end_cpu, weight, out_cpu);
+  mark_host_dirty(out);
+  return out;
+}
+
+at::Tensor& sigmoid_out_xdna(
+    const at::Tensor& self,
+    at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::sigmoid.out");
+  ensure_host_current(self);
+  auto self_cpu = cpu_alias(self);
+  auto out_cpu = cpu_alias(out);
+  at::_ops::sigmoid_out::call(self_cpu, out_cpu);
+  mark_host_dirty(out);
+  return out;
+}
+
+at::Tensor& sub_out_xdna(
+    const at::Tensor& self,
+    const at::Tensor& other,
+    const at::Scalar& alpha,
+    at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::sub.out");
+  ensure_host_current(self);
+  ensure_host_current(other);
+  auto self_cpu = cpu_alias(self);
+  auto other_cpu = cpu_alias(other);
+  auto out_cpu = cpu_alias(out);
+  at::_ops::sub_out::call(self_cpu, other_cpu, alpha, out_cpu);
+  mark_host_dirty(out);
+  return out;
+}
+
 bool lazy_decoder_values_enabled() {
   const char* raw = std::getenv("XDNA_LAZY_DECODER_VALUES");
   return raw != nullptr && raw[0] != 0 && std::strcmp(raw, "0") != 0;
@@ -3566,6 +3701,14 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("leaky_relu_backward", TORCH_FN(leaky_relu_backward_xdna));
   m.impl("add.Tensor", TORCH_FN(add_tensor_xdna));
   m.impl("add.out", TORCH_FN(add_out_xdna));
+  m.impl("mul.out", TORCH_FN(mul_out_xdna));
+  m.impl("div.out", TORCH_FN(div_out_xdna));
+  m.impl("sqrt.out", TORCH_FN(sqrt_out_xdna));
+  m.impl("addcmul.out", TORCH_FN(addcmul_out_xdna));
+  m.impl("addcdiv.out", TORCH_FN(addcdiv_out_xdna));
+  m.impl("lerp.Scalar_out", TORCH_FN(lerp_scalar_out_xdna));
+  m.impl("sigmoid.out", TORCH_FN(sigmoid_out_xdna));
+  m.impl("sub.out", TORCH_FN(sub_out_xdna));
   m.impl("cat", TORCH_FN(cat_xdna));
   m.impl("upsample_nearest2d", TORCH_FN(upsample_nearest2d_xdna));
   m.impl("native_batch_norm", TORCH_FN(native_batch_norm_xdna));

@@ -111,6 +111,7 @@ The current backend uses PyTorch `PrivateUse1` renamed to `xdna` and provides:
 - channels-last layout preservation through important compatibility operations;
 - stride-aware view support for non-contiguous tensors when PyTorch can represent the view without copying;
 - native mapped-storage `add.out` support for autograd gradient accumulation, avoiding a large generic CPU-fallback boundary;
+- mapped-storage out-variant coverage for common AdamW/elementwise primitives (`mul`, `div`, `sqrt`, `addcmul`, `addcdiv`, `lerp`, `sigmoid`, `sub`);
 - CPU `dW` overlapped with dependency-critical NPU `dX` when that is faster;
 - batch-4 CPU `dW` reduction split into batch-1 oneDNN calls by default, reducing shared LPDDR/fabric pressure during NPU `dX` overlap;
 - full-frame batch-4 decoder/residual programs for the current Strix training path.

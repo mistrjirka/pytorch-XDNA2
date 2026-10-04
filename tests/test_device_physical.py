@@ -113,3 +113,39 @@ def test_noncontiguous_compatible_view_matches_cpu() -> None:
     expected = torch.as_strided(base_cpu, (2, 3, 4), (24, 8, 2)).view(6, 4)
     assert not sliced.is_contiguous()
     torch.testing.assert_close(viewed.cpu(), expected)
+
+
+def test_common_out_variants_match_cpu() -> None:
+    torch.manual_seed(7)
+    a_cpu = (torch.randn(8, 16) * 0.2).bfloat16()
+    b_cpu = (torch.randn(8, 16) * 0.2 + 1).bfloat16()
+    c_cpu = (torch.randn(8, 16) * 0.2 + 1).bfloat16()
+    a = a_cpu.to("xdna")
+    b = b_cpu.to("xdna")
+    c = c_cpu.to("xdna")
+
+    cases = [
+        (lambda out: torch.mul(a, b, out=out),
+         lambda out: torch.mul(a_cpu, b_cpu, out=out)),
+        (lambda out: torch.div(a, b, out=out),
+         lambda out: torch.div(a_cpu, b_cpu, out=out)),
+        (lambda out: torch.sqrt(b, out=out),
+         lambda out: torch.sqrt(b_cpu, out=out)),
+        (lambda out: torch.addcmul(a, b, c, value=0.7, out=out),
+         lambda out: torch.addcmul(a_cpu, b_cpu, c_cpu, value=0.7, out=out)),
+        (lambda out: torch.addcdiv(a, b, c, value=0.7, out=out),
+         lambda out: torch.addcdiv(a_cpu, b_cpu, c_cpu, value=0.7, out=out)),
+        (lambda out: torch.lerp(a, b, 0.3, out=out),
+         lambda out: torch.lerp(a_cpu, b_cpu, 0.3, out=out)),
+        (lambda out: torch.sigmoid(a, out=out),
+         lambda out: torch.sigmoid(a_cpu, out=out)),
+        (lambda out: torch.sub(a, b, alpha=0.5, out=out),
+         lambda out: torch.sub(a_cpu, b_cpu, alpha=0.5, out=out)),
+    ]
+    for xdna_op, cpu_op in cases:
+        out = torch.empty_like(a)
+        expected = torch.empty_like(a_cpu)
+        xdna_op(out)
+        cpu_op(expected)
+        torch.xdna.synchronize()
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
