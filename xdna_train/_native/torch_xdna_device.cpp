@@ -3303,6 +3303,47 @@ convolution_backward_overrideable_xdna(
            output_padding_v = std::move(output_padding_v),
            groups_v]() mutable {
             const std::array<bool, 3> dw_mask = {false, true, false};
+
+            // The CPU and NPU share the same LPDDR/fabric while dW and dX
+            // overlap. For the validated batch-4 training path, reducing dW
+            // one sample at a time gives oneDNN a smaller working set and
+            // lowers instantaneous memory pressure enough to improve both the
+            // CPU dW and the concurrent NPU dX critical region. Keep this
+            // tunable: 0 disables, positive values select a batch chunk.
+            int64_t batch_chunk =
+                input_cpu_keep.dim() == 4 && input_cpu_keep.size(0) == 4 ? 1 : 0;
+            if (const char* raw = std::getenv("XDNA_CPU_DW_BATCH_CHUNK")) {
+              const long parsed = std::strtol(raw, nullptr, 10);
+              batch_chunk = parsed > 0 ? parsed : 0;
+            }
+            if (batch_chunk > 0 &&
+                input_cpu_keep.dim() == 4 &&
+                go_cpu_keep.dim() == 4 &&
+                input_cpu_keep.size(0) == go_cpu_keep.size(0) &&
+                input_cpu_keep.size(0) > batch_chunk) {
+              auto accum = at::zeros(
+                  weight_cpu_keep.sizes(),
+                  weight_cpu_keep.options().dtype(at::ScalarType::Float));
+              const int64_t batch = input_cpu_keep.size(0);
+              for (int64_t b0 = 0; b0 < batch; b0 += batch_chunk) {
+                const int64_t b1 = std::min<int64_t>(batch, b0 + batch_chunk);
+                auto grads = at::_ops::convolution_backward::call(
+                    go_cpu_keep.slice(0, b0, b1),
+                    input_cpu_keep.slice(0, b0, b1),
+                    weight_cpu_keep,
+                    std::nullopt,
+                    c10::SymIntArrayRef(stride_v),
+                    c10::SymIntArrayRef(padding_v),
+                    c10::SymIntArrayRef(dilation_v),
+                    transposed,
+                    c10::SymIntArrayRef(output_padding_v),
+                    groups_v,
+                    dw_mask);
+                accum.add_(std::get<1>(grads).to(at::ScalarType::Float));
+              }
+              return accum.to(weight_cpu_keep.scalar_type());
+            }
+
             auto grads = at::_ops::convolution_backward::call(
                 go_cpu_keep,
                 input_cpu_keep,

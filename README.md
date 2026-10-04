@@ -110,6 +110,7 @@ The current backend uses PyTorch `PrivateUse1` renamed to `xdna` and provides:
 - BF16 3x3 Conv forward/dX families for validated training geometries;
 - channels-last layout preservation through important compatibility operations;
 - CPU `dW` overlapped with dependency-critical NPU `dX` when that is faster;
+- batch-4 CPU `dW` reduction split into batch-1 oneDNN calls by default, reducing shared LPDDR/fabric pressure during NPU `dX` overlap;
 - full-frame batch-4 decoder/residual programs for the current Strix training path.
 
 The bundled full-frame family is enabled automatically. The current Strix package also enables validated resident-weight / queue-pipelined fast paths for the large decoder dX family and conv11 dX when their bundled artifacts are present. Disable them independently for A/B debugging with:
@@ -123,6 +124,13 @@ Disable the full-frame backend entirely with:
 
 ```bash
 XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_CONV=0 python ...
+```
+
+For batch-4 heterogeneous Conv backward, the CPU weight-gradient reduction is split into batch-1 oneDNN calls by default. This preserves oneDNN's AVX-512 BF16 compute kernel while reducing the working set and shared memory-fabric pressure seen by concurrent NPU dX. Override or disable it with:
+
+```bash
+XDNA_CPU_DW_BATCH_CHUNK=0 python ...   # disable
+XDNA_CPU_DW_BATCH_CHUNK=2 python ...   # alternate chunk size
 ```
 
 An optional virtual concat + nearest-upsample representation is available:
@@ -145,6 +153,8 @@ Mean speedup vs CPU:                   ~1.38x end-to-end
 ```
 
 In the latest package-level ABBA bracket, the q4 resident full-frame path alone averaged about 0.2038 it/s; adding the validated conv11 q4 dX path averaged about 0.2111 it/s. The large 256→128 @ 584 decoder dX itself improved from roughly 615 ms to roughly 469 ms, while preserving BF16 numerical agreement with the CPU reference.
+
+A later same-package ABBA test of the batch-split CPU dW scheduler measured 0.20295 it/s enabled versus 0.19823 it/s disabled (+2.4% throughput in that run). On the isolated 256→128 @ 584 backward region, the same change reduced median wall time from about 659 ms to about 621–623 ms while keeping the NPU dX path unchanged and preserving BF16 training loss.
 
 The metric is the notebook metric:
 

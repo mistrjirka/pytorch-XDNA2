@@ -54,3 +54,34 @@ def test_allocator_reuses_storage() -> None:
     second = xdna_train.allocator_stats()
     assert first["fresh_allocations"] >= before["fresh_allocations"] + 1
     assert second["reuses"] >= first["reuses"] + 1
+
+
+def test_batch4_cpu_dw_chunking_matches_unsplit_reference(monkeypatch) -> None:
+    torch.manual_seed(20261004)
+    batch, cin, cout, height, width = 4, 128, 128, 146, 141
+    x_cpu = (
+        torch.randn(batch, cin, height, width) * 0.01
+    ).bfloat16().contiguous(memory_format=torch.channels_last)
+    go_cpu = (
+        torch.randn(batch, cout, height, width) * 0.01
+    ).bfloat16().contiguous(memory_format=torch.channels_last)
+    w_cpu = (torch.randn(cout, cin, 3, 3) * 0.02).bfloat16()
+
+    x = x_cpu.to('xdna')
+    go = go_cpu.to('xdna')
+    w = w_cpu.to('xdna')
+
+    def backward_dw() -> torch.Tensor:
+        _, dw, _ = torch.ops.aten.convolution_backward_overrideable(
+            go, x, w, [1, 1], [1, 1], [1, 1], False, [0, 0], 1,
+            [True, True, False],
+        )
+        torch.xdna.synchronize()
+        return dw.cpu()
+
+    monkeypatch.setenv('XDNA_CPU_DW_BATCH_CHUNK', '0')
+    unsplit = backward_dw()
+    monkeypatch.setenv('XDNA_CPU_DW_BATCH_CHUNK', '1')
+    split = backward_dw()
+
+    torch.testing.assert_close(split, unsplit, rtol=0.02, atol=0.002)
