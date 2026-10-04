@@ -23,3 +23,5 @@ layout_in=HWCblockBC32_halo_bf16_padded_width
 layout_out=YXBCout_bf16_padded_width
 cols=8
 built_extra_streams=fwd292
+fwd292_dma_schedule=q4_streaming_b
+fwd584_dma_schedule=q4_streaming_b

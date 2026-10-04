@@ -159,6 +159,8 @@ A later same-package ABBA test of the batch-split CPU dW scheduler measured 0.20
 
 The next generic fallback audit found seven large `aten::add.out` calls in backward costing about 60–66 ms per step through the generic fallback. Registering a mapped-storage `add.out` implementation removed that fallback; a short interleaved NIS check measured roughly 0.2117 it/s with the native overload versus 0.2053 it/s without it, with unchanged loss.
 
+Applying the bounded rolling-DMA schedule to the non-resident forward streams improved fwd292 from about 124 ms to about 97 ms and fwd584 from about 486 ms to about 382 ms without changing the universal XCLBIN. A clean-fork NIS ABBA measured about 0.21572 it/s with the rolled forward streams versus about 0.20995 it/s with the previous streams (+2.7%), with unchanged loss.
+
 The metric is the notebook metric:
 
 ```python
