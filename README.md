@@ -109,6 +109,7 @@ The current backend uses PyTorch `PrivateUse1` renamed to `xdna` and provides:
 - BF16 rectangular GEMM forward/dX/dW on XDNA2;
 - BF16 3x3 Conv forward/dX families for validated training geometries;
 - channels-last layout preservation through important compatibility operations;
+- stride-aware view support for non-contiguous tensors when PyTorch can represent the view without copying;
 - native mapped-storage `add.out` support for autograd gradient accumulation, avoiding a large generic CPU-fallback boundary;
 - CPU `dW` overlapped with dependency-critical NPU `dX` when that is faster;
 - batch-4 CPU `dW` reduction split into batch-1 oneDNN calls by default, reducing shared LPDDR/fabric pressure during NPU `dX` overlap;
@@ -200,6 +201,17 @@ Currently tested on:
 - BF16 training.
 
 The package pins the supported PyTorch range to 2.14.x because the native `PrivateUse1` ABI is version-sensitive. The extension is rebuilt for each Python/PyTorch/source fingerprint.
+
+## Training coverage suite
+
+The installed `torch-xdna2-coverage` command runs small real training motifs rather than inference-only operator probes. It currently covers MLP, residual CNN, U-Net-like decoder, Transformer, Mobile/depthwise, and embedding/MLP workloads. Each result reports full-step time, overload-aware generic CPU fallbacks, and XDNA handlers that still execute CPU math over mapped XRT storage.
+
+```bash
+torch-xdna2-coverage --motif all --steps 2 --threads 8
+torch-xdna2-coverage --motif transformer --json
+```
+
+Use this suite as an admission test for generic backend work: an optimization should improve the relevant motif and should not regress unrelated motifs before it is promoted.
 
 ## Development
 

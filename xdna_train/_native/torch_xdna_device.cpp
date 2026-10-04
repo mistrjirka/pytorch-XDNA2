@@ -1,6 +1,7 @@
 #include <ATen/ATen.h>
 #include <ATen/EmptyTensor.h>
 #include <ATen/InferSize.h>
+#include <ATen/TensorUtils.h>
 #include <ATen/native/CPUFallback.h>
 #include <ATen/ops/convolution_ops.h>
 #include <ATen/ops/convolution_backward_ops.h>
@@ -824,17 +825,19 @@ at::Tensor reshape_alias_xdna(
 at::Tensor view_xdna(
     const at::Tensor& self,
     c10::SymIntArrayRef requested_size) {
-  TORCH_CHECK(
-      self.is_contiguous(),
-      "XDNA view currently requires contiguous input; use contiguous() first");
   auto size = at::infer_size_dv(requested_size, self.sym_numel());
-  at::SymDimVector stride(size.size());
-  c10::SymInt running = 1;
-  for (int64_t i = static_cast<int64_t>(size.size()) - 1; i >= 0; --i) {
-    stride[static_cast<size_t>(i)] = running;
-    running = running * size[static_cast<size_t>(i)];
-  }
-  return make_alias(self, size, stride, self.sym_storage_offset());
+  auto stride = at::detail::computeStride(
+      self.sym_sizes(), self.sym_strides(), c10::SymIntArrayRef(size));
+  TORCH_CHECK(
+      stride.has_value(),
+      "view size is not compatible with input tensor's size and stride "
+      "(at least one dimension spans across two contiguous subspaces). "
+      "Use .reshape(...) instead.");
+  return make_alias(
+      self,
+      c10::SymIntArrayRef(size),
+      c10::SymIntArrayRef(*stride),
+      self.sym_storage_offset());
 }
 
 const at::Tensor& resize_xdna_(
@@ -2305,9 +2308,62 @@ at::Tensor xdna_empty_like_layout(const at::Tensor& reference) {
       format);
 }
 
+struct MappedCpuStat {
+  uint64_t calls = 0;
+  uint64_t total_ns = 0;
+};
+
+std::mutex& mapped_cpu_stats_mutex() {
+  static auto* value = new std::mutex();
+  return *value;
+}
+
+std::unordered_map<std::string, MappedCpuStat>& mapped_cpu_stats_map() {
+  static auto* value =
+      new std::unordered_map<std::string, MappedCpuStat>();
+  return *value;
+}
+
+bool profile_mapped_cpu() {
+  static const bool enabled = []() {
+    const char* raw = std::getenv("XDNA_PROFILE_MAPPED_CPU");
+    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+  }();
+  return enabled;
+}
+
+void record_mapped_cpu_ns(const char* name, uint64_t ns) {
+  if (!profile_mapped_cpu()) return;
+  std::lock_guard<std::mutex> guard(mapped_cpu_stats_mutex());
+  auto& stat = mapped_cpu_stats_map()[name];
+  ++stat.calls;
+  stat.total_ns += ns;
+}
+
+class ScopedMappedCpu {
+ public:
+  explicit ScopedMappedCpu(const char* name)
+      : name_(name), enabled_(profile_mapped_cpu()) {
+    if (enabled_) start_ = std::chrono::steady_clock::now();
+  }
+  ~ScopedMappedCpu() {
+    if (!enabled_) return;
+    const auto end = std::chrono::steady_clock::now();
+    const uint64_t ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start_).count());
+    record_mapped_cpu_ns(name_, ns);
+  }
+ private:
+  const char* name_;
+  bool enabled_;
+  std::chrono::steady_clock::time_point start_{};
+};
+
 at::Tensor leaky_relu_xdna(
     const at::Tensor& self,
     const at::Scalar& negative_slope) {
+  ScopedMappedCpu mapped_phase("aten::leaky_relu");
   ensure_host_current(self);
   auto out = xdna_empty_like_layout(self);
   auto in_cpu = cpu_alias(self);
@@ -2322,6 +2378,7 @@ at::Tensor leaky_relu_backward_xdna(
     const at::Tensor& self,
     const at::Scalar& negative_slope,
     bool self_is_result) {
+  ScopedMappedCpu mapped_phase("aten::leaky_relu_backward");
   ensure_host_current(grad_output);
   ensure_host_current(self);
   auto out = xdna_empty_like_layout(self);
@@ -2349,6 +2406,7 @@ at::Tensor add_tensor_xdna(
     const at::Tensor& self,
     const at::Tensor& other,
     const at::Scalar& alpha) {
+  ScopedMappedCpu mapped_phase("aten::add.Tensor");
   ensure_host_current(self);
   ensure_host_current(other);
   auto self_cpu = cpu_alias(self);
@@ -2388,6 +2446,7 @@ at::Tensor& add_out_xdna(
     const at::Tensor& other,
     const at::Scalar& alpha,
     at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::add.out");
   ensure_host_current(self);
   ensure_host_current(other);
   auto self_cpu = cpu_alias(self);
@@ -2406,6 +2465,7 @@ bool lazy_decoder_values_enabled() {
 at::Tensor cat_xdna(
     const at::ITensorListRef& tensors,
     int64_t dim) {
+  ScopedMappedCpu mapped_phase("aten::cat");
   TORCH_CHECK(tensors.size() > 0, "XDNA cat expects at least one tensor");
   const auto first = *tensors.begin();
   TORCH_CHECK(
@@ -2497,6 +2557,7 @@ at::Tensor upsample_nearest2d_xdna(
     c10::SymIntArrayRef output_size,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
+  ScopedMappedCpu mapped_phase("aten::upsample_nearest2d");
   TORCH_CHECK(
       self.dim() == 4 && output_size.size() == 2,
       "XDNA upsample_nearest2d expects NCHW input and 2-D output size");
@@ -2557,6 +2618,7 @@ at::Tensor upsample_nearest2d_backward_xdna(
     c10::SymIntArrayRef input_size,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
+  ScopedMappedCpu mapped_phase("aten::upsample_nearest2d_backward");
   TORCH_CHECK(
       input_size.size() == 4,
       "XDNA upsample_nearest2d_backward expects 4-D input size");
@@ -2608,6 +2670,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_batch_norm_xdna(
     bool training,
     double momentum,
     double eps) {
+  ScopedMappedCpu mapped_phase("aten::native_batch_norm");
   TORCH_CHECK(input.dim() >= 2, "XDNA BatchNorm expects rank >= 2 input");
   ensure_host_current(input);
   auto input_cpu = cpu_alias(input);
@@ -2665,6 +2728,7 @@ native_batch_norm_backward_xdna(
     bool train,
     double eps,
     std::array<bool, 3> output_mask) {
+  ScopedMappedCpu mapped_phase("aten::native_batch_norm_backward");
   ensure_host_current(grad_out);
   ensure_host_current(input);
   auto go_cpu = cpu_alias(grad_out);
@@ -2738,6 +2802,7 @@ native_batch_norm_backward_xdna(
 }
 
 at::Tensor cpu_mm_xdna(const at::Tensor& lhs, const at::Tensor& rhs) {
+  ScopedMappedCpu mapped_phase("aten::mm.cpu_mapped");
   TORCH_CHECK(
       lhs.device().type() == kXdnaType && rhs.device().type() == kXdnaType,
       "cpu_mm_xdna expects XDNA tensors");
@@ -2937,6 +3002,7 @@ at::Tensor convolution_overrideable_xdna(
     }
   }
 
+  ScopedMappedCpu mapped_phase("aten::convolution.cpu_mapped");
   ensure_host_current(input);
   ensure_host_current(weight);
   auto input_cpu = cpu_alias(input);
@@ -3394,6 +3460,7 @@ convolution_backward_overrideable_xdna(
   }
 
   if (cpu_mask[0] || cpu_mask[1] || cpu_mask[2]) {
+    ScopedMappedCpu mapped_phase("aten::convolution_backward.cpu_mapped");
     ensure_host_current(grad_output);
     ensure_host_current(input);
     ensure_host_current(weight);
@@ -3547,7 +3614,11 @@ void xdna_cpu_fallback(
     at::native::cpu_fallback(op, stack, false, c10::DispatchKey::CPU);
     return;
   }
-  const std::string name = op.schema().name();
+  std::string name = op.schema().name();
+  if (!op.schema().overload_name().empty()) {
+    name += ".";
+    name += op.schema().overload_name();
+  }
   const auto t0 = std::chrono::steady_clock::now();
   at::native::cpu_fallback(op, stack, false, c10::DispatchKey::CPU);
   const auto t1 = std::chrono::steady_clock::now();
@@ -3677,6 +3748,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fullframe_dw584_configured", []() {
     return static_cast<bool>(fullframe_dw_runtime_slot());
   });
+  m.def("reset_mapped_cpu_stats", []() {
+    std::lock_guard<std::mutex> guard(mapped_cpu_stats_mutex());
+    mapped_cpu_stats_map().clear();
+  });
+  m.def("mapped_cpu_stats", []() {
+    std::lock_guard<std::mutex> guard(mapped_cpu_stats_mutex());
+    py::dict out;
+    for (const auto& [name, stat] : mapped_cpu_stats_map()) {
+      py::dict item;
+      item["calls"] = py::int_(stat.calls);
+      item["total_ms"] = py::float_(double(stat.total_ns) / 1.0e6);
+      item["avg_ms"] = py::float_(
+          stat.calls ? double(stat.total_ns) / 1.0e6 / stat.calls : 0.0);
+      out[py::str(name)] = std::move(item);
+    }
+    return out;
+  });
+
   m.def("reset_fallback_stats", []() {
     std::lock_guard<std::mutex> guard(fallback_stats_mutex());
     fallback_stats_map().clear();

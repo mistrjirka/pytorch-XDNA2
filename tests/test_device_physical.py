@@ -102,3 +102,14 @@ def test_add_out_matches_cpu() -> None:
     torch.xdna.synchronize()
     expected = torch.add(a_cpu, b_cpu, alpha=0.5)
     torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_noncontiguous_compatible_view_matches_cpu() -> None:
+    base_cpu = torch.arange(48, dtype=torch.float32).reshape(2, 3, 8)
+    base = base_cpu.to("xdna")
+    sliced = torch.as_strided(base, (2, 3, 4), (24, 8, 2))
+    viewed = sliced.view(6, 4)
+
+    expected = torch.as_strided(base_cpu, (2, 3, 4), (24, 8, 2)).view(6, 4)
+    assert not sliced.is_contiguous()
+    torch.testing.assert_close(viewed.cpu(), expected)

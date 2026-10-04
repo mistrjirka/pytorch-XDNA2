@@ -325,6 +325,23 @@ def allocator_stats() -> dict[str, int]:
     return dict(_C.allocator_stats())
 
 
+def reset_mapped_cpu_stats() -> None:
+    """Reset profiling counters for XDNA handlers that execute on mapped CPU storage."""
+    _C.reset_mapped_cpu_stats()
+
+
+def mapped_cpu_stats() -> dict[str, dict[str, float | int]]:
+    """Return profiling counters for mapped-CPU XDNA handlers."""
+    return {
+        str(name): {
+            "calls": int(value["calls"]),
+            "total_ms": float(value["total_ms"]),
+            "avg_ms": float(value["avg_ms"]),
+        }
+        for name, value in dict(_C.mapped_cpu_stats()).items()
+    }
+
+
 def reset_fallback_stats() -> None:
     register_xdna_device()
     _C.reset_fallback_stats()

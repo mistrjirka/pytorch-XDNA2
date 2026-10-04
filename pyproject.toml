@@ -26,6 +26,7 @@ classifiers = [
 
 [project.scripts]
 torch-xdna2-build = "xdna_train._build:main"
+torch-xdna2-coverage = "xdna_train.training_coverage:main"
 
 [tool.setuptools.packages.find]
 include = ["xdna_train*"]
