@@ -507,3 +507,58 @@ extern "C" void xdna_pack_conv3x3_weight_dx_slice_bf16(
     }
   }
 }
+
+extern "C" void xdna_pack_conv3x3_weight_dx_slice_padded_bf16(
+    const uint16_t* src,
+    uint16_t* dst,
+    int Cout,
+    int Cin,
+    int out_start,
+    int out_count,
+    int dst_n) {
+  const std::size_t rows = std::size_t(9) * Cout;
+  std::memset(dst, 0, rows * dst_n * sizeof(uint16_t));
+#pragma omp parallel for collapse(3) schedule(static)
+  for (int ky = 0; ky < 3; ++ky) {
+    for (int kx = 0; kx < 3; ++kx) {
+      for (int co = 0; co < Cout; ++co) {
+        uint16_t* d =
+            dst + std::size_t((ky * 3 + kx) * Cout + co) * dst_n;
+        for (int j = 0; j < out_count; ++j) {
+          const int ci = out_start + j;
+          d[j] = src[((std::size_t(co) * Cin + ci) * 3 + (2 - ky)) * 3 +
+                     (2 - kx)];
+        }
+      }
+    }
+  }
+}
+
+extern "C" void xdna_yxbc_slice_stripe_to_channels_last_partial_bf16(
+    const uint16_t* src,
+    uint16_t* dst,
+    int B,
+    int Ctotal,
+    int Cphysical,
+    int Ccopy,
+    int channel_offset,
+    int full_h,
+    int y0,
+    int stripe_h,
+    int W,
+    int W_sched) {
+#pragma omp parallel for collapse(2) schedule(static)
+  for (int b = 0; b < B; ++b) {
+    for (int ly = 0; ly < stripe_h; ++ly) {
+      const int gy = y0 + ly;
+      for (int x = 0; x < W; ++x) {
+        const uint16_t* srcp =
+            src + (((std::size_t(ly) * W_sched + x) * B + b) * Cphysical);
+        uint16_t* dstp =
+            dst + (((std::size_t(b) * full_h + gy) * W + x) * Ctotal +
+                   channel_offset);
+        std::memcpy(dstp, srcp, std::size_t(Ccopy) * sizeof(uint16_t));
+      }
+    }
+  }
+}

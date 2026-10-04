@@ -66,6 +66,10 @@ extern "C" void xdna_pack_conv3x3_weight_fwd_bf16(
     const uint16_t*, uint16_t*, int, int);
 extern "C" void xdna_pack_conv3x3_weight_dx_slice_bf16(
     const uint16_t*, uint16_t*, int, int, int, int);
+extern "C" void xdna_pack_conv3x3_weight_dx_slice_padded_bf16(
+    const uint16_t*, uint16_t*, int, int, int, int, int);
+extern "C" void xdna_yxbc_slice_stripe_to_channels_last_partial_bf16(
+    const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
 extern "C" void xdna_pack_conv3x3_dy_channels_last_bf16(
     const uint16_t*, uint16_t*, int, int, int, int);
 extern "C" void xdna_pack_conv3x3_dy_bf16(
@@ -1427,6 +1431,7 @@ struct XdnaFullFrameConvStream {
   int64_t w_sched = 0;
   int64_t m_sched = 0;
   int64_t k_gemm = 0;
+  int64_t n_phys = 128;
   ShimBo* instr = nullptr;
   ShimBo* a = nullptr;
   ShimBo* b = nullptr;
@@ -1444,7 +1449,7 @@ struct XdnaFullFrameConvRuntime {
 
   ShimKernel* kernel = nullptr;
   std::array<XdnaFullFrameConvStream, 3> forward_streams;
-  std::array<XdnaFullFrameConvStream, 2> dx_streams;
+  std::array<XdnaFullFrameConvStream, 3> dx_streams;
   std::mutex mutex;
 
   ~XdnaFullFrameConvRuntime() {
@@ -1480,7 +1485,8 @@ struct XdnaFullFrameConvRuntime {
       int64_t w,
       int64_t w_sched,
       int64_t m_sched,
-      int64_t k_gemm) {
+      int64_t k_gemm,
+      int64_t n_phys = kCout) {
     auto blob = read_file(path);
     TORCH_CHECK(blob.size() % 4 == 0, "full-frame Conv stream is not word aligned: ", path);
     stream.name = name;
@@ -1490,6 +1496,7 @@ struct XdnaFullFrameConvRuntime {
     stream.w_sched = w_sched;
     stream.m_sched = m_sched;
     stream.k_gemm = k_gemm;
+    stream.n_phys = n_phys;
 
     const int gid_instr = shim_kernel_group_id(kernel, 1);
     const int gid_tmp = shim_kernel_group_id(kernel, 6);
@@ -1499,7 +1506,7 @@ struct XdnaFullFrameConvRuntime {
     stream.a = shim_bo_alloc(
         xdna_device(), kernel, a_elems(cin, h, w_sched) * 2, 2, 0);
     stream.b = shim_bo_alloc(
-        xdna_device(), kernel, static_cast<size_t>(k_gemm * kCout * 2), 2, 0);
+        xdna_device(), kernel, static_cast<size_t>(k_gemm * n_phys * 2), 2, 0);
     stream.tmp = shim_bo_alloc(xdna_device(), kernel, 1, 2, gid_tmp);
     stream.trace = shim_bo_alloc(xdna_device(), kernel, 4, 2, gid_trace);
     TORCH_CHECK(
@@ -1519,7 +1526,7 @@ struct XdnaFullFrameConvRuntime {
         shim_last_error());
     std::memset(stream.a_ptr, 0, a_elems(cin, h, w_sched) * 2);
     std::memset(
-        stream.b_ptr, 0, static_cast<size_t>(k_gemm * kCout * 2));
+        stream.b_ptr, 0, static_cast<size_t>(k_gemm * n_phys * 2));
     stream.instr_words = blob.size() / 4;
   }
 
@@ -1582,6 +1589,38 @@ struct XdnaFullFrameConvRuntime {
           128, kDx584StripeH, 564, sched_width(564),
           sched_m(kDx584StripeH, 564), 1152);
     }
+  }
+
+  void open_conv11_only(
+      const std::string& xclbin,
+      const std::string& insts,
+      int64_t n_phys) {
+    kernel = shim_kernel_load(
+        xdna_device(), xclbin.c_str(), nullptr, QOS_PRIORITY_NONE);
+    TORCH_CHECK(
+        kernel != nullptr,
+        "failed to load fast conv11 XDNA program: ",
+        shim_last_error());
+    int pack_threads = 12;
+    if (const char* raw = std::getenv("XDNA_CONV_PACK_THREADS")) {
+      const int parsed = std::atoi(raw);
+      if (parsed > 0) pack_threads = parsed;
+    }
+    xdna_conv_set_threads(pack_threads);
+    TORCH_CHECK(
+        n_phys == 128 || n_phys == 256,
+        "conv11 dX physical N must be 128 or 256");
+    int64_t tile_m = 32;
+    if (const char* raw = std::getenv("XDNA_FULLFRAME_TM")) {
+      const int parsed = std::atoi(raw);
+      if (parsed > 0 && parsed % kBatch == 0) tile_m = parsed;
+    }
+    const int64_t x_per_tile = tile_m / kBatch;
+    const int64_t w_sched = ((564 + x_per_tile - 1) / x_per_tile) * x_per_tile;
+    const int64_t m_sched = kBatch * 584 * w_sched;
+    open_stream(
+        dx_streams[2], n_phys == 256 ? "dx584c64n256" : "dx584c64", insts,
+        64, 584, 564, w_sched, m_sched, 576, n_phys);
   }
 
   static bool common_args(
@@ -1652,9 +1691,9 @@ struct XdnaFullFrameConvRuntime {
         weight.scalar_type() != at::ScalarType::BFloat16 ||
         grad_output.dim() != 4 || weight.dim() != 4 ||
         grad_output.size(0) != kBatch ||
-        grad_output.size(1) != kCout ||
-        weight.size(0) != kCout ||
-        (weight.size(1) != 128 && weight.size(1) != 256) ||
+        grad_output.size(1) != weight.size(0) ||
+        (weight.size(1) != 128 && weight.size(1) != 195 &&
+         weight.size(1) != 256) ||
         weight.size(2) != 3 || weight.size(3) != 3 ||
         !weight.is_contiguous() ||
         stride.size() != 2 || stride[0] != 1 || stride[1] != 1 ||
@@ -1675,18 +1714,15 @@ struct XdnaFullFrameConvRuntime {
         forward_streams[0].instr) {
       return &forward_streams[0];
     }
-    if (weight.size(1) == 256) {
-      for (auto& stream : dx_streams) {
-        if (!stream.instr || grad_output.size(3) != stream.w)
-          continue;
-        if (grad_output.size(2) == stream.h)
-          return &stream;
-        if (stream.name == "dx584s73" &&
-            grad_output.size(2) == 584 &&
-            584 % stream.h == 0) {
-          return &stream;
-        }
-      }
+    for (auto& stream : dx_streams) {
+      if (!stream.instr ||
+          stream.cin != grad_output.size(1) ||
+          grad_output.size(3) != stream.w)
+        continue;
+      if (grad_output.size(2) == stream.h)
+        return &stream;
+      if (grad_output.size(2) % stream.h == 0)
+        return &stream;
     }
     return nullptr;
   }
@@ -1695,7 +1731,7 @@ struct XdnaFullFrameConvRuntime {
       XdnaFullFrameConvStream& stream,
       at::ScalarType dtype) {
     auto raw = empty_memory_format(
-        {c10::SymInt(stream.m_sched), c10::SymInt(kCout)},
+        {c10::SymInt(stream.m_sched), c10::SymInt(stream.n_phys)},
         dtype,
         at::Layout::Strided,
         c10::Device(kXdnaType, 0),
@@ -1720,10 +1756,10 @@ struct XdnaFullFrameConvRuntime {
         c10::SymInt(kBatch), c10::SymInt(channels),
         c10::SymInt(stream.h), c10::SymInt(stream.w)};
     std::vector<c10::SymInt> strides = {
-        c10::SymInt(kCout),
+        c10::SymInt(stream.n_phys),
         c10::SymInt(1),
-        c10::SymInt(stream.w_sched * kBatch * kCout),
-        c10::SymInt(kBatch * kCout)};
+        c10::SymInt(stream.w_sched * kBatch * stream.n_phys),
+        c10::SymInt(kBatch * stream.n_phys)};
     return make_alias(raw, sizes, strides, c10::SymInt(0));
   }
 
@@ -1916,28 +1952,23 @@ struct XdnaFullFrameConvRuntime {
         full_h, "x", full_w, " stripe=", stream.h, "x", stream.w);
 
     const int64_t cin = weight.size(1);
+    const int64_t grad_c = weight.size(0);
     TORCH_CHECK(
-        cin % kCout == 0,
-        "full-frame dX requires input channels divisible by ", kCout,
-        "; got ", cin);
-    const int nslices = static_cast<int>(cin / kCout);
+        stream.cin == grad_c,
+        "full-frame dX stream input channels mismatch: stream=",
+        stream.cin, " grad=", grad_c);
+    const int nslices =
+        static_cast<int>((cin + stream.n_phys - 1) / stream.n_phys);
 
     auto out = empty_memory_format(
-        {
-            c10::SymInt(kBatch),
-            c10::SymInt(cin),
-            c10::SymInt(full_h),
-            c10::SymInt(full_w),
-        },
+        {c10::SymInt(kBatch), c10::SymInt(cin),
+         c10::SymInt(full_h), c10::SymInt(full_w)},
         at::ScalarType::BFloat16,
         at::Layout::Strided,
         c10::Device(kXdnaType, 0),
         false,
         at::MemoryFormat::ChannelsLast);
 
-    // CPU aliases are zero-copy views of the host-mapped XDNA BO. Convert a
-    // non-channels-last dY once, outside the stripe loop; the normal compiled
-    // path already preserves channels-last and takes no conversion here.
     at::Tensor go_cl;
     const uint16_t* go_ptr = nullptr;
     if (grad_output.is_contiguous(at::MemoryFormat::ChannelsLast)) {
@@ -1954,7 +1985,7 @@ struct XdnaFullFrameConvRuntime {
           go_ptr,
           static_cast<uint16_t*>(stream.a_ptr),
           static_cast<int>(kBatch),
-          static_cast<int>(kCout),
+          static_cast<int>(stream.cin),
           static_cast<int>(full_h),
           static_cast<int>(full_w),
           static_cast<int>(y0),
@@ -1966,14 +1997,27 @@ struct XdnaFullFrameConvRuntime {
           shim_last_error());
 
       for (int slice = 0; slice < nslices; ++slice) {
-        const int start_channel = slice * static_cast<int>(kCout);
-        xdna_pack_conv3x3_weight_dx_slice_bf16(
-            static_cast<const uint16_t*>(weight_cpu.const_data_ptr()),
-            static_cast<uint16_t*>(stream.b_ptr),
-            static_cast<int>(kCout),
-            static_cast<int>(cin),
-            start_channel,
-            static_cast<int>(kCout));
+        const int start_channel = slice * static_cast<int>(stream.n_phys);
+        const int copy_channels = static_cast<int>(
+            std::min<int64_t>(stream.n_phys, cin - start_channel));
+        if (copy_channels == stream.n_phys) {
+          xdna_pack_conv3x3_weight_dx_slice_bf16(
+              static_cast<const uint16_t*>(weight_cpu.const_data_ptr()),
+              static_cast<uint16_t*>(stream.b_ptr),
+              static_cast<int>(grad_c),
+              static_cast<int>(cin),
+              start_channel,
+              static_cast<int>(stream.n_phys));
+        } else {
+          xdna_pack_conv3x3_weight_dx_slice_padded_bf16(
+              static_cast<const uint16_t*>(weight_cpu.const_data_ptr()),
+              static_cast<uint16_t*>(stream.b_ptr),
+              static_cast<int>(grad_c),
+              static_cast<int>(cin),
+              start_channel,
+              copy_channels,
+              static_cast<int>(stream.n_phys));
+        }
         TORCH_CHECK(
             shim_bo_sync_to_device(stream.b) == 0,
             "failed to sync full-frame decoder dX weight slice: ",
@@ -1981,18 +2025,34 @@ struct XdnaFullFrameConvRuntime {
 
         auto raw = dispatch_raw(stream, at::ScalarType::BFloat16);
         ensure_host_current(raw);
-        xdna_yxbc_slice_stripe_to_channels_last_bf16(
-            static_cast<const uint16_t*>(raw.const_data_ptr()),
-            static_cast<uint16_t*>(out.mutable_data_ptr()),
-            static_cast<int>(kBatch),
-            static_cast<int>(cin),
-            static_cast<int>(kCout),
-            start_channel,
-            static_cast<int>(full_h),
-            static_cast<int>(y0),
-            static_cast<int>(stream.h),
-            static_cast<int>(full_w),
-            static_cast<int>(stream.w_sched));
+        if (copy_channels == stream.n_phys) {
+          xdna_yxbc_slice_stripe_to_channels_last_bf16(
+              static_cast<const uint16_t*>(raw.const_data_ptr()),
+              static_cast<uint16_t*>(out.mutable_data_ptr()),
+              static_cast<int>(kBatch),
+              static_cast<int>(cin),
+              static_cast<int>(stream.n_phys),
+              start_channel,
+              static_cast<int>(full_h),
+              static_cast<int>(y0),
+              static_cast<int>(stream.h),
+              static_cast<int>(full_w),
+              static_cast<int>(stream.w_sched));
+        } else {
+          xdna_yxbc_slice_stripe_to_channels_last_partial_bf16(
+              static_cast<const uint16_t*>(raw.const_data_ptr()),
+              static_cast<uint16_t*>(out.mutable_data_ptr()),
+              static_cast<int>(kBatch),
+              static_cast<int>(cin),
+              static_cast<int>(stream.n_phys),
+              copy_channels,
+              start_channel,
+              static_cast<int>(full_h),
+              static_cast<int>(y0),
+              static_cast<int>(stream.h),
+              static_cast<int>(full_w),
+              static_cast<int>(stream.w_sched));
+        }
       }
     }
     mark_host_dirty(out);
@@ -2201,6 +2261,16 @@ std::unique_ptr<XdnaFullFrameDwRuntime>& fullframe_dw_runtime_slot() {
 }
 
 std::unique_ptr<XdnaFullFrameConvRuntime>& fullframe_conv_runtime_slot() {
+  static auto* slot = new std::unique_ptr<XdnaFullFrameConvRuntime>();
+  return *slot;
+}
+
+std::unique_ptr<XdnaFullFrameConvRuntime>& fast_dx584_runtime_slot() {
+  static auto* slot = new std::unique_ptr<XdnaFullFrameConvRuntime>();
+  return *slot;
+}
+
+std::unique_ptr<XdnaFullFrameConvRuntime>& fast_conv11_runtime_slot() {
   static auto* slot = new std::unique_ptr<XdnaFullFrameConvRuntime>();
   return *slot;
 }
@@ -2821,6 +2891,21 @@ at::Tensor convolution_overrideable_xdna(
       }
     }
   }
+  auto& fast_full_slot = fast_dx584_runtime_slot();
+  if (fast_full_slot) {
+    if (auto* stream = fast_full_slot->find_forward(
+            input,
+            weight,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+            bias)) {
+      return fast_full_slot->forward(input, weight, *stream);
+    }
+  }
   if (full_conv_slot) {
     if (auto* stream = full_conv_slot->find_forward(
             input,
@@ -3028,8 +3113,11 @@ convolution_backward_overrideable_xdna(
   // NPU dX instead of serializing the heterogeneous engines.
   XdnaConvStream* small_dx = nullptr;
   XdnaFullFrameConvStream* full_dx = nullptr;
+  XdnaFullFrameConvRuntime* full_dx_owner = nullptr;
   auto& conv_slot = conv_runtime_slot();
   auto& full_conv_slot = fullframe_conv_runtime_slot();
+  auto& fast_dx584_slot = fast_dx584_runtime_slot();
+  auto& fast_conv11_slot = fast_conv11_runtime_slot();
   if (output_mask[0] && conv_slot) {
     small_dx = conv_slot->find_dx(
         grad_output,
@@ -3041,16 +3129,23 @@ convolution_backward_overrideable_xdna(
         output_padding,
         groups);
   }
-  if (output_mask[0] && !small_dx && full_conv_slot) {
+  if (output_mask[0] && !small_dx && fast_conv11_slot) {
+    full_dx = fast_conv11_slot->find_dx(
+        grad_output, weight, stride, padding, dilation,
+        transposed, output_padding, groups);
+    if (full_dx) full_dx_owner = fast_conv11_slot.get();
+  }
+  if (output_mask[0] && !small_dx && !full_dx && fast_dx584_slot) {
+    full_dx = fast_dx584_slot->find_dx(
+        grad_output, weight, stride, padding, dilation,
+        transposed, output_padding, groups);
+    if (full_dx) full_dx_owner = fast_dx584_slot.get();
+  }
+  if (output_mask[0] && !small_dx && !full_dx && full_conv_slot) {
     full_dx = full_conv_slot->find_dx(
-        grad_output,
-        weight,
-        stride,
-        padding,
-        dilation,
-        transposed,
-        output_padding,
-        groups);
+        grad_output, weight, stride, padding, dilation,
+        transposed, output_padding, groups);
+    if (full_dx) full_dx_owner = full_conv_slot.get();
   }
   const bool have_npu_dx = small_dx != nullptr || full_dx != nullptr;
 
@@ -3231,7 +3326,8 @@ convolution_backward_overrideable_xdna(
     gi = conv_slot->input_grad(grad_output, weight, *small_dx);
     cpu_mask[0] = false;
   } else if (full_dx) {
-    gi = full_conv_slot->input_grad(grad_output, weight, *full_dx);
+    TORCH_CHECK(full_dx_owner != nullptr, "full-frame dX runtime owner missing");
+    gi = full_dx_owner->input_grad(grad_output, weight, *full_dx);
     cpu_mask[0] = false;
   }
 
@@ -3467,6 +3563,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       });
   m.def("fullframe_conv_family_configured", []() {
     return static_cast<bool>(fullframe_conv_runtime_slot());
+  });
+  m.def(
+      "configure_fast_conv11_dx",
+      [](const std::string& xclbin,
+         const std::string& insts,
+         int64_t n_phys) {
+        auto runtime = std::make_unique<XdnaFullFrameConvRuntime>();
+        runtime->open_conv11_only(xclbin, insts, n_phys);
+        fast_conv11_runtime_slot() = std::move(runtime);
+      });
+  m.def("fast_conv11_dx_configured", []() {
+    return static_cast<bool>(fast_conv11_runtime_slot());
+  });
+  m.def(
+      "configure_fast_fullframe_family",
+      [](const std::string& xclbin,
+         const std::string& res146,
+         const std::string& dx292,
+         const std::string& dx584) {
+        auto runtime = std::make_unique<XdnaFullFrameConvRuntime>();
+        runtime->open(xclbin, res146, "", "", dx292, dx584);
+        fast_dx584_runtime_slot() = std::move(runtime);
+      });
+  m.def(
+      "configure_fast_dx584",
+      [](const std::string& xclbin, const std::string& dx584) {
+        auto runtime = std::make_unique<XdnaFullFrameConvRuntime>();
+        runtime->open(xclbin, dx584, "", "", "", dx584);
+        fast_dx584_runtime_slot() = std::move(runtime);
+      });
+  m.def("fast_dx584_configured", []() {
+    return static_cast<bool>(fast_dx584_runtime_slot());
   });
   m.def(
       "fullframe_cat2_upsample2_forward",

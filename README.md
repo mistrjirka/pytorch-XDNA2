@@ -112,7 +112,14 @@ The current backend uses PyTorch `PrivateUse1` renamed to `xdna` and provides:
 - CPU `dW` overlapped with dependency-critical NPU `dX` when that is faster;
 - full-frame batch-4 decoder/residual programs for the current Strix training path.
 
-The bundled full-frame family is enabled automatically. Disable it for debugging with:
+The bundled full-frame family is enabled automatically. The current Strix package also enables validated resident-weight / queue-pipelined fast paths for the large decoder dX family and conv11 dX when their bundled artifacts are present. Disable them independently for A/B debugging with:
+
+```bash
+XDNA_ENABLE_FAST_FULLFRAME=0 python ...
+XDNA_ENABLE_FAST_CONV11=0 python ...
+```
+
+Disable the full-frame backend entirely with:
 
 ```bash
 XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_CONV=0 python ...
@@ -131,10 +138,13 @@ It avoids materializing large decoder intermediates when the following supported
 On the development Ryzen AI 9 365 / Strix machine, XRT 2.21.75, BF16, 16 CPU threads, performance power profile, the real full-frame DRIVE `MyNet(3,1,7)` training+validation loop has recently measured approximately:
 
 ```text
-CPU BF16:               0.151 - 0.155 it/s
-XDNA + virtual decoder: 0.179 - 0.182 it/s in the latest installed-package ABBA run
-Mean speedup:            ~1.18x end-to-end
+CPU BF16:                              0.151 - 0.155 it/s
+XDNA legacy full-frame path:           ~0.200 - 0.201 it/s
+XDNA q4 resident full-frame + conv11:  ~0.210 - 0.212 it/s
+Mean speedup vs CPU:                   ~1.38x end-to-end
 ```
+
+In the latest package-level ABBA bracket, the q4 resident full-frame path alone averaged about 0.2038 it/s; adding the validated conv11 q4 dX path averaged about 0.2111 it/s. The large 256→128 @ 584 decoder dX itself improved from roughly 615 ms to roughly 469 ms, while preserving BF16 numerical agreement with the CPU reference.
 
 The metric is the notebook metric:
 

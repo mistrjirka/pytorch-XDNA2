@@ -38,4 +38,6 @@ xdna_train = [
   "_artifacts/train_gemm_64x32x96/*",
   "_artifacts/conv3x3_patch40_128/*",
   "_artifacts/fullframe_strix_b4_m96/*",
+  "_artifacts/fullframe_q4_resident_k1152_m96/*",
+  "_artifacts/conv11_dx_q4_resident_k576_m96/*",
 ]

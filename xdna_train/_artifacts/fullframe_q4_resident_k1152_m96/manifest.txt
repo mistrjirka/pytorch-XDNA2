@@ -1,0 +1,9 @@
+op=fullframe_q4_resident_k1152
+batch=4
+kernel=3x3
+tile=96x32x16
+resident_b=1
+q4_pipeline=1
+res146=4x128x146x141
+dx292=4x128x292x282
+dx584_stripe=4x128x73x564

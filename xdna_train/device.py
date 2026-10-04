@@ -191,6 +191,82 @@ def register_xdna_device() -> None:
             _optional_stream("dx584s73.bin"),
         )
 
+    fast_full_raw = os.environ.get(
+        "XDNA_FAST_FULLFRAME_ARTIFACT_DIR",
+        os.environ.get("XDNA_FAST_DX584_ARTIFACT_DIR"),
+    )
+    fast_full = Path(
+        fast_full_raw
+        if fast_full_raw
+        else str(_ROOT / "_artifacts" / "fullframe_q4_resident_k1152_m96")
+    )
+    enable_fast = os.environ.get(
+        "XDNA_ENABLE_FAST_FULLFRAME",
+        os.environ.get("XDNA_ENABLE_FAST_DX584", "1"),
+    )
+    if (
+        enable_fast == "1"
+        and (fast_full / "final.xclbin").is_file()
+        and (fast_full / "dx584s73.bin").is_file()
+    ):
+        fast_manifest = fast_full / "manifest.txt"
+        if fast_manifest.is_file():
+            for line in fast_manifest.read_text().splitlines():
+                if line.startswith("tile="):
+                    artifact_tm = line.split("=", 1)[1].split("x", 1)[0]
+                    configured_tm = os.environ.get("XDNA_FULLFRAME_TM")
+                    if configured_tm is not None and configured_tm != artifact_tm:
+                        raise RuntimeError(
+                            "XDNA_FULLFRAME_TM does not match fast full-frame artifact tile: "
+                            f"{configured_tm} != {artifact_tm}"
+                        )
+                    os.environ["XDNA_FULLFRAME_TM"] = artifact_tm
+                    break
+        fast_res146 = fast_full / "res146.bin"
+        fast_dx292 = fast_full / "dx292.bin"
+        if fast_res146.is_file():
+            _C.configure_fast_fullframe_family(
+                str(fast_full / "final.xclbin"),
+                str(fast_res146),
+                str(fast_dx292) if fast_dx292.is_file() else "",
+                str(fast_full / "dx584s73.bin"),
+            )
+        else:
+            _C.configure_fast_dx584(
+                str(fast_full / "final.xclbin"),
+                str(fast_full / "dx584s73.bin"),
+            )
+
+    fast_conv11 = Path(
+        os.environ.get(
+            "XDNA_FAST_CONV11_ARTIFACT_DIR",
+            str(_ROOT / "_artifacts" / "conv11_dx_q4_resident_k576_m96"),
+        )
+    )
+    if (
+        os.environ.get("XDNA_ENABLE_FAST_CONV11", "1") == "1"
+        and (fast_conv11 / "final.xclbin").is_file()
+        and (fast_conv11 / "dx584c64.bin").is_file()
+    ):
+        manifest = fast_conv11 / "manifest.txt"
+        if manifest.is_file():
+            for line in manifest.read_text().splitlines():
+                if line.startswith("tile="):
+                    artifact_tm = line.split("=", 1)[1].split("x", 1)[0]
+                    configured_tm = os.environ.get("XDNA_FULLFRAME_TM")
+                    if configured_tm is not None and configured_tm != artifact_tm:
+                        raise RuntimeError(
+                            "XDNA_FULLFRAME_TM does not match fast conv11 artifact tile: "
+                            f"{configured_tm} != {artifact_tm}"
+                        )
+                    os.environ["XDNA_FULLFRAME_TM"] = artifact_tm
+                    break
+        _C.configure_fast_conv11_dx(
+            str(fast_conv11 / "final.xclbin"),
+            str(fast_conv11 / "dx584c64.bin"),
+            128,
+        )
+
     full_dw = Path(
         os.environ.get(
             "XDNA_FULLFRAME_DW_ARTIFACT_DIR",

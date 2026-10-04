@@ -1,0 +1,9 @@
+op=conv11_dx_q4_resident_k576
+batch=4
+kernel=3x3
+tile=96x32x16
+resident_b=1
+q4_pipeline=1
+logical_dy=4x64x584x564
+logical_dx=4x195x584x564
+n_phys=128
