@@ -30,6 +30,7 @@ class Motif:
     input_factory: Callable[[], tuple[TensorArgs, torch.Tensor | None]]
     loss_fn: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor]
     description: str
+    optimizer_factory: Callable[[nn.Module], torch.optim.Optimizer] | None = None
 
 
 class ResidualBlock(nn.Module):
@@ -57,6 +58,80 @@ class UNetMotif(nn.Module):
         y = F.interpolate(y, scale_factor=2.0, mode="nearest")
         skip = F.interpolate(x, scale_factor=2.0, mode="nearest")
         return self.dec(torch.cat((y, skip), dim=1))
+
+
+class NisMiniConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, 3, stride=stride, padding=1, bias=False
+        )
+        self.norm = nn.BatchNorm2d(out_channels)
+        self.act = nn.LeakyReLU(negative_slope=0.2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.norm(self.conv(x)))
+
+
+class NisMiniResidualBlock(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(128, 128, 3, padding=1, bias=False)
+        self.norm1 = nn.BatchNorm2d(128)
+        self.conv2 = nn.Conv2d(128, 128, 3, padding=1, bias=False)
+        self.norm2 = nn.BatchNorm2d(128)
+        self.act = nn.LeakyReLU(negative_slope=0.2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip = x.clone()
+        x = self.act(self.norm1(self.conv1(x)))
+        x = self.norm2(self.conv2(x))
+        return self.act(x + skip)
+
+
+class NisMiniUpsampleConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
+        self.norm = nn.BatchNorm2d(out_channels)
+        self.act = nn.LeakyReLU(negative_slope=0.2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        return self.act(self.norm(self.conv(x)))
+
+
+class NisMiniNet(nn.Module):
+    """Scaled spatial clone of NIS MyNet(3, 1, 7).
+
+    Channel widths and block count intentionally match the real network. Only
+    spatial dimensions are reduced by the input factory.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv0 = NisMiniConvBlock(3, 64)
+        self.conv1 = NisMiniConvBlock(64, 128, stride=2)
+        self.conv2 = NisMiniConvBlock(128, 128, stride=2)
+        self.resnet_blocks = nn.ModuleList(
+            [NisMiniResidualBlock() for _ in range(7)]
+        )
+        self.upconv2 = NisMiniUpsampleConvBlock(256, 128)
+        self.upconv1 = NisMiniUpsampleConvBlock(256, 128)
+        self.conv11 = NisMiniConvBlock(195, 64)
+        self.conv12 = nn.Conv2d(64, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0 = self.conv0(x)
+        x1 = self.conv1(x0)
+        x2 = self.conv2(x1)
+        x_res = x2.clone()
+        for block in self.resnet_blocks:
+            x_res = block(x_res)
+        x_out = self.upconv2(torch.cat((x_res, x2), dim=1))
+        x_out = self.upconv1(torch.cat((x_out, x1), dim=1))
+        x_out = self.conv11(torch.cat((x_out, x0, x), dim=1))
+        return self.conv12(x_out)
 
 
 class TransformerMotif(nn.Module):
@@ -106,6 +181,25 @@ def _bf16_randn(*shape: int) -> torch.Tensor:
 
 def motifs() -> dict[str, Motif]:
     return {
+        "nis-mini": Motif(
+            "nis-mini",
+            NisMiniNet,
+            lambda: (
+                (
+                    _bf16_randn(4, 3, 72, 68).contiguous(
+                        memory_format=torch.channels_last
+                    ),
+                ),
+                torch.rand(4, 1, 72, 68).bfloat16().contiguous(
+                    memory_format=torch.channels_last
+                ),
+            ),
+            lambda out, target: F.binary_cross_entropy(torch.sigmoid(out), target),
+            "Scaled NIS MyNet: same 7 blocks/channels/op graph at 72x68 + BCE + Adam",
+            lambda model: torch.optim.Adam(
+                model.parameters(), lr=1e-4, weight_decay=1e-5
+            ),
+        ),
         "mlp": Motif(
             "mlp",
             lambda: nn.Sequential(
@@ -204,8 +298,12 @@ def run_motif(
     cpu_args, cpu_target = motif.input_factory()
     args = tuple(_to_device(x, "xdna") for x in cpu_args)
     target = None if cpu_target is None else _to_device(cpu_target, "xdna")
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=1e-3, weight_decay=1e-4, foreach=False, fused=False
+    optimizer = (
+        motif.optimizer_factory(model)
+        if motif.optimizer_factory is not None
+        else torch.optim.AdamW(
+            model.parameters(), lr=1e-3, weight_decay=1e-4, foreach=False, fused=False
+        )
     )
 
     def step() -> torch.Tensor:

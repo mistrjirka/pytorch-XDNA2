@@ -205,14 +205,15 @@ The package pins the supported PyTorch range to 2.14.x because the native `Priva
 
 ## Training coverage suite
 
-The installed `torch-xdna2-coverage` command runs small real training motifs rather than inference-only operator probes. It currently covers MLP, residual CNN, U-Net-like decoder, Transformer, Mobile/depthwise, and embedding/MLP workloads. Each result reports full-step time, overload-aware generic CPU fallbacks, and XDNA handlers that still execute CPU math over mapped XRT storage.
+The installed `torch-xdna2-coverage` command runs small real training motifs rather than inference-only operator probes. It currently covers MLP, residual CNN, U-Net-like decoder, Transformer, Mobile/depthwise, embedding/MLP, and a `nis-mini` workload. `nis-mini` preserves the NIS MyNet channel widths, all seven residual blocks, both cat/nearest-upsample decoder stages, final 1x1 Conv, sigmoid+BCE, and Adam while shrinking only the spatial input from 584x564 to 72x68. Each result reports full-step time, overload-aware generic CPU fallbacks, and XDNA handlers that still execute CPU math over mapped XRT storage.
 
 ```bash
 torch-xdna2-coverage --motif all --steps 2 --threads 8
+torch-xdna2-coverage --motif nis-mini --steps 5 --threads 16
 torch-xdna2-coverage --motif transformer --json
 ```
 
-Use this suite as an admission test for generic backend work: an optimization should improve the relevant motif and should not regress unrelated motifs before it is promoted.
+Use this suite as an admission test for generic backend work: an optimization should improve the relevant motif and should not regress unrelated motifs before it is promoted. On the development Strix machine, the first `nis-mini` checkpoint measured about 96.6 ms/step through XDNA versus about 73.0 ms/step on CPU BF16; roughly 75 ms/step of the XDNA run was generic-shape Conv forward/backward still executing on CPU over mapped XRT storage, making it a fast target for broadening NPU Conv support.
 
 ## Development
 
