@@ -6,6 +6,10 @@
 #include <omp.h>
 #endif
 
+// Width of the pack loops only.  Set through num_threads() on each loop so the
+// caller's OpenMP width (PyTorch's intra-op setting) is never modified.
+static int g_pack_threads = 1;
+
 extern "C" {
 
 // NCHW bf16 -> [H+2,W+2,C/32,B,32] halo layout used by virtual-im2col fwd/dX.
@@ -21,7 +25,7 @@ void xdna_pack_conv3x3_halo_bf16(
       std::size_t(H + 2) * (W + 2) * cb * B * 32;
   std::memset(dst, 0, elems * sizeof(uint16_t));
 
-#pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
   for (int y = 0; y < H; ++y) {
     for (int x = 0; x < W; ++x) {
       for (int cblock = 0; cblock < cb; ++cblock) {
@@ -54,7 +58,7 @@ void xdna_pack_conv3x3_halo_padded_bf16(
       std::size_t(H + 2) * (W_sched + 2) * cb * B * 32;
   std::memset(dst, 0, elems * sizeof(uint16_t));
 
-#pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
   for (int y = 0; y < H; ++y) {
     for (int x = 0; x < W; ++x) {
       for (int cblock = 0; cblock < cb; ++cblock) {
@@ -91,7 +95,7 @@ void xdna_pack_conv3x3_halo_padded_channels_last_bf16(
       std::size_t(H + 2) * (W_sched + 2) * cb * B * 32;
   std::memset(dst, 0, elems * sizeof(uint16_t));
 
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
   for (int y = 0; y < H; ++y) {
     for (int x = 0; x < W; ++x) {
       for (int cblock = 0; cblock < cb; ++cblock) {
@@ -132,7 +136,7 @@ void xdna_pack_conv3x3_halo_cat2_upsample2_channels_last_bf16(
       std::size_t(OH + 2) * (W_sched + 2) * cb * B * 32;
   std::memset(dst, 0, elems * sizeof(uint16_t));
 
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
   for (int oy = 0; oy < OH; ++oy) {
     for (int ox = 0; ox < OW; ++ox) {
       const int sy = oy >> 1;
@@ -168,7 +172,7 @@ void xdna_yxbc_to_channels_last_bf16(
     int H,
     int W,
     int W_sched) {
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
   for (int b = 0; b < B; ++b) {
     for (int y = 0; y < H; ++y) {
       for (int x = 0; x < W; ++x) {
@@ -177,6 +181,38 @@ void xdna_yxbc_to_channels_last_bf16(
         uint16_t* dstp =
             dst + (((std::size_t(b) * H + y) * W + x) * C);
         std::memcpy(dstp, srcp, std::size_t(C) * sizeof(uint16_t));
+      }
+    }
+  }
+}
+
+// [Y*X,B,C] NPU result -> channels [c_start, c_start+C) of NCHW dst with
+// C_total channels.  Blocked 32x64 tiles keep the strided gather in cache;
+// ATen's generic permuted copy_ is several times slower for this transpose.
+void xdna_yxbc_to_nchw_bf16(
+    const uint16_t* src,
+    uint16_t* dst,
+    int B,
+    int C,
+    int HW,
+    int C_total,
+    int c_start) {
+  constexpr int kTc = 32;
+  constexpr int kTp = 64;
+  const int c_tiles = (C + kTc - 1) / kTc;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int b = 0; b < B; ++b) {
+    for (int ct = 0; ct < c_tiles; ++ct) {
+      const int c0 = ct * kTc;
+      const int c1 = c0 + kTc < C ? c0 + kTc : C;
+      for (int p0 = 0; p0 < HW; p0 += kTp) {
+        const int p1 = p0 + kTp < HW ? p0 + kTp : HW;
+        for (int c = c0; c < c1; ++c) {
+          uint16_t* d =
+              dst + (std::size_t(b) * C_total + c_start + c) * HW;
+          for (int p = p0; p < p1; ++p)
+            d[p] = src[(std::size_t(p) * B + b) * C + c];
+        }
       }
     }
   }
@@ -194,7 +230,7 @@ void xdna_yxbc_slice_to_channels_last_bf16(
     int H,
     int W,
     int W_sched) {
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
   for (int b = 0; b < B; ++b) {
     for (int y = 0; y < H; ++y) {
       for (int x = 0; x < W; ++x) {
@@ -228,7 +264,7 @@ void xdna_pack_conv3x3_halo_padded_channels_last_stripe_bf16(
       std::size_t(stripe_h + 2) * (W_sched + 2) * cb * B * 32;
   std::memset(dst, 0, elems * sizeof(uint16_t));
 
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
   for (int ly = 0; ly < stripe_h + 2; ++ly) {
     for (int x = 0; x < W; ++x) {
       const int gy = y0 + ly - 1;
@@ -263,7 +299,7 @@ void xdna_yxbc_slice_stripe_to_channels_last_bf16(
     int stripe_h,
     int W,
     int W_sched) {
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
   for (int b = 0; b < B; ++b) {
     for (int ly = 0; ly < stripe_h; ++ly) {
       const int gy = y0 + ly;
@@ -284,7 +320,7 @@ void xdna_pack_conv3x3_weight_fwd_bf16(
     uint16_t* dst,
     int Cout,
     int Cin) {
-#pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
   for (int ky = 0; ky < 3; ++ky) {
     for (int kx = 0; kx < 3; ++kx) {
       for (int ci = 0; ci < Cin; ++ci) {
@@ -304,7 +340,7 @@ void xdna_pack_conv3x3_weight_dx_bf16(
     uint16_t* dst,
     int Cout,
     int Cin) {
-#pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
   for (int ky = 0; ky < 3; ++ky) {
     for (int kx = 0; kx < 3; ++kx) {
       for (int co = 0; co < Cout; ++co) {
@@ -333,7 +369,7 @@ void xdna_pack_conv3x3_dw_a_bf16(
   std::memset(dst, 0, std::size_t(Mpad) * Kpad * sizeof(uint16_t));
   const int real_rows = 9 * Cin;
 
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) schedule(static)
   for (int row = 0; row < real_rows; ++row) {
     const int q = row / Cin;
     const int ci = row - q * Cin;
@@ -366,7 +402,7 @@ void xdna_pack_conv3x3_dy_channels_last_bf16(
     int Cout,
     int H,
     int W) {
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
   for (int y = 0; y < H; ++y) {
     for (int x = 0; x < W; ++x) {
       for (int b = 0; b < B; ++b) {
@@ -392,7 +428,7 @@ void xdna_pack_conv3x3_dy_bf16(
   std::memset(dst, 0, std::size_t(Kpad) * Cout * sizeof(uint16_t));
   const int real_k = B * H * W;
 
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) schedule(static)
   for (int p = 0; p < real_k; ++p) {
     const int b = p % B;
     const int pos = p / B;
@@ -421,7 +457,7 @@ extern "C" void xdna_pack_conv3x3_dw_a_bhw_bf16(
     int Kpad) {
   const int real_rows = 9 * Cin;
 
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) schedule(static)
   for (int row = 0; row < real_rows; ++row) {
     const int q = row / Cin;
     const int ci = row - q * Cin;
@@ -459,7 +495,7 @@ extern "C" void xdna_pack_conv3x3_dy_bhw_bf16(
     int H,
     int W,
     int Kpad) {
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
   for (int b = 0; b < B; ++b) {
     for (int y = 0; y < H; ++y) {
       for (int x = 0; x < W; ++x) {
@@ -473,12 +509,7 @@ extern "C" void xdna_pack_conv3x3_dy_bhw_bf16(
 }
 
 extern "C" void xdna_conv_set_threads(int n) {
-#ifdef _OPENMP
-  omp_set_dynamic(0);
-  omp_set_num_threads(n);
-#else
-  (void)n;
-#endif
+  g_pack_threads = n > 0 ? n : 1;
 }
 
 // Pack one 128-channel slice of dX weights from original OIHW.
@@ -492,7 +523,7 @@ extern "C" void xdna_pack_conv3x3_weight_dx_slice_bf16(
     int Cin,
     int out_start,
     int out_count) {
-#pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
   for (int ky = 0; ky < 3; ++ky) {
     for (int kx = 0; kx < 3; ++kx) {
       for (int co = 0; co < Cout; ++co) {
@@ -518,7 +549,7 @@ extern "C" void xdna_pack_conv3x3_weight_dx_slice_padded_bf16(
     int dst_n) {
   const std::size_t rows = std::size_t(9) * Cout;
   std::memset(dst, 0, rows * dst_n * sizeof(uint16_t));
-#pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
   for (int ky = 0; ky < 3; ++ky) {
     for (int kx = 0; kx < 3; ++kx) {
       for (int co = 0; co < Cout; ++co) {
@@ -547,7 +578,7 @@ extern "C" void xdna_yxbc_slice_stripe_to_channels_last_partial_bf16(
     int stripe_h,
     int W,
     int W_sched) {
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
   for (int b = 0; b < B; ++b) {
     for (int ly = 0; ly < stripe_h; ++ly) {
       const int gy = y0 + ly;
@@ -558,6 +589,186 @@ extern "C" void xdna_yxbc_slice_stripe_to_channels_last_partial_bf16(
             dst + (((std::size_t(b) * full_h + gy) * W + x) * Ctotal +
                    channel_offset);
         std::memcpy(dstp, srcp, std::size_t(Ccopy) * sizeof(uint16_t));
+      }
+    }
+  }
+}
+
+// ---- conv3x3w host layouts (spec: xdna_train/_designs/conv3x3w_host.py) ----
+
+namespace {
+constexpr int kGroupOutRows = 2048;
+constexpr int kGroupRows = 2126;
+constexpr int kKStep = 64;
+constexpr int kN = 128;
+}  // namespace
+
+extern "C" {
+
+// NCHW bf16 -> [groups][chunks][GROUP_ROWS][64].  Writes only real pixels and
+// real channels (plus their halo duplicates in the previous group); the caller
+// zero-fills dst once and reuses it for the same shape.
+void xdna_conv3x3w_pack_input_bf16(
+    const uint16_t* src,
+    uint16_t* dst,
+    int B,
+    int C,
+    int H,
+    int W,
+    int chunks) {
+  const int wp = W + 2;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
+  for (int b = 0; b < B; ++b) {
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+      for (int y = 0; y < H; ++y) {
+        const int cc = C - chunk * kKStep < kKStep ? C - chunk * kKStep : kKStep;
+        if (cc <= 0) continue;
+        const uint16_t* s =
+            src + ((std::size_t(b) * C + chunk * kKStep) * H + y) * W;
+        const std::size_t p0 = (std::size_t(b) * (H + 2) + y + 1) * wp + 1;
+        for (int x = 0; x < W; ++x) {
+          uint16_t px[kKStep];
+          for (int c = 0; c < cc; ++c) px[c] = s[std::size_t(c) * H * W + x];
+          const std::size_t p = p0 + x;
+          const std::size_t g = p / kGroupOutRows;
+          const std::size_t r = p % kGroupOutRows;
+          std::memcpy(
+              dst + ((g * chunks + chunk) * kGroupRows + r) * kKStep, px,
+              std::size_t(cc) * sizeof(uint16_t));
+          if (g > 0 && r + kGroupOutRows < std::size_t(kGroupRows))
+            std::memcpy(
+                dst + (((g - 1) * chunks + chunk) * kGroupRows + r +
+                       kGroupOutRows) * kKStep,
+                px, std::size_t(cc) * sizeof(uint16_t));
+        }
+      }
+    }
+  }
+}
+
+// OIHW bf16 -> atb-shuffled bfp16ebs8 bytes for output channels
+// [128*n_block, +128).  Block order [kb][n/16][k/8][2][8 n][8 k], K order
+// (chunk, dy, dx, c).  Each 8-k block = 1 exponent byte + 8 int8 mantissas.
+void xdna_conv3x3w_pack_weights_bfp16(
+    const uint16_t* w,
+    uint8_t* dst,
+    int Cout,
+    int Cin,
+    int chunks,
+    int n_block) {
+  const int nkb = chunks * 9;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int kb = 0; kb < nkb; ++kb) {
+    for (int n16 = 0; n16 < kN / 16; ++n16) {
+      const int chunk = kb / 9, tap = kb % 9;
+      uint8_t* out = dst + std::size_t(kb * (kN / 16) + n16) * 8 * 2 * 8 * 9;
+      for (int k8 = 0; k8 < 8; ++k8) {
+        for (int two = 0; two < 2; ++two) {
+          for (int nl = 0; nl < 8; ++nl) {
+            const int n = kN * n_block + n16 * 16 + two * 8 + nl;
+            uint32_t u[8];
+            int mx = 0;
+            for (int kl = 0; kl < 8; ++kl) {
+              const int c = chunk * kKStep + k8 * 8 + kl;
+              uint32_t bits = 0;
+              if (c < Cin && n < Cout)
+                bits = uint32_t(w[(std::size_t(n) * Cin + c) * 9 + tap]) << 16;
+              u[kl] = bits;
+              const int e = int((bits >> 23) & 0xFF);
+              if (e > mx) mx = e;
+            }
+            // scale = 2^(133 - mx), exact power of two in double
+            const uint64_t sb = uint64_t(1023 + 133 - mx) << 52;
+            double scale;
+            std::memcpy(&scale, &sb, sizeof(scale));
+            *out++ = uint8_t(mx);
+            for (int kl = 0; kl < 8; ++kl) {
+              float f;
+              std::memcpy(&f, &u[kl], sizeof(f));
+              double q = __builtin_nearbyint(double(f) * scale);
+              q = q < -128.0 ? -128.0 : (q > 127.0 ? 127.0 : q);
+              *out++ = uint8_t(int8_t(int(q)));
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// [groups*2048][128] bf16 rows -> channel slice [c_start, c_start+cout_valid)
+// of an NCHW [B][C_total][H][W] tensor (valid pixels only).
+void xdna_conv3x3w_unpack_output_bf16(
+    const uint16_t* c,
+    uint16_t* dst,
+    int B,
+    int H,
+    int W,
+    int cout_valid,
+    int C_total,
+    int c_start) {
+  const int wp = W + 2;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int b = 0; b < B; ++b) {
+    for (int y = 0; y < H; ++y) {
+      const uint16_t* s = c + (std::size_t(b) * (H + 2) + y) * wp * kN;
+      for (int n = 0; n < cout_valid; ++n) {
+        uint16_t* d =
+            dst + ((std::size_t(b) * C_total + c_start + n) * H + y) * W;
+        for (int x = 0; x < W; ++x) d[x] = s[std::size_t(x) * kN + n];
+      }
+    }
+  }
+}
+
+}  // extern "C"
+
+// ---- conv3x3w dX weights: the forward weight w[Cout_fwd][Cin_fwd][3][3] read as
+// w'[ci][co][dy][dx] = w[co][ci][2-dy][2-dx] (spatial flip + in/out swap), so the
+// dX conv (Cin' = Cout_fwd, Cout' = Cin_fwd) needs no flipped copy.  Same bytes as
+// xdna_conv3x3w_pack_weights_bfp16 of that tensor.
+extern "C" void xdna_conv3x3w_pack_weights_dx_bfp16(
+    const uint16_t* w,
+    uint8_t* dst,
+    int Cout_fwd,
+    int Cin_fwd,
+    int chunks,
+    int n_block) {
+  const int Cin = Cout_fwd, Cout = Cin_fwd;
+  const int nkb = chunks * 9;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int kb = 0; kb < nkb; ++kb) {
+    for (int n16 = 0; n16 < kN / 16; ++n16) {
+      const int chunk = kb / 9, tap = kb % 9;
+      uint8_t* out = dst + std::size_t(kb * (kN / 16) + n16) * 8 * 2 * 8 * 9;
+      for (int k8 = 0; k8 < 8; ++k8) {
+        for (int two = 0; two < 2; ++two) {
+          for (int nl = 0; nl < 8; ++nl) {
+            const int n = kN * n_block + n16 * 16 + two * 8 + nl;
+            uint32_t u[8];
+            int mx = 0;
+            for (int kl = 0; kl < 8; ++kl) {
+              const int c = chunk * kKStep + k8 * 8 + kl;
+              uint32_t bits = 0;
+              if (c < Cin && n < Cout)
+                bits = uint32_t(w[(std::size_t(c) * Cin_fwd + n) * 9 + (8 - tap)]) << 16;
+              u[kl] = bits;
+              const int e = int((bits >> 23) & 0xFF);
+              if (e > mx) mx = e;
+            }
+            const uint64_t sb = uint64_t(1023 + 133 - mx) << 52;
+            double scale;
+            std::memcpy(&scale, &sb, sizeof(scale));
+            *out++ = uint8_t(mx);
+            for (int kl = 0; kl < 8; ++kl) {
+              float f;
+              std::memcpy(&f, &u[kl], sizeof(f));
+              double q = __builtin_nearbyint(double(f) * scale);
+              q = q < -128.0 ? -128.0 : (q > 127.0 ? 127.0 : q);
+              *out++ = uint8_t(int8_t(int(q)));
+            }
+          }
+        }
       }
     }
   }

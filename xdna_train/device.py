@@ -99,6 +99,61 @@ def _configure_default_allocator_budget() -> None:
     os.environ["XDNA_BO_CACHE_MB"] = str(budget_mb)
 
 
+def _manifest(artifact_dir: Path) -> dict[str, str]:
+    path = artifact_dir / "manifest.txt"
+    if not path.is_file():
+        return {}
+    return dict(
+        line.split("=", 1) for line in path.read_text().splitlines() if "=" in line
+    )
+
+
+def _iron_python() -> str:
+    """Python of an mlir-aie (IRON) environment, used to compile conv3x3w
+    instruction streams on demand.  XDNA_IRON_PYTHON overrides; an empty
+    value disables on-demand builds."""
+    raw = os.environ.get("XDNA_IRON_PYTHON")
+    if raw is not None:
+        return raw
+    for candidate in (
+        _ROOT.parent.parent / "mlir-aie-env" / "bin" / "python",
+        Path.home() / "mlir-aie-env" / "bin" / "python",
+        Path.home() / "ironenv" / "bin" / "python",
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return ""
+
+
+def _configure_iron_family(name: str, configure, min_macs: int) -> None:
+    """Configure an on-demand IRON family: _designs/<name>.py + <name>_kernel.cc,
+    streams cached under the source hash."""
+    import shlex
+
+    designs = _ROOT / "_designs"
+    sources = [designs / f"{name}.py", designs / f"{name}_kernel.cc"]
+    if not all(p.is_file() for p in sources):
+        return
+    h = hashlib.sha256()
+    for p in sources:
+        h.update(p.read_bytes())
+    from ._build import _cache_root
+    env = name.upper()
+    cache = Path(os.environ.get(f"XDNA_{env}_DIR") or _cache_root() / name / h.hexdigest()[:16])
+    python = _iron_python()
+    build_cmd = ""
+    if python:
+        build_cmd = f"nice -n 10 {shlex.quote(python)} {shlex.quote(str(sources[0]))}"
+    if not build_cmd and not (cache / f"{name}.xclbin").is_file():
+        return
+    configure(
+        str(cache),
+        build_cmd,
+        int(os.environ.get(f"XDNA_{env}_MIN_MACS", str(min_macs))),
+        os.environ.get("XDNA_CONV3X3W_SYNC_BUILD", "0") == "1",
+    )
+
+
 def _load_native():
     global _C
     if _C is not None:
@@ -143,15 +198,34 @@ def register_xdna_device() -> None:
             str(gemm / "dw.bin"),
         )
 
-    conv = _ROOT / "_artifacts" / "conv3x3_patch40_128"
-    if conv.is_dir():
+    conv = Path(
+        os.environ.get("XDNA_PATCH_CONV_ARTIFACT_DIR")
+        or str(_ROOT / "_artifacts" / "conv3x3_patch40_128")
+    )
+    # Diagnostic cost-policy gate: leave resident patch Conv disabled when its
+    # complete fwd+dX+CPU dW costs more than the mapped CPU fallback.
+    if conv.is_dir() and os.environ.get("XDNA_ENABLE_PATCH_CONV", "1") == "1":
+        shapes = _manifest(conv)
         _C.configure_conv_family(
             str(conv / "final.xclbin"),
             str(conv / "fwd18.bin"),
             str(conv / "dx18.bin"),
             str(conv / "fwd36.bin"),
             str(conv / "dx36.bin"),
+            int(shapes.get("fwd18_shape", "12960x").split("x")[0]),
+            int(shapes.get("fwd36_shape", "51840x").split("x")[0]),
         )
+
+    # General 3x3 conv family (BFP16 weights); XDNA_CONV3X3W=0 disables it.
+    # Below ~20 MMAC (e.g. RGB input layers) host packing and dispatch cost
+    # more than the CPU conv.
+    if os.environ.get("XDNA_CONV3X3W", "1") == "1":
+        _configure_iron_family("conv3x3w", _C.configure_conv3x3w, 20_000_000)
+        # Its weight gradient (BFP16 operands, fp32 sums), deferred to the
+        # optimizer.  Smaller dWs stay on the CPU, where they overlap the NPU dX
+        # chain for free; XDNA_CONV3X3W_DW=0 keeps every dW on the CPU.
+        if os.environ.get("XDNA_CONV3X3W_DW", "1") == "1":
+            _configure_iron_family("conv3x3w_dw", _C.configure_conv3x3w_dw, 1_000_000_000)
 
     full = Path(
         os.environ.get(

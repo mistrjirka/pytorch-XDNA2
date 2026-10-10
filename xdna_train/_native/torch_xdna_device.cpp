@@ -6,6 +6,8 @@
 #include <ATen/ops/convolution_ops.h>
 #include <ATen/ops/convolution_backward_ops.h>
 #include <ATen/ops/mm_ops.h>
+#include <ATen/ops/addmm_ops.h>
+#include <ATen/ops/bmm_ops.h>
 #include <ATen/ops/mul_ops.h>
 #include <ATen/ops/div_ops.h>
 #include <ATen/ops/sqrt_ops.h>
@@ -26,6 +28,7 @@
 #include <ATen/CPUGeneratorImpl.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/Allocator.h>
+#include <c10/core/CPUAllocator.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/core/StorageImpl.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
@@ -33,6 +36,7 @@
 #include "xrt_shim.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -42,7 +46,10 @@
 #include <unordered_map>
 #include <vector>
 #include <array>
+#include <filesystem>
 #include <fstream>
+#include <map>
+#include <set>
 #include <future>
 #include <condition_variable>
 #include <deque>
@@ -59,6 +66,8 @@ extern "C" void xdna_pack_conv3x3_halo_bf16(
 extern "C" void xdna_pack_conv3x3_halo_padded_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
 extern "C" void xdna_pack_conv3x3_halo_padded_channels_last_bf16(
+    const uint16_t*, uint16_t*, int, int, int, int, int);
+extern "C" void xdna_yxbc_to_nchw_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
 extern "C" void xdna_yxbc_to_channels_last_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
@@ -83,6 +92,16 @@ extern "C" void xdna_pack_conv3x3_dy_channels_last_bf16(
     const uint16_t*, uint16_t*, int, int, int, int);
 extern "C" void xdna_pack_conv3x3_dy_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
+extern "C" void xdna_conv3x3w_pack_input_bf16(
+    const uint16_t*, uint16_t*, int, int, int, int, int);
+extern "C" void xdna_conv3x3w_pack_weights_bfp16(
+    const uint16_t*, uint8_t*, int, int, int, int);
+extern "C" void xdna_conv3x3w_pack_weights_dx_bfp16(
+    const uint16_t*, uint8_t*, int, int, int, int);
+extern "C" void xdna_conv3x3w_unpack_output_bf16(
+    const uint16_t*, uint16_t*, int, int, int, int, int, int);
+extern "C" ShimRun* shim_run_kernel_start(
+    ShimKernel*, unsigned int, ShimBo*, size_t, ShimBo* const*, size_t);
 
 namespace {
 
@@ -90,6 +109,46 @@ constexpr c10::DeviceType kXdnaType = c10::DeviceType::PrivateUse1;
 constexpr size_t kPageAlignment = 4096;
 constexpr uint64_t kXdnaAllocationMagic = 0x58444e41424f3031ULL; // "XDNABO01"
 thread_local c10::DeviceIndex g_current_device = 0;
+
+// Intra-op width for host (CPU) compute issued from XDNA kernels.
+//
+// Autograd runs backward for non-CPU devices on its own worker thread, and the
+// CPU dW overlap uses std::async/queue threads.  Fresh threads take their
+// OpenMP width from ATen's process-wide value, which other code lowers:
+// DataLoader(pin_memory=True) calls torch.set_num_threads(1) in its pin
+// thread.  Every XDNA backward op then ran single-threaded (4x slower NIS
+// step).  Follow the width the user sets on the thread that loaded the
+// backend (the Python main thread) and apply it to every other thread
+// before host compute.  XDNA_HOST_THREADS=N pins the width instead.
+std::atomic<int> g_host_threads{0};
+std::thread::id g_host_threads_owner;
+bool g_host_threads_fixed = false;
+
+void init_host_threads() {
+  g_host_threads_owner = std::this_thread::get_id();
+  if (const char* raw = std::getenv("XDNA_HOST_THREADS")) {
+    const int parsed = std::atoi(raw);
+    if (parsed > 0) {
+      g_host_threads.store(parsed, std::memory_order_relaxed);
+      g_host_threads_fixed = true;
+      return;
+    }
+  }
+  g_host_threads.store(at::get_num_threads(), std::memory_order_relaxed);
+}
+
+void sync_host_threads() {
+  if (std::this_thread::get_id() == g_host_threads_owner) {
+    if (!g_host_threads_fixed) {
+      g_host_threads.store(at::get_num_threads(), std::memory_order_relaxed);
+    }
+    return;
+  }
+  const int want = g_host_threads.load(std::memory_order_relaxed);
+  if (want > 0 && at::get_num_threads() != want) {
+    at::set_num_threads(want);
+  }
+}
 
 ShimDevice* xdna_device();
 
@@ -492,6 +551,7 @@ class AsyncHostWorkQueue {
         task = std::move(tasks_.front());
         tasks_.pop_front();
       }
+      sync_host_threads();
       task();
       {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -619,6 +679,135 @@ struct XdnaAllocator final : c10::Allocator {
 
 XdnaAllocator g_xdna_allocator;
 
+// Output adoption for host compute.
+//
+// Many XDNA ops run a CPU kernel on aliases of XRT memory.  CPU kernels that
+// only exist functionally (convolution, convolution_backward, and anything in
+// the boxed fallback) allocate their result with the CPU allocator, which used
+// to cost a full copy into XDNA storage per output (~10% of a NIS step).
+// Inside an AdoptHostAllocations scope, large CPU allocations are served from
+// the XRT BO cache instead, so adopt_host_tensor() can hand the result over
+// to an XDNA tensor without copying.  Outside a scope, and for small or
+// unadopted tensors, behavior is the ordinary CPU allocator's.
+thread_local int g_adopt_depth = 0;
+constexpr size_t kAdoptMinBytes = size_t(64) << 10;
+
+std::mutex& host_bo_mutex() {
+  static auto* value = new std::mutex();
+  return *value;
+}
+
+// data pointer -> XRT allocation, for CPU DataPtrs served from the BO cache.
+std::unordered_map<void*, XdnaAllocation*>& host_bo_map() {
+  static auto* value = new std::unordered_map<void*, XdnaAllocation*>();
+  return *value;
+}
+
+struct XdnaHostAllocator final : c10::Allocator {
+  c10::Allocator* base = nullptr;
+
+  // Context is the data pointer itself, as raw_allocate() requires.
+  static void deleter(void* data);
+
+  c10::DataPtr allocate(size_t nbytes) override {
+    if (g_adopt_depth > 0 && nbytes >= kAdoptMinBytes) {
+      auto dp = g_xdna_allocator.allocate(nbytes);
+      auto* allocation = static_cast<XdnaAllocation*>(dp.release_context());
+      void* data = allocation->mapped;
+      {
+        std::lock_guard<std::mutex> guard(host_bo_mutex());
+        host_bo_map()[data] = allocation;
+      }
+      return c10::DataPtr(
+          data, data, &XdnaHostAllocator::deleter, c10::Device(c10::DeviceType::CPU));
+    }
+    return base->allocate(nbytes);
+  }
+
+  c10::DeleterFnPtr raw_deleter() const override {
+    return &XdnaHostAllocator::deleter;
+  }
+
+  void copy_data(void* dest, const void* src, std::size_t count) const override {
+    std::memcpy(dest, src, count);
+  }
+};
+
+XdnaHostAllocator g_host_allocator;
+
+void XdnaHostAllocator::deleter(void* data) {
+  XdnaAllocation* allocation = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(host_bo_mutex());
+    auto& map = host_bo_map();
+    auto it = map.find(data);
+    if (it != map.end()) {
+      allocation = it->second;
+      map.erase(it);
+    }
+  }
+  if (allocation != nullptr) {
+    XdnaAllocator::deleter(allocation);
+  } else {
+    // A raw_allocate() served by the base allocator.
+    g_host_allocator.base->raw_deleter()(data);
+  }
+}
+
+void install_host_allocator() {
+  g_host_allocator.base = c10::GetCPUAllocator();
+  c10::SetCPUAllocator(&g_host_allocator, /*priority=*/1);
+}
+
+struct AdoptHostAllocations {
+  AdoptHostAllocations() { ++g_adopt_depth; }
+  ~AdoptHostAllocations() { --g_adopt_depth; }
+  AdoptHostAllocations(const AdoptHostAllocations&) = delete;
+  AdoptHostAllocations& operator=(const AdoptHostAllocations&) = delete;
+};
+
+// The XDNA tensor sharing `t`'s memory, when `t` is a CPU tensor whose sole
+// storage came from the BO cache; std::nullopt otherwise (caller copies).
+std::optional<at::Tensor> adopt_host_tensor(const at::Tensor& t) {
+  if (!t.defined() || t.device().type() != c10::DeviceType::CPU) {
+    return std::nullopt;
+  }
+  const c10::Storage& handle = t.unsafeGetTensorImpl()->storage();
+  c10::StorageImpl* storage = handle.unsafeGetStorageImpl();
+  if (storage->data_ptr().get_deleter() != &XdnaHostAllocator::deleter ||
+      handle.use_count() != 1) {
+    return std::nullopt;
+  }
+  void* data = storage->mutable_data();
+  XdnaAllocation* allocation = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(host_bo_mutex());
+    auto& map = host_bo_map();
+    auto it = map.find(data);
+    if (it == map.end()) return std::nullopt;
+    allocation = it->second;
+    map.erase(it);
+  }
+  // The CPU tensor gives up its memory without running a deleter.
+  auto old = storage->set_data_ptr(c10::DataPtr(nullptr, c10::Device(c10::DeviceType::CPU)));
+  old.release_context();
+  auto xdna_storage = c10::make_intrusive<c10::StorageImpl>(
+      c10::StorageImpl::use_byte_size_t(),
+      storage->nbytes(),
+      c10::DataPtr(data, allocation, &XdnaAllocator::deleter, c10::Device(kXdnaType, 0)),
+      &g_xdna_allocator,
+      /*resizable=*/true);
+  storage->set_nbytes(0);
+  auto impl = c10::make_intrusive<c10::TensorImpl>(
+      c10::Storage(std::move(xdna_storage)),
+      c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
+      t.dtype());
+  impl->set_sizes_and_strides(t.sizes(), t.strides(), t.storage_offset());
+  at::Tensor out(std::move(impl));
+  allocation->coherency = XdnaCoherency::HostDirty;
+  return out;
+}
+
 c10::intrusive_ptr<c10::StorageImpl> make_xdna_storage_impl(
     c10::StorageImpl::use_byte_size_t,
     c10::SymInt size_bytes,
@@ -662,6 +851,11 @@ struct XdnaGuardImpl final : c10::impl::DeviceGuardImplInterface {
     TORCH_CHECK(d.type() == kXdnaType, "expected XDNA/PrivateUse1 device");
     TORCH_CHECK(d.index() <= 0, "only xdna:0 is currently supported");
     g_current_device = 0;
+    // No sync_host_threads() here: DataLoader's pin thread sets the device
+    // right after torch.set_num_threads(1), and widening it to the full
+    // intra-op width added a third spinning OpenMP team (+25% NIS step).
+    // Host compute entry points (ScopedMappedCpu, fallback, dW workers)
+    // apply the width where it is actually used.
   }
 
   void uncheckedSetDevice(c10::Device) const noexcept override {
@@ -1090,6 +1284,59 @@ struct XdnaConvStream {
   size_t instr_words = 0;
 };
 
+struct MappedCpuStat {
+  uint64_t calls = 0;
+  uint64_t total_ns = 0;
+};
+
+std::mutex& mapped_cpu_stats_mutex() {
+  static auto* value = new std::mutex();
+  return *value;
+}
+
+std::unordered_map<std::string, MappedCpuStat>& mapped_cpu_stats_map() {
+  static auto* value =
+      new std::unordered_map<std::string, MappedCpuStat>();
+  return *value;
+}
+
+bool profile_mapped_cpu() {
+  static const bool enabled = []() {
+    const char* raw = std::getenv("XDNA_PROFILE_MAPPED_CPU");
+    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+  }();
+  return enabled;
+}
+
+void record_mapped_cpu_ns(const char* name, uint64_t ns) {
+  if (!profile_mapped_cpu()) return;
+  std::lock_guard<std::mutex> guard(mapped_cpu_stats_mutex());
+  auto& stat = mapped_cpu_stats_map()[name];
+  ++stat.calls;
+  stat.total_ns += ns;
+}
+
+class ScopedMappedCpu {
+ public:
+  explicit ScopedMappedCpu(const char* name)
+      : name_(name), enabled_(profile_mapped_cpu()) {
+    sync_host_threads();
+    if (enabled_) start_ = std::chrono::steady_clock::now();
+  }
+  ~ScopedMappedCpu() {
+    if (!enabled_) return;
+    const auto end = std::chrono::steady_clock::now();
+    const uint64_t ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start_).count());
+    record_mapped_cpu_ns(name_, ns);
+  }
+ private:
+  const char* name_;
+  bool enabled_;
+  std::chrono::steady_clock::time_point start_{};
+};
+
 struct XdnaConvRuntime {
   static constexpr int64_t kBatch = 40;
   static constexpr int64_t kCout = 128;
@@ -1182,7 +1429,9 @@ struct XdnaConvRuntime {
       const std::string& fwd18,
       const std::string& dx18,
       const std::string& fwd36,
-      const std::string& dx36) {
+      const std::string& dx36,
+      int64_t m_sched18,
+      int64_t m_sched36) {
     kernel = shim_kernel_load(
         xdna_device(), xclbin.c_str(), nullptr, QOS_PRIORITY_NONE);
     TORCH_CHECK(kernel != nullptr, "failed to load XDNA Conv family: ", shim_last_error());
@@ -1192,14 +1441,16 @@ struct XdnaConvRuntime {
       if (parsed > 0) pack_threads = parsed;
     }
     xdna_conv_set_threads(pack_threads);
+    // Scheduled GEMM rows come from the artifact manifest: they depend on
+    // the tile height the streams were built with (padding to whole tiles).
     open_stream(
-        forward_streams[0], "fwd18", fwd18, 256, 18, 12960, 2304);
+        forward_streams[0], "fwd18", fwd18, 256, 18, m_sched18, 2304);
     open_stream(
-        dx_streams[0], "dx18", dx18, 128, 18, 12960, 1152);
+        dx_streams[0], "dx18", dx18, 128, 18, m_sched18, 1152);
     open_stream(
-        forward_streams[1], "fwd36", fwd36, 256, 36, 51840, 2304);
+        forward_streams[1], "fwd36", fwd36, 256, 36, m_sched36, 2304);
     open_stream(
-        dx_streams[1], "dx36", dx36, 128, 36, 51840, 1152);
+        dx_streams[1], "dx36", dx36, 128, 36, m_sched36, 1152);
   }
 
   XdnaConvStream* find_forward(
@@ -1284,7 +1535,6 @@ struct XdnaConvRuntime {
     TORCH_CHECK(weight_cpu.is_contiguous(), "XDNA Conv weight must be contiguous");
 
     const int64_t h = stream.h;
-    const int64_t real_m = kBatch * h * h;
     auto out = empty_memory_format(
         {
             c10::SymInt(kBatch),
@@ -1334,6 +1584,7 @@ struct XdnaConvRuntime {
           false,
           at::MemoryFormat::Contiguous);
       auto* raw_alloc = allocation_from_tensor(raw);
+      ScopedMappedCpu run_phase("npu_conv.dx.run");
       TORCH_CHECK(
           shim_run_matmul8(
               kernel,
@@ -1350,14 +1601,14 @@ struct XdnaConvRuntime {
       mark_device_dirty(raw);
       ensure_host_current(raw);
 
-      auto raw_cpu = cpu_alias(raw);
-      auto view = raw_cpu
-          .narrow(0, 0, real_m)
-          .view({h, h, kBatch, kCout})
-          .permute({2, 3, 0, 1});
-      out_cpu
-          .narrow(1, start, kCout)
-          .copy_(view);
+      xdna_yxbc_to_nchw_bf16(
+          static_cast<const uint16_t*>(raw.const_data_ptr()),
+          static_cast<uint16_t*>(out_cpu.data_ptr()),
+          static_cast<int>(kBatch),
+          static_cast<int>(kCout),
+          static_cast<int>(h * h),
+          256,
+          start);
     }
 
     mark_host_dirty(out);
@@ -1370,6 +1621,7 @@ struct XdnaConvRuntime {
       XdnaConvStream& stream) {
     ensure_host_current(input);
     ensure_host_current(weight);
+    auto pack_phase = std::make_optional<ScopedMappedCpu>("npu_conv.fwd.pack+sync");
     xdna_pack_conv3x3_halo_bf16(
         static_cast<const uint16_t*>(input.const_data_ptr()),
         static_cast<uint16_t*>(stream.a_ptr),
@@ -1387,6 +1639,7 @@ struct XdnaConvRuntime {
             shim_bo_sync_to_device(stream.b) == 0,
         "failed to sync XDNA Conv operands: ",
         shim_last_error());
+    pack_phase.reset();
 
     auto raw = empty_memory_format(
         {c10::SymInt(stream.m_sched), c10::SymInt(kCout)},
@@ -1397,6 +1650,7 @@ struct XdnaConvRuntime {
         at::MemoryFormat::Contiguous);
     auto* out = allocation_from_tensor(raw);
     {
+      ScopedMappedCpu run_phase("npu_conv.fwd.run");
       std::lock_guard<std::mutex> guard(mutex);
       TORCH_CHECK(
           shim_run_matmul8(
@@ -1413,6 +1667,36 @@ struct XdnaConvRuntime {
           shim_last_error());
     }
     mark_device_dirty(raw);
+
+    // Consumer-layout policy for small BF16 Conv family.
+    // The raw [Y,X,B,Cout] result is zero-copy, but CPU BatchNorm is up to
+    // 20x slower on those strides than on contiguous NCHW, and the blocked
+    // transpose costs ~2 ms at H36.  Transpose by default;
+    // XDNA_CONV_OUTPUT_NCHW=0 keeps the raw layout for NPU-to-NPU consumers.
+    if (const char* setting = std::getenv("XDNA_CONV_OUTPUT_NCHW");
+        setting == nullptr || std::strcmp(setting, "0") != 0) {
+      ScopedMappedCpu reorder_phase("npu_conv.fwd.sync_back+reorder");
+      ensure_host_current(raw);
+      const int64_t hh = stream.h;
+      auto reordered = empty_memory_format(
+          {c10::SymInt(kBatch), c10::SymInt(kCout),
+           c10::SymInt(hh), c10::SymInt(hh)},
+          at::ScalarType::BFloat16,
+          at::Layout::Strided,
+          c10::Device(kXdnaType, 0),
+          false,
+          at::MemoryFormat::Contiguous);
+      xdna_yxbc_to_nchw_bf16(
+          static_cast<const uint16_t*>(raw.const_data_ptr()),
+          static_cast<uint16_t*>(reordered.data_ptr()),
+          static_cast<int>(kBatch),
+          static_cast<int>(kCout),
+          static_cast<int>(hh * hh),
+          static_cast<int>(kCout),
+          0);
+      mark_host_dirty(reordered);
+      return reordered;
+    }
 
     // GEMM rows are physically [Y,X,Batch,Cout]. Present them to PyTorch as
     // logical NCHW through strides; no output transpose/copy is needed.
@@ -1431,6 +1715,670 @@ struct XdnaConvRuntime {
 
 std::unique_ptr<XdnaConvRuntime>& conv_runtime_slot() {
   static auto* slot = new std::unique_ptr<XdnaConvRuntime>();
+  return *slot;
+}
+
+// conv3x3w: 3x3 / stride 1 / pad 1 convolution on the whole array for any
+// batch, height, channel count and width <= 36 (xdna_train/_designs/conv3x3w.py).
+// One xclbin; an instruction stream per (groups, padded width, channel chunks),
+// compiled on first use by a background job and cached on disk.  Until a
+// stream exists the conv takes the next path (older NPU families or CPU), so
+// a new shape never blocks training.  Arithmetic: bf16 activations x bfp16
+// weights with a bf16 running sum (~1.2% rel. RMS vs fp32; CPU bf16 ~0.2%).
+// Compiles IRON instruction streams in the background: one niced build at a
+// time, each key at most once per process.  `cmd` is the design script
+// invocation; a build appends "--out <dir> <args>" and must write <dir>/<key>.bin.
+struct IronStreamBuilder {
+  std::string dir;
+  std::string cmd;  // empty: only streams already on disk are used
+  bool sync = false;
+
+  std::mutex m;
+  std::condition_variable cv;
+  std::deque<std::pair<std::string, std::string>> queue;  // key, args
+  std::set<std::string> seen;
+  bool started = false;
+
+  std::filesystem::path path(const std::string& key) const {
+    return std::filesystem::path(dir) / (key + ".bin");
+  }
+  bool exists(const std::string& key) const { return std::filesystem::exists(path(key)); }
+
+  void build(const std::string& args) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::string line = cmd + " --out '" + dir + "' " + args + " >> '" + dir +
+        "/build.log' 2>&1";
+    (void)std::system(line.c_str());
+  }
+
+  // Make sure a build of `key` is under way (or done).
+  void request(const std::string& key, const std::string& args) {
+    if (cmd.empty()) return;
+    std::unique_lock<std::mutex> lock(m);
+    if (!seen.insert(key).second) return;
+    if (sync) {
+      lock.unlock();
+      build(args);
+      return;
+    }
+    queue.emplace_back(key, args);
+    if (!started) {
+      started = true;
+      std::thread([this] {
+        for (;;) {
+          std::string args;
+          {
+            std::unique_lock<std::mutex> lock(m);
+            cv.wait(lock, [&] { return !queue.empty(); });
+            args = queue.front().second;
+            queue.pop_front();
+          }
+          build(args);
+        }
+      }).detach();
+    }
+    cv.notify_one();
+  }
+
+  // True if the stream exists; otherwise queues its build.
+  bool ready(const std::string& key, const std::string& args) {
+    if (exists(key)) return true;
+    request(key, args);
+    return exists(key);
+  }
+};
+
+struct Conv3x3wPlan {
+  int64_t batch = 0, cin = 0, cout = 0, h = 0, w = 0;
+  int64_t groups = 0, wp = 0, chunks = 0;
+  std::string key;
+};
+
+struct Conv3x3wWeightSlot {
+  ShimBo* bo = nullptr;
+  void* ptr = nullptr;
+  bool valid = false;
+  // Tag: storage pointer + TensorImpl version counter identify the contents;
+  // the storage is pinned while tagged so its address cannot be reused.
+  at::Storage pin;
+  const void* data = nullptr;
+  uint32_t version = 0;
+  std::array<int64_t, 8> geom{};  // sizes, strides
+  bool dx = false;
+  int64_t nb = 0;
+  uint64_t last_use = 0;
+};
+
+// Waits for (and frees) an in-flight async dispatch, also when unwinding.
+struct Conv3x3wRun {
+  ShimRun* r = nullptr;
+  Conv3x3wRun() = default;
+  Conv3x3wRun(const Conv3x3wRun&) = delete;
+  ~Conv3x3wRun() {
+    if (r) {
+      shim_run_wait(r);
+      shim_run_free(r);
+    }
+  }
+  void wait() {
+    ShimRun* h = r;
+    r = nullptr;
+    const int rc = shim_run_wait(h);
+    shim_run_free(h);
+    TORCH_CHECK(rc == 0, "conv3x3w dispatch failed: ", shim_last_error());
+  }
+};
+
+struct Conv3x3wStream {
+  ShimBo* instr = nullptr;
+  size_t instr_words = 0;
+  // Packed input [groups][chunks][2126][64]: zeroed once; packing rewrites
+  // only real pixels and channels, so borders and padding stay zero.
+  ShimBo* x = nullptr;
+  void* x_ptr = nullptr;
+  // bfp16 weight BOs, one per (weight tensor, fwd/dx, 128-channel block): the
+  // stream is shared by every layer with the same shape key, so the tag says
+  // which encoding a BO currently holds.
+  std::vector<Conv3x3wWeightSlot> wslots;
+  uint64_t use_clock = 0;
+};
+
+struct XdnaConv3x3wRuntime {
+  static constexpr int64_t kN = 128;
+  static constexpr int64_t kKStep = 64;
+  static constexpr int64_t kGroupOutRows = 2048;
+  static constexpr int64_t kGroupRows = 2126;
+  static constexpr int64_t kMaxWidth = 36;
+  static constexpr int64_t kMaxGroups = 1024;
+
+  IronStreamBuilder builder;
+  int64_t min_macs = 0;
+
+  std::mutex mutex;  // kernel, streams, dispatch
+  ShimKernel* kernel = nullptr;
+  std::map<std::string, std::unique_ptr<Conv3x3wStream>> streams;
+
+  static int64_t ceil_div(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+  std::filesystem::path xclbin_path() const {
+    return std::filesystem::path(builder.dir) / "conv3x3w.xclbin";
+  }
+
+  // Shape check only (no stream lookup).  `x` is the conv input (or dY for
+  // dX), `weight_cout`/`weight_cin` the effective output/input channels.
+  std::optional<Conv3x3wPlan> plan(
+      const at::Tensor& x,
+      const at::Tensor& weight,
+      bool for_dx,
+      c10::SymIntArrayRef stride,
+      c10::SymIntArrayRef padding,
+      c10::SymIntArrayRef dilation,
+      bool transposed,
+      c10::SymIntArrayRef output_padding,
+      const c10::SymInt& groups) const {
+    if (x.scalar_type() != at::ScalarType::BFloat16 ||
+        weight.scalar_type() != at::ScalarType::BFloat16 ||
+        x.dim() != 4 || weight.dim() != 4 ||
+        weight.size(2) != 3 || weight.size(3) != 3 ||
+        stride.size() != 2 || stride[0] != 1 || stride[1] != 1 ||
+        padding.size() != 2 || padding[0] != 1 || padding[1] != 1 ||
+        dilation.size() != 2 || dilation[0] != 1 || dilation[1] != 1 ||
+        transposed ||
+        output_padding.size() != 2 ||
+        output_padding[0] != 0 || output_padding[1] != 0 ||
+        groups != 1) {
+      return std::nullopt;
+    }
+    Conv3x3wPlan p;
+    p.batch = x.size(0);
+    p.cin = for_dx ? weight.size(0) : weight.size(1);
+    p.cout = for_dx ? weight.size(1) : weight.size(0);
+    p.h = x.size(2);
+    p.w = x.size(3);
+    if (x.size(1) != p.cin || p.batch < 1 || p.h < 1 || p.w < 1 ||
+        p.w > kMaxWidth || p.cin < 1 || p.cout < 1) {
+      return std::nullopt;
+    }
+    if (p.batch * p.h * p.w * p.cin * p.cout * 9 < min_macs) return std::nullopt;
+    p.wp = p.w + 2;
+    p.groups = ceil_div(p.batch * (p.h + 2) * p.wp, kGroupOutRows);
+    p.chunks = ceil_div(p.cin, kKStep);
+    if (p.groups > kMaxGroups) return std::nullopt;
+    p.key = "g" + std::to_string(p.groups) + "_w" + std::to_string(p.wp) +
+        "_c" + std::to_string(p.chunks);
+    return p;
+  }
+
+  // The stream for p if it is ready, else nullptr (and a build is queued).
+  Conv3x3wStream* stream(const Conv3x3wPlan& p) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      auto it = streams.find(p.key);
+      if (it != streams.end()) return it->second.get();
+    }
+    if (!builder.ready(p.key, "--groups " + std::to_string(p.groups) + " --wp " +
+                                  std::to_string(p.wp) + " --chunks " + std::to_string(p.chunks))) {
+      return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!kernel) {
+      kernel = shim_kernel_load(
+          xdna_device(), xclbin_path().c_str(), nullptr, QOS_PRIORITY_NONE);
+      TORCH_CHECK(kernel != nullptr, "failed to load conv3x3w xclbin: ", shim_last_error());
+    }
+    auto blob = XdnaGemmRuntime::read_file(builder.path(p.key).string());
+    TORCH_CHECK(blob.size() % 4 == 0, "conv3x3w stream is not word aligned: ", p.key);
+    auto s = std::make_unique<Conv3x3wStream>();
+    s->instr = shim_bo_alloc(
+        xdna_device(), kernel, blob.size(), 1, shim_kernel_group_id(kernel, 1));
+    const size_t x_bytes = static_cast<size_t>(
+        p.groups * p.chunks * kGroupRows * kKStep * 2);
+    s->x = shim_bo_alloc(xdna_device(), kernel, x_bytes, 2, 0);
+    TORCH_CHECK(s->instr && s->x, "failed to allocate conv3x3w buffers: ", shim_last_error());
+    TORCH_CHECK(
+        shim_bo_write(s->instr, blob.data(), blob.size(), 0) == 0 &&
+            shim_bo_sync_to_device(s->instr) == 0,
+        "failed to upload conv3x3w stream: ", shim_last_error());
+    s->instr_words = blob.size() / 4;
+    s->x_ptr = shim_bo_map(s->x);
+    TORCH_CHECK(s->x_ptr, "failed to map conv3x3w input: ", shim_last_error());
+    std::memset(s->x_ptr, 0, x_bytes);
+    auto* raw = s.get();
+    streams.emplace(p.key, std::move(s));
+    return raw;
+  }
+
+  static bool weight_cache_enabled() {
+    const char* e = std::getenv("XDNA_CONV3X3W_WEIGHT_CACHE");
+    return !(e && e[0] == '0');
+  }
+
+  // The weight BO for (weight, dx, nb) in s.  Sets `hit` when it already holds
+  // that encoding; otherwise the caller encodes into it.  Slots used by the
+  // current call (last_use >= call_start) are never taken.
+  Conv3x3wWeightSlot& weight_slot(
+      Conv3x3wStream& s, const at::Tensor& weight, bool dx, int64_t nb,
+      size_t b_bytes, uint64_t call_start, bool& hit) {
+    constexpr size_t kMaxSlots = 256;
+    const bool cache = weight_cache_enabled() && !weight.is_inference();
+    std::array<int64_t, 8> geom{};
+    for (int i = 0; i < 4; ++i) {
+      geom[i] = weight.size(i);
+      geom[4 + i] = weight.stride(i);
+    }
+    const void* data = weight.data_ptr();
+    const uint32_t version = cache
+        ? static_cast<uint32_t>(weight.unsafeGetTensorImpl()->version_counter().current_version())
+        : 0;
+    Conv3x3wWeightSlot* slot = nullptr;
+    hit = false;
+    if (cache) {
+      for (auto& c : s.wslots) {
+        if (c.valid && c.data == data && c.version == version && c.dx == dx &&
+            c.nb == nb && c.geom == geom) {
+          slot = &c;
+          hit = true;
+          break;
+        }
+      }
+    }
+    if (!slot) {
+      for (auto& c : s.wslots) {
+        if (!c.valid && c.last_use < call_start) { slot = &c; break; }
+      }
+    }
+    if (!slot && s.wslots.size() < kMaxSlots) {
+      auto* bo = shim_bo_alloc(xdna_device(), kernel, b_bytes, 2, 0);
+      TORCH_CHECK(bo, "failed to allocate conv3x3w weights: ", shim_last_error());
+      void* ptr = shim_bo_map(bo);
+      TORCH_CHECK(ptr, "failed to map conv3x3w weights: ", shim_last_error());
+      s.wslots.emplace_back();
+      slot = &s.wslots.back();
+      slot->bo = bo;
+      slot->ptr = ptr;
+    }
+    if (!slot) {
+      for (auto& c : s.wslots) {
+        if (c.last_use < call_start && (!slot || c.last_use < slot->last_use)) slot = &c;
+      }
+    }
+    TORCH_CHECK(slot, "conv3x3w: out of weight buffers");
+    slot->last_use = ++s.use_clock;
+    if (!hit) {
+      slot->valid = false;
+      slot->pin = at::Storage();
+      if (cache) {
+        slot->pin = weight.storage();
+        slot->data = data;
+        slot->version = version;
+        slot->geom = geom;
+        slot->dx = dx;
+        slot->nb = nb;
+      }
+    }
+    return *slot;
+  }
+
+  // out[:, :, :, :] = conv3x3(x, weight) (+ bias).  `weight` is the forward
+  // weight [cout][cin][3][3]; for_dx convolves with its flipped/transposed form.
+  at::Tensor run(
+      const at::Tensor& x,
+      const at::Tensor& weight,
+      bool for_dx,
+      const std::optional<at::Tensor>& bias,
+      const Conv3x3wPlan& p,
+      Conv3x3wStream& s,
+      const char* phase) {
+    ensure_host_current(x);
+    auto x_cpu = cpu_alias(x);
+    if (!x_cpu.is_contiguous()) x_cpu = x_cpu.contiguous();
+    auto out = empty_memory_format(
+        {c10::SymInt(p.batch), c10::SymInt(p.cout), c10::SymInt(p.h), c10::SymInt(p.w)},
+        at::ScalarType::BFloat16, at::Layout::Strided, c10::Device(kXdnaType, 0),
+        false, at::MemoryFormat::Contiguous);
+    auto out_cpu = cpu_alias(out);
+    const size_t b_bytes = static_cast<size_t>(p.chunks * 9 * kKStep * kN / 8 * 9);
+    const int64_t n_blocks = ceil_div(p.cout, kN);
+    // Two raw outputs so block nb can be unpacked while nb+1 runs.
+    std::array<at::Tensor, 2> raw;
+    for (int64_t i = 0; i < std::min<int64_t>(n_blocks, 2); ++i) {
+      raw[i] = empty_memory_format(
+          {c10::SymInt(p.groups * kGroupOutRows * kN)},
+          at::ScalarType::BFloat16, at::Layout::Strided, c10::Device(kXdnaType, 0),
+          false, at::MemoryFormat::Contiguous);
+    }
+
+    std::lock_guard<std::mutex> guard(mutex);
+    xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+    {
+      ScopedMappedCpu pack_phase("npu_conv3x3w.pack");
+      xdna_conv3x3w_pack_input_bf16(
+          static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
+          static_cast<uint16_t*>(s.x_ptr),
+          int(p.batch), int(p.cin), int(p.h), int(p.w), int(p.chunks));
+      TORCH_CHECK(shim_bo_sync_to_device(s.x) == 0,
+                  "failed to sync conv3x3w input: ", shim_last_error());
+    }
+    const uint64_t call_start = s.use_clock + 1;
+    std::optional<at::Tensor> w_cpu;
+    auto prepare = [&](int64_t nb) -> Conv3x3wWeightSlot& {
+      bool hit = false;
+      auto& slot = weight_slot(s, weight, for_dx, nb, b_bytes, call_start, hit);
+      if (hit) {
+        ScopedMappedCpu hit_phase("npu_conv3x3w.weights_hit");
+        return slot;
+      }
+      ScopedMappedCpu wpack_phase("npu_conv3x3w.weights");
+      if (!w_cpu) {
+        ensure_host_current(weight);
+        auto w = cpu_alias(weight);
+        w_cpu = w.is_contiguous() ? w : w.contiguous();
+      }
+      const auto* wp = static_cast<const uint16_t*>(w_cpu->const_data_ptr());
+      if (for_dx) {
+        xdna_conv3x3w_pack_weights_dx_bfp16(
+            wp, static_cast<uint8_t*>(slot.ptr),
+            int(p.cin), int(p.cout), int(p.chunks), int(nb));
+      } else {
+        xdna_conv3x3w_pack_weights_bfp16(
+            wp, static_cast<uint8_t*>(slot.ptr),
+            int(p.cout), int(p.cin), int(p.chunks), int(nb));
+      }
+      TORCH_CHECK(shim_bo_sync_to_device(slot.bo) == 0,
+                  "failed to sync conv3x3w weights: ", shim_last_error());
+      slot.valid = weight_cache_enabled() && static_cast<bool>(slot.pin);
+      return slot;
+    };
+    auto start = [&](Conv3x3wWeightSlot& slot, const at::Tensor& r, Conv3x3wRun& run) {
+      ShimBo* data[3] = {s.x, slot.bo, allocation_from_tensor(r)->bo};
+      run.r = shim_run_kernel_start(kernel, 3, s.instr, s.instr_words, data, 3);
+      TORCH_CHECK(run.r, "conv3x3w dispatch failed: ", shim_last_error());
+    };
+
+    Conv3x3wRun cur;
+    Conv3x3wWeightSlot* slot = &prepare(0);
+    // The run phase is the host wait for the NPU, i.e. what the overlapped
+    // CPU work did not hide.
+    start(*slot, raw[0], cur);
+    for (int64_t nb = 0; nb < n_blocks; ++nb) {
+      Conv3x3wWeightSlot* next = nullptr;
+      if (nb + 1 < n_blocks) next = &prepare(nb + 1);
+      {
+        ScopedMappedCpu run_phase(phase);
+        cur.wait();
+      }
+      if (next) start(*next, raw[(nb + 1) & 1], cur);
+      auto& rw = raw[nb & 1];
+      mark_device_dirty(rw);
+      {
+        ScopedMappedCpu sync_phase("npu_conv3x3w.unpack_sync");
+        ensure_host_current(rw);
+      }
+      ScopedMappedCpu unpack_phase("npu_conv3x3w.unpack");
+      xdna_conv3x3w_unpack_output_bf16(
+          static_cast<const uint16_t*>(rw.const_data_ptr()),
+          static_cast<uint16_t*>(out_cpu.data_ptr()),
+          int(p.batch), int(p.h), int(p.w),
+          int(std::min<int64_t>(kN, p.cout - nb * kN)), int(p.cout), int(nb * kN));
+    }
+    if (bias.has_value() && bias->defined()) {
+      ensure_host_current(*bias);
+      out_cpu.add_(cpu_alias(*bias).view({1, -1, 1, 1}));
+    }
+    mark_host_dirty(out);
+    return out;
+  }
+
+  std::optional<at::Tensor> try_forward(
+      const at::Tensor& input,
+      const at::Tensor& weight,
+      const std::optional<at::Tensor>& bias,
+      c10::SymIntArrayRef stride,
+      c10::SymIntArrayRef padding,
+      c10::SymIntArrayRef dilation,
+      bool transposed,
+      c10::SymIntArrayRef output_padding,
+      const c10::SymInt& groups) {
+    auto p = plan(input, weight, false, stride, padding, dilation, transposed,
+                  output_padding, groups);
+    if (!p) return std::nullopt;
+    if (bias.has_value() && bias->defined() &&
+        (bias->dim() != 1 || bias->size(0) != p->cout)) {
+      return std::nullopt;
+    }
+    auto* s = stream(*p);
+    if (!s) return std::nullopt;
+    return run(input, weight, false, bias, *p, *s, "npu_conv3x3w.fwd.run");
+  }
+
+  // dX of a 3x3 / pad 1 conv is the same conv of dY with the kernel
+  // flipped spatially and in/out channels swapped.
+  at::Tensor input_grad(
+      const at::Tensor& grad_output,
+      const at::Tensor& weight,
+      const Conv3x3wPlan& p,
+      Conv3x3wStream& s) {
+    return run(grad_output, weight, true, std::nullopt, p, s, "npu_conv3x3w.dx.run");
+  }
+};
+
+std::unique_ptr<XdnaConv3x3wRuntime>& conv3x3w_runtime_slot() {
+  static auto* slot = new std::unique_ptr<XdnaConv3x3wRuntime>();
+  return *slot;
+}
+
+// conv3x3w_dw: weight gradient of the same convolutions on the NPU
+// (xdna_train/_designs/conv3x3w_dw.py): bfp16 operands in 8-pixel blocks with
+// fp32 sums.  X and dY use the forward family's packed input layout.  A
+// dispatch covers 128 input x 128 output channels; streams per
+// (groups, padded width, chunks, cochunks, pass) are built on demand.
+//
+// It is its own xclbin, and a hardware-context switch costs ~2.6 ms, so dW is
+// never interleaved with the dX chain: backward returns the gradient as
+// pending host work, and the first reader (normally the optimizer) runs it.
+// All deferred dWs of a step then run back to back in one context.
+struct Conv3x3wDwPlan {
+  int64_t batch = 0, cin = 0, cout = 0, h = 0, w = 0;
+  int64_t groups = 0, wp = 0, chunks = 0, cochunks = 0;
+  std::string buf_key;
+  std::vector<std::pair<std::string, std::string>> passes;  // key, build args
+};
+
+struct Conv3x3wDwBuffers {
+  ShimBo* x = nullptr;
+  void* x_ptr = nullptr;
+  ShimBo* d = nullptr;
+  void* d_ptr = nullptr;
+};
+
+struct XdnaConv3x3wDwRuntime {
+  static constexpr int64_t kKStep = 64;
+  static constexpr int64_t kGroupOutRows = 2048;
+  static constexpr int64_t kGroupRows = 2126;
+  static constexpr int64_t kMaxWidth = 36;
+  static constexpr int64_t kMaxChunks = 15;  // shim stride limit (2^20 words)
+  static constexpr int64_t kAcc = 3 * 64 * 32;
+  static constexpr int64_t kCols = 6, kRows = 4;
+
+  IronStreamBuilder builder;
+  int64_t min_macs = 0;
+
+  std::mutex mutex;
+  ShimKernel* kernel = nullptr;
+  std::map<std::string, std::pair<ShimBo*, size_t>> streams;  // instr, words
+  std::map<std::string, Conv3x3wDwBuffers> buffers;
+  ShimBo* c = nullptr;
+  void* c_ptr = nullptr;
+
+  static int64_t ceil_div(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+  std::optional<Conv3x3wDwPlan> plan(
+      const at::Tensor& input,
+      const at::Tensor& grad_output,
+      const at::Tensor& weight,
+      c10::SymIntArrayRef stride,
+      c10::SymIntArrayRef padding,
+      c10::SymIntArrayRef dilation,
+      bool transposed,
+      c10::SymIntArrayRef output_padding,
+      const c10::SymInt& groups) const {
+    if (input.scalar_type() != at::ScalarType::BFloat16 ||
+        grad_output.scalar_type() != at::ScalarType::BFloat16 ||
+        weight.scalar_type() != at::ScalarType::BFloat16 ||
+        input.dim() != 4 || grad_output.dim() != 4 || weight.dim() != 4 ||
+        weight.size(2) != 3 || weight.size(3) != 3 ||
+        stride.size() != 2 || stride[0] != 1 || stride[1] != 1 ||
+        padding.size() != 2 || padding[0] != 1 || padding[1] != 1 ||
+        dilation.size() != 2 || dilation[0] != 1 || dilation[1] != 1 ||
+        transposed || output_padding.size() != 2 ||
+        output_padding[0] != 0 || output_padding[1] != 0 || groups != 1) {
+      return std::nullopt;
+    }
+    Conv3x3wDwPlan p;
+    p.batch = input.size(0);
+    p.cin = input.size(1);
+    p.h = input.size(2);
+    p.w = input.size(3);
+    p.cout = grad_output.size(1);
+    if (weight.size(0) != p.cout || weight.size(1) != p.cin ||
+        grad_output.size(0) != p.batch || grad_output.size(2) != p.h ||
+        grad_output.size(3) != p.w || p.w > kMaxWidth || p.batch < 1 || p.h < 1 ||
+        p.w < 1) {
+      return std::nullopt;
+    }
+    if (p.batch * p.h * p.w * p.cin * p.cout * 9 < min_macs) return std::nullopt;
+    p.wp = p.w + 2;
+    p.groups = ceil_div(p.batch * (p.h + 2) * p.wp, kGroupOutRows);
+    p.chunks = ceil_div(p.cin, kKStep);
+    p.cochunks = ceil_div(p.cout, kKStep);
+    if (p.chunks > kMaxChunks || p.cochunks > kMaxChunks || p.groups > 1024) {
+      return std::nullopt;
+    }
+    const std::string base = "g" + std::to_string(p.groups) + "_w" + std::to_string(p.wp) +
+        "_c" + std::to_string(p.chunks) + "_d" + std::to_string(p.cochunks);
+    p.buf_key = base;
+    for (int64_t ci = 0; ci < ceil_div(p.chunks, 2); ++ci) {
+      for (int64_t co = 0; co < ceil_div(p.cochunks, 2); ++co) {
+        p.passes.emplace_back(
+            base + "_p" + std::to_string(ci) + "_q" + std::to_string(co),
+            "--groups " + std::to_string(p.groups) + " --wp " + std::to_string(p.wp) +
+                " --chunks " + std::to_string(p.chunks) + " --cochunks " +
+                std::to_string(p.cochunks) + " --ci-pass " + std::to_string(ci) +
+                " --co-pass " + std::to_string(co));
+      }
+    }
+    return p;
+  }
+
+  // True once every pass stream exists (missing ones are queued for build).
+  bool ready(const Conv3x3wDwPlan& p) {
+    bool all = true;
+    for (const auto& [key, args] : p.passes) all &= builder.ready(key, args);
+    return all;
+  }
+
+  ShimBo* alloc(size_t bytes, void** ptr) {
+    auto* bo = shim_bo_alloc(xdna_device(), kernel, bytes, 2, 0);
+    TORCH_CHECK(bo, "failed to allocate conv3x3w_dw buffer: ", shim_last_error());
+    *ptr = shim_bo_map(bo);
+    TORCH_CHECK(*ptr, "failed to map conv3x3w_dw buffer: ", shim_last_error());
+    std::memset(*ptr, 0, bytes);
+    return bo;
+  }
+
+  // gw [cout][cin][3][3] bf16 (host memory) = dW of the conv.
+  void compute(const at::Tensor& input, const at::Tensor& grad_output,
+               uint16_t* gw, const Conv3x3wDwPlan& p) {
+    ensure_host_current(input);
+    ensure_host_current(grad_output);
+    auto x_cpu = cpu_alias(input);
+    auto d_cpu = cpu_alias(grad_output);
+    if (!x_cpu.is_contiguous()) x_cpu = x_cpu.contiguous();
+    if (!d_cpu.is_contiguous()) d_cpu = d_cpu.contiguous();
+
+    std::lock_guard<std::mutex> guard(mutex);
+    if (!kernel) {
+      const auto xclbin = std::filesystem::path(builder.dir) / "conv3x3w_dw.xclbin";
+      kernel = shim_kernel_load(xdna_device(), xclbin.c_str(), nullptr, QOS_PRIORITY_NONE);
+      TORCH_CHECK(kernel != nullptr, "failed to load conv3x3w_dw xclbin: ", shim_last_error());
+      c = alloc(static_cast<size_t>(kCols * kRows * kAcc * 4), &c_ptr);
+    }
+    auto& b = buffers[p.buf_key];
+    if (!b.x) {
+      b.x = alloc(static_cast<size_t>(p.groups * p.chunks * kGroupRows * kKStep * 2), &b.x_ptr);
+      b.d = alloc(static_cast<size_t>(p.groups * p.cochunks * kGroupRows * kKStep * 2), &b.d_ptr);
+    }
+    xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+    {
+      ScopedMappedCpu pack_phase("npu_conv3x3w.dw.pack");
+      xdna_conv3x3w_pack_input_bf16(
+          static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
+          static_cast<uint16_t*>(b.x_ptr),
+          int(p.batch), int(p.cin), int(p.h), int(p.w), int(p.chunks));
+      xdna_conv3x3w_pack_input_bf16(
+          static_cast<const uint16_t*>(d_cpu.const_data_ptr()),
+          static_cast<uint16_t*>(b.d_ptr),
+          int(p.batch), int(p.cout), int(p.h), int(p.w), int(p.cochunks));
+      TORCH_CHECK(shim_bo_sync_to_device(b.x) == 0 && shim_bo_sync_to_device(b.d) == 0,
+                  "failed to sync conv3x3w_dw inputs: ", shim_last_error());
+    }
+    const int64_t co_passes = ceil_div(p.cochunks, 2);
+    for (size_t i = 0; i < p.passes.size(); ++i) {
+      const auto& key = p.passes[i].first;
+      auto it = streams.find(key);
+      if (it == streams.end()) {
+        auto blob = XdnaGemmRuntime::read_file(builder.path(key).string());
+        auto* instr = shim_bo_alloc(xdna_device(), kernel, blob.size(), 1,
+                                    shim_kernel_group_id(kernel, 1));
+        TORCH_CHECK(instr && shim_bo_write(instr, blob.data(), blob.size(), 0) == 0 &&
+                        shim_bo_sync_to_device(instr) == 0,
+                    "failed to upload conv3x3w_dw stream: ", shim_last_error());
+        it = streams.emplace(key, std::make_pair(instr, blob.size() / 4)).first;
+      }
+      {
+        ScopedMappedCpu run_phase("npu_conv3x3w.dw.run");
+        ShimBo* data[3] = {b.x, b.d, c};
+        TORCH_CHECK(shim_run_kernel(kernel, 3, it->second.first, it->second.second, data, 3) == 0,
+                    "conv3x3w_dw dispatch failed: ", shim_last_error());
+        TORCH_CHECK(shim_bo_sync_from_device(c) == 0,
+                    "failed to sync conv3x3w_dw output: ", shim_last_error());
+      }
+      // C [6 col][4 row][3 dx][8 ci blk][4 co blk][8 ci][8 co] fp32; column =
+      // 3 * local input chunk + dy, row = 32-channel slice of the 128 outputs.
+      ScopedMappedCpu unpack_phase("npu_conv3x3w.dw.unpack");
+      const float* cf = static_cast<const float*>(c_ptr);
+      const int64_t ci_pass = static_cast<int64_t>(i) / co_passes;
+      const int64_t co_pass = static_cast<int64_t>(i) % co_passes;
+      for (int64_t col = 0; col < kCols; ++col) {
+        const int64_t ci0 = (2 * ci_pass + col / 3) * 64, dy = col % 3;
+        if (ci0 >= p.cin) continue;
+        for (int64_t row = 0; row < kRows; ++row) {
+          const int64_t co0 = 2 * co_pass * 64 + row * 32;
+          if (co0 >= p.cout) continue;
+          const float* t = cf + (col * kRows + row) * kAcc;
+          for (int64_t dx = 0; dx < 3; ++dx)
+            for (int64_t cib = 0; cib < 8; ++cib)
+              for (int64_t cob = 0; cob < 4; ++cob)
+                for (int64_t a = 0; a < 8; ++a) {
+                  const int64_t ci = ci0 + cib * 8 + a;
+                  if (ci >= p.cin) continue;
+                  const float* src = t + (((dx * 8 + cib) * 4 + cob) * 8 + a) * 8;
+                  for (int64_t e = 0; e < 8; ++e) {
+                    const int64_t co = co0 + cob * 8 + e;
+                    if (co >= p.cout) continue;
+                    gw[((co * p.cin + ci) * 3 + dy) * 3 + dx] =
+                        c10::BFloat16(src[e]).x;
+                  }
+                }
+        }
+      }
+    }
+  }
+};
+
+std::unique_ptr<XdnaConv3x3wDwRuntime>& conv3x3w_dw_runtime_slot() {
+  static auto* slot = new std::unique_ptr<XdnaConv3x3wDwRuntime>();
   return *slot;
 }
 
@@ -2288,6 +3236,7 @@ std::unique_ptr<XdnaFullFrameConvRuntime>& fast_conv11_runtime_slot() {
 
 
 at::Tensor xdna_from_cpu(const at::Tensor& cpu);
+at::Tensor adopt_or_copy(const at::Tensor& cpu);
 
 at::Tensor xdna_empty_like_shape(
     c10::SymIntArrayRef sizes,
@@ -2316,57 +3265,6 @@ at::Tensor xdna_empty_like_layout(const at::Tensor& reference) {
       format);
 }
 
-struct MappedCpuStat {
-  uint64_t calls = 0;
-  uint64_t total_ns = 0;
-};
-
-std::mutex& mapped_cpu_stats_mutex() {
-  static auto* value = new std::mutex();
-  return *value;
-}
-
-std::unordered_map<std::string, MappedCpuStat>& mapped_cpu_stats_map() {
-  static auto* value =
-      new std::unordered_map<std::string, MappedCpuStat>();
-  return *value;
-}
-
-bool profile_mapped_cpu() {
-  static const bool enabled = []() {
-    const char* raw = std::getenv("XDNA_PROFILE_MAPPED_CPU");
-    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
-  }();
-  return enabled;
-}
-
-void record_mapped_cpu_ns(const char* name, uint64_t ns) {
-  if (!profile_mapped_cpu()) return;
-  std::lock_guard<std::mutex> guard(mapped_cpu_stats_mutex());
-  auto& stat = mapped_cpu_stats_map()[name];
-  ++stat.calls;
-  stat.total_ns += ns;
-}
-
-class ScopedMappedCpu {
- public:
-  explicit ScopedMappedCpu(const char* name)
-      : name_(name), enabled_(profile_mapped_cpu()) {
-    if (enabled_) start_ = std::chrono::steady_clock::now();
-  }
-  ~ScopedMappedCpu() {
-    if (!enabled_) return;
-    const auto end = std::chrono::steady_clock::now();
-    const uint64_t ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            end - start_).count());
-    record_mapped_cpu_ns(name_, ns);
-  }
- private:
-  const char* name_;
-  bool enabled_;
-  std::chrono::steady_clock::time_point start_{};
-};
 
 at::Tensor leaky_relu_xdna(
     const at::Tensor& self,
@@ -2588,6 +3486,43 @@ at::Tensor& sub_out_xdna(
   auto other_cpu = cpu_alias(other);
   auto out_cpu = cpu_alias(out);
   at::_ops::sub_out::call(self_cpu, other_cpu, alpha, out_cpu);
+  mark_host_dirty(out);
+  return out;
+}
+
+
+at::Tensor& addmm_out_xdna(
+    const at::Tensor& self,
+    const at::Tensor& mat1,
+    const at::Tensor& mat2,
+    const at::Scalar& beta,
+    const at::Scalar& alpha,
+    at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::addmm.out");
+  ensure_host_current(self);
+  ensure_host_current(mat1);
+  ensure_host_current(mat2);
+  auto self_cpu = cpu_alias(self);
+  auto mat1_cpu = cpu_alias(mat1);
+  auto mat2_cpu = cpu_alias(mat2);
+  auto out_cpu = cpu_alias(out);
+  at::_ops::addmm_out::call(
+      self_cpu, mat1_cpu, mat2_cpu, beta, alpha, out_cpu);
+  mark_host_dirty(out);
+  return out;
+}
+
+at::Tensor& bmm_out_xdna(
+    const at::Tensor& self,
+    const at::Tensor& mat2,
+    at::Tensor& out) {
+  ScopedMappedCpu mapped_phase("aten::bmm.out");
+  ensure_host_current(self);
+  ensure_host_current(mat2);
+  auto self_cpu = cpu_alias(self);
+  auto mat2_cpu = cpu_alias(mat2);
+  auto out_cpu = cpu_alias(out);
+  at::_ops::bmm_out::call(self_cpu, mat2_cpu, out_cpu);
   mark_host_dirty(out);
   return out;
 }
@@ -3004,6 +3939,13 @@ at::Tensor xdna_from_cpu(const at::Tensor& cpu) {
   return out;
 }
 
+// XDNA tensor holding a CPU kernel's result: zero-copy when the result was
+// allocated inside an AdoptHostAllocations scope, a copy otherwise.
+at::Tensor adopt_or_copy(const at::Tensor& cpu) {
+  if (auto adopted = adopt_host_tensor(cpu)) return *adopted;
+  return xdna_from_cpu(cpu);
+}
+
 int64_t concrete(c10::SymInt x) {
   return x.guard_int(__FILE__, __LINE__);
 }
@@ -3060,6 +4002,13 @@ at::Tensor convolution_overrideable_xdna(
     bool transposed,
     c10::SymIntArrayRef output_padding,
     c10::SymInt groups) {
+  if (auto& w3 = conv3x3w_runtime_slot()) {
+    if (auto out = w3->try_forward(
+            input, weight, bias, stride, padding, dilation, transposed,
+            output_padding, groups)) {
+      return *out;
+    }
+  }
   auto& conv_slot = conv_runtime_slot();
   if (conv_slot) {
     if (auto* stream = conv_slot->find_forward(
@@ -3148,42 +4097,23 @@ at::Tensor convolution_overrideable_xdna(
     bias_cpu = cpu_alias(*bias);
   }
 
-  const auto shape = conv_output_shape(
-      input,
-      weight,
-      stride,
-      padding,
-      dilation,
-      transposed,
-      output_padding,
-      groups);
-  const auto output_format =
-      input.dim() == 4 &&
-          input.is_contiguous(at::MemoryFormat::ChannelsLast)
-      ? at::MemoryFormat::ChannelsLast
-      : at::MemoryFormat::Contiguous;
-  auto out = empty_memory_format(
-      shape,
-      input.scalar_type(),
-      at::Layout::Strided,
-      c10::Device(kXdnaType, 0),
-      false,
-      output_format);
-  auto out_cpu = cpu_alias(out);
-
-  at::_ops::convolution_out::call(
-      input_cpu,
-      weight_cpu,
-      bias_cpu,
-      stride,
-      padding,
-      dilation,
-      transposed,
-      output_padding,
-      groups,
-      out_cpu);
-  mark_host_dirty(out);
-  return out;
+  // convolution has no real out= kernel (convolution_out computes into a
+  // temporary and copies), so run it functionally and adopt the result.
+  at::Tensor out_cpu;
+  {
+    AdoptHostAllocations adopt;
+    out_cpu = at::_ops::convolution::call(
+        input_cpu,
+        weight_cpu,
+        bias_cpu,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups);
+  }
+  return adopt_or_copy(out_cpu);
 }
 
 bool lazy_decoder_dw_enabled() {
@@ -3328,14 +4258,23 @@ convolution_backward_overrideable_xdna(
   // Resolve accelerator candidates before executing either branch. dX and dW
   // are independent once X, W and dY exist, so a CPU dW can overlap a resident
   // NPU dX instead of serializing the heterogeneous engines.
+  Conv3x3wStream* w3_dx = nullptr;
+  std::optional<Conv3x3wPlan> w3_dx_plan;
   XdnaConvStream* small_dx = nullptr;
   XdnaFullFrameConvStream* full_dx = nullptr;
   XdnaFullFrameConvRuntime* full_dx_owner = nullptr;
+  auto& w3_slot = conv3x3w_runtime_slot();
+  if (output_mask[0] && w3_slot) {
+    w3_dx_plan = w3_slot->plan(
+        grad_output, weight, true, stride, padding, dilation, transposed,
+        output_padding, groups);
+    if (w3_dx_plan) w3_dx = w3_slot->stream(*w3_dx_plan);
+  }
   auto& conv_slot = conv_runtime_slot();
   auto& full_conv_slot = fullframe_conv_runtime_slot();
   auto& fast_dx584_slot = fast_dx584_runtime_slot();
   auto& fast_conv11_slot = fast_conv11_runtime_slot();
-  if (output_mask[0] && conv_slot) {
+  if (output_mask[0] && !w3_dx && conv_slot) {
     small_dx = conv_slot->find_dx(
         grad_output,
         weight,
@@ -3364,7 +4303,8 @@ convolution_backward_overrideable_xdna(
         transposed, output_padding, groups);
     if (full_dx) full_dx_owner = full_conv_slot.get();
   }
-  const bool have_npu_dx = small_dx != nullptr || full_dx != nullptr;
+  const bool have_npu_dx =
+      w3_dx != nullptr || small_dx != nullptr || full_dx != nullptr;
 
   auto& full_dw_slot = fullframe_dw_runtime_slot();
   const bool have_npu_dw =
@@ -3379,6 +4319,17 @@ convolution_backward_overrideable_xdna(
           transposed,
           output_padding,
           groups);
+
+  // Large 3x3 dWs go to the NPU, deferred (see XdnaConv3x3wDwRuntime); small
+  // ones stay on the CPU, overlapped with the NPU dX below.
+  std::optional<Conv3x3wDwPlan> w3_dw_plan;
+  auto& w3_dw_slot = conv3x3w_dw_runtime_slot();
+  if (output_mask[1] && w3_dw_slot && !have_npu_dw) {
+    w3_dw_plan = w3_dw_slot->plan(
+        input, grad_output, weight, stride, padding, dilation, transposed,
+        output_padding, groups);
+    if (w3_dw_plan && !w3_dw_slot->ready(*w3_dw_plan)) w3_dw_plan.reset();
+  }
 
   auto cpu_mask = output_mask;
   std::future<at::Tensor> overlapped_dw;
@@ -3411,7 +4362,25 @@ convolution_backward_overrideable_xdna(
   // zero-copy aliases of the same host-visible XRT BOs. The weight gradient is
   // tiny compared with activations, so copying the finished CPU dW into XDNA
   // storage after joining is negligible and keeps the implementation simple.
-  if (overlap_cpu_dw && have_npu_dx && output_mask[1] && !have_npu_dw) {
+  if (w3_dw_plan) {
+    gw = xdna_empty_like_shape(weight.sym_sizes(), weight.scalar_type());
+    // The job holds X and dY until it runs; it must not hold gw itself (gw's
+    // allocation owns this future: a cycle).  gw's deleter also waits on it.
+    struct Job {
+      at::Tensor input, grad_output;
+    };
+    auto job = std::make_shared<Job>(Job{input, grad_output});
+    auto* gw_ptr = static_cast<uint16_t*>(cpu_alias(gw).data_ptr());
+    auto* rt = w3_dw_slot.get();
+    std::shared_future<void> pending =
+        std::async(std::launch::deferred, [job, gw_ptr, rt, plan = *w3_dw_plan]() {
+          rt->compute(job->input, job->grad_output, gw_ptr, plan);
+          job->input = at::Tensor();
+          job->grad_output = at::Tensor();
+        }).share();
+    set_pending_host_write(gw, std::move(pending));
+    cpu_mask[1] = false;
+  } else if (overlap_cpu_dw && have_npu_dx && output_mask[1] && !have_npu_dw) {
     ensure_host_current(grad_output);
     ensure_host_current(weight);
     auto go_cpu = cpu_alias(grad_output);
@@ -3503,6 +4472,7 @@ convolution_backward_overrideable_xdna(
            src0_xdna,
            src1_xdna,
            weight_shape = std::move(weight_shape)]() mutable {
+            sync_host_threads();
             return virtual_cat2_upsample2_weight_grad_cpu(
                 src0_cpu, src1_cpu, go_cpu_keep, weight_shape);
           });
@@ -3519,6 +4489,7 @@ convolution_backward_overrideable_xdna(
            transposed,
            output_padding_v = std::move(output_padding_v),
            groups_v]() mutable {
+            sync_host_threads();
             const std::array<bool, 3> dw_mask = {false, true, false};
 
             // The CPU and NPU share the same LPDDR/fabric while dW and dX
@@ -3580,7 +4551,10 @@ convolution_backward_overrideable_xdna(
     cpu_mask[1] = false;
   }
 
-  if (small_dx) {
+  if (w3_dx) {
+    gi = w3_slot->input_grad(grad_output, weight, *w3_dx_plan, *w3_dx);
+    cpu_mask[0] = false;
+  } else if (small_dx) {
     gi = conv_slot->input_grad(grad_output, weight, *small_dx);
     cpu_mask[0] = false;
   } else if (full_dx) {
@@ -3622,44 +4596,13 @@ convolution_backward_overrideable_xdna(
       bias_sizes = c10::SymIntArrayRef(bias_size_vec);
     }
 
-    if (cpu_mask[0] && cpu_mask[1]) {
-      gi = xdna_empty_like_layout(input);
-      gw = xdna_empty_like_shape(weight.sym_sizes(), weight.scalar_type());
-      std::vector<c10::SymInt> gb_shape = {
-          transposed ? weight.sym_size(1) * groups : weight.sym_size(0)};
-      auto gb_work = xdna_empty_like_shape(gb_shape, grad_output.scalar_type());
-      auto gi_cpu = cpu_alias(gi);
-      auto gw_cpu = cpu_alias(gw);
-      auto gb_cpu = cpu_alias(gb_work);
-      std::vector<c10::SymInt> full_bias_vec = {gb_shape[0]};
-      at::OptionalSymIntArrayRef full_bias_sizes =
-          c10::SymIntArrayRef(full_bias_vec);
-      const std::array<bool, 3> full_mask = {true, true, true};
-
-      at::_ops::convolution_backward_out::call(
-          go_cpu,
-          input_cpu,
-          weight_cpu,
-          full_bias_sizes,
-          stride,
-          padding,
-          dilation,
-          transposed,
-          output_padding,
-          groups,
-          full_mask,
-          gi_cpu,
-          gw_cpu,
-          gb_cpu);
-
-      mark_host_dirty(gi);
-      mark_host_dirty(gw);
-      mark_host_dirty(gb_work);
-      if (cpu_mask[2]) {
-        gb = gb_work;
-      }
-    } else {
-      auto grads = at::_ops::convolution_backward::call(
+    // convolution_backward has no real out= kernel, so compute exactly the
+    // requested gradients functionally and adopt them (no dBias for
+    // bias-free convs, no temporary-to-output copies).
+    std::tuple<at::Tensor, at::Tensor, at::Tensor> grads;
+    {
+      AdoptHostAllocations adopt;
+      grads = at::_ops::convolution_backward::call(
           go_cpu,
           input_cpu,
           weight_cpu,
@@ -3671,10 +4614,10 @@ convolution_backward_overrideable_xdna(
           output_padding,
           groups,
           cpu_mask);
-      if (cpu_mask[0]) gi = xdna_from_cpu(std::get<0>(grads));
-      if (cpu_mask[1]) gw = xdna_from_cpu(std::get<1>(grads));
-      if (cpu_mask[2]) gb = xdna_from_cpu(std::get<2>(grads));
     }
+    if (cpu_mask[0]) gi = adopt_or_copy(std::get<0>(grads));
+    if (cpu_mask[1]) gw = adopt_or_copy(std::get<1>(grads));
+    if (cpu_mask[2]) gb = adopt_or_copy(std::get<2>(grads));
   }
 
   if (has_overlapped_dw) {
@@ -3682,6 +4625,138 @@ convolution_backward_overrideable_xdna(
   }
 
   return {gi, gw, gb};
+}
+
+
+// Fused RNN cells.  ATen's LSTM/GRU send every non-CPU device
+// (is_privateuseone()) to these CUDA-only fused cells, which have no CPU
+// kernel to fall back to.  Same math and workspace layout as the CUDA kernels
+// (activated gates for LSTM; r, z, n, hx, hn for GRU), computed in FP32.
+at::Tensor xdna_host_f32(const at::Tensor& t) {
+  ensure_host_current(t);
+  return cpu_alias(t).to(at::kFloat);
+}
+
+at::Tensor xdna_result(const at::Tensor& f32, at::ScalarType dtype) {
+  at::Tensor cpu;
+  {
+    AdoptHostAllocations adopt;
+    cpu = f32.to(dtype).contiguous();
+  }
+  return adopt_or_copy(cpu);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_lstm_cell_xdna(
+    const at::Tensor& input_gates,
+    const at::Tensor& hidden_gates,
+    const at::Tensor& cx,
+    const std::optional<at::Tensor>& input_bias,
+    const std::optional<at::Tensor>& hidden_bias) {
+  ScopedMappedCpu mapped_phase("aten::_thnn_fused_lstm_cell");
+  const auto dtype = input_gates.scalar_type();
+  auto gates = xdna_host_f32(input_gates) + xdna_host_f32(hidden_gates);
+  if (input_bias.has_value() && input_bias->defined()) {
+    gates = gates + xdna_host_f32(*input_bias) + xdna_host_f32(*hidden_bias);
+  }
+  auto chunks = gates.chunk(4, 1);
+  auto i = chunks[0].sigmoid();
+  auto f = chunks[1].sigmoid();
+  auto g = chunks[2].tanh();
+  auto o = chunks[3].sigmoid();
+  auto cy = f * xdna_host_f32(cx) + i * g;
+  auto hy = o * cy.tanh();
+  auto workspace = at::cat({i, f, g, o}, 1);
+  return {xdna_result(hy, dtype), xdna_result(cy, dtype), xdna_result(workspace, dtype)};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_lstm_cell_backward_xdna(
+    const std::optional<at::Tensor>& grad_hy,
+    const std::optional<at::Tensor>& grad_cy,
+    const at::Tensor& cx,
+    const at::Tensor& cy,
+    const at::Tensor& workspace,
+    bool has_bias) {
+  ScopedMappedCpu mapped_phase("aten::_thnn_fused_lstm_cell_backward_impl");
+  const auto dtype = workspace.scalar_type();
+  auto ws = xdna_host_f32(workspace).chunk(4, 1);
+  const auto& i = ws[0];
+  const auto& f = ws[1];
+  const auto& g = ws[2];
+  const auto& o = ws[3];
+  auto cy_f = xdna_host_f32(cy);
+  auto tanh_cy = cy_f.tanh();
+  const bool has_ghy = grad_hy.has_value() && grad_hy->defined();
+  const bool has_gcy = grad_cy.has_value() && grad_cy->defined();
+  auto ghy = has_ghy ? xdna_host_f32(*grad_hy) : at::zeros_like(cy_f);
+  auto gcy = has_gcy ? xdna_host_f32(*grad_cy) : at::zeros_like(cy_f);
+  auto gc = gcy + ghy * o * (1 - tanh_cy * tanh_cy);
+  auto gi = gc * g * i * (1 - i);
+  auto gf = gc * xdna_host_f32(cx) * f * (1 - f);
+  auto gg = gc * i * (1 - g * g);
+  auto go = ghy * tanh_cy * o * (1 - o);
+  auto grad_gates = at::cat({gi, gf, gg, go}, 1);
+  auto grad_cx = gc * f;
+  at::Tensor grad_bias;
+  if (has_bias) grad_bias = xdna_result(grad_gates.sum(0), dtype);
+  return {xdna_result(grad_gates, dtype), xdna_result(grad_cx, dtype), grad_bias};
+}
+
+std::tuple<at::Tensor, at::Tensor> fused_gru_cell_xdna(
+    const at::Tensor& input_gates,
+    const at::Tensor& hidden_gates,
+    const at::Tensor& hx,
+    const std::optional<at::Tensor>& input_bias,
+    const std::optional<at::Tensor>& hidden_bias) {
+  ScopedMappedCpu mapped_phase("aten::_thnn_fused_gru_cell");
+  const auto dtype = input_gates.scalar_type();
+  auto ig = xdna_host_f32(input_gates);
+  auto hg = xdna_host_f32(hidden_gates);
+  if (input_bias.has_value() && input_bias->defined()) {
+    ig = ig + xdna_host_f32(*input_bias);
+    hg = hg + xdna_host_f32(*hidden_bias);
+  }
+  auto ic = ig.chunk(3, 1);
+  auto hc = hg.chunk(3, 1);
+  auto r = (ic[0] + hc[0]).sigmoid();
+  auto z = (ic[1] + hc[1]).sigmoid();
+  auto n = (ic[2] + r * hc[2]).tanh();
+  auto hx_f = xdna_host_f32(hx);
+  auto hy = n + z * (hx_f - n);
+  auto workspace = at::cat({r, z, n, hx_f, hc[2]}, 1);
+  return {xdna_result(hy, dtype), xdna_result(workspace, dtype)};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+fused_gru_cell_backward_xdna(
+    const at::Tensor& grad_hy,
+    const at::Tensor& workspace,
+    bool has_bias) {
+  ScopedMappedCpu mapped_phase("aten::_thnn_fused_gru_cell_backward");
+  const auto dtype = workspace.scalar_type();
+  auto ws = xdna_host_f32(workspace).chunk(5, 1);
+  const auto& r = ws[0];
+  const auto& z = ws[1];
+  const auto& n = ws[2];
+  const auto& hx = ws[3];
+  const auto& hn = ws[4];
+  auto ghy = xdna_host_f32(grad_hy);
+  auto gz = ghy * (hx - n) * z * (1 - z);
+  auto ghx = ghy * z;
+  auto gn = ghy * (1 - z) * (1 - n * n);
+  auto ghn = gn * r;
+  auto gr = gn * hn * r * (1 - r);
+  auto grad_input_gates = at::cat({gr, gz, gn}, 1);
+  auto grad_hidden_gates = at::cat({gr, gz, ghn}, 1);
+  at::Tensor grad_input_bias, grad_hidden_bias;
+  if (has_bias) {
+    grad_input_bias = xdna_result(grad_input_gates.sum(0), dtype);
+    grad_hidden_bias = xdna_result(grad_hidden_gates.sum(0), dtype);
+  }
+  return {xdna_result(grad_input_gates, dtype),
+          xdna_result(grad_hidden_gates, dtype),
+          xdna_result(ghx, dtype),
+          grad_input_bias,
+          grad_hidden_bias};
 }
 
 } // namespace
@@ -3709,6 +4784,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("lerp.Scalar_out", TORCH_FN(lerp_scalar_out_xdna));
   m.impl("sigmoid.out", TORCH_FN(sigmoid_out_xdna));
   m.impl("sub.out", TORCH_FN(sub_out_xdna));
+  m.impl("addmm.out", TORCH_FN(addmm_out_xdna));
+  m.impl("bmm.out", TORCH_FN(bmm_out_xdna));
   m.impl("cat", TORCH_FN(cat_xdna));
   m.impl("upsample_nearest2d", TORCH_FN(upsample_nearest2d_xdna));
   m.impl("native_batch_norm", TORCH_FN(native_batch_norm_xdna));
@@ -3724,6 +4801,12 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl(
       "convolution_backward_overrideable",
       TORCH_FN(convolution_backward_overrideable_xdna));
+  m.impl("_thnn_fused_lstm_cell", TORCH_FN(fused_lstm_cell_xdna));
+  m.impl(
+      "_thnn_fused_lstm_cell_backward_impl",
+      TORCH_FN(fused_lstm_cell_backward_xdna));
+  m.impl("_thnn_fused_gru_cell", TORCH_FN(fused_gru_cell_xdna));
+  m.impl("_thnn_fused_gru_cell_backward", TORCH_FN(fused_gru_cell_backward_xdna));
 }
 
 struct FallbackStat {
@@ -3750,11 +4833,158 @@ bool profile_fallbacks() {
   return enabled;
 }
 
+bool schema_type_has_tensor(const c10::TypePtr& type) {
+  if (type->kind() == c10::TypeKind::TensorType) return true;
+  for (const auto& contained : type->containedTypes()) {
+    if (schema_type_has_tensor(contained)) return true;
+  }
+  return false;
+}
+
+// XDNA storage is host-mapped XRT memory, so an operator without an XDNA
+// kernel can run its CPU kernel directly on CPU aliases of the XDNA
+// arguments.  at::native::cpu_fallback instead copies every input to CPU and
+// every output back (about half of the VGG-loss time in NIS style
+// transfer).  Returns false, with the stack untouched, for anything this
+// cannot express: view returns, device/factory arguments, non-Tensor
+// containers of tensors.
+bool zero_copy_cpu_fallback(
+    const c10::OperatorHandle& op,
+    torch::jit::Stack* stack) {
+  const auto& schema = op.schema();
+  const auto& args = schema.arguments();
+  const auto& rets = schema.returns();
+  for (const auto& ret : rets) {
+    if (ret.alias_info() && !ret.alias_info()->isWrite()) return false;
+    if (schema_type_has_tensor(ret.type()) &&
+        ret.type()->kind() != c10::TypeKind::TensorType) {
+      return false;
+    }
+  }
+
+  const size_t n = args.size();
+  TORCH_INTERNAL_ASSERT(stack->size() >= n);
+  const size_t base = stack->size() - n;
+  bool any_xdna = false;
+  for (size_t i = 0; i < n; ++i) {
+    const auto& iv = (*stack)[base + i];
+    if (iv.isDevice()) return false;
+    if (iv.isTensor()) {
+      const auto& t = iv.toTensor();
+      if (!t.defined() || t.device().type() != kXdnaType) continue;
+      any_xdna = true;
+      const auto* alias = args[i].alias_info();
+      // A CPU kernel cannot resize a non-owning alias; let the copying
+      // fallback handle out= tensors that still need their real shape.
+      if (alias && alias->isWrite() && t.numel() == 0) return false;
+    } else if (iv.isTensorList()) {
+      for (const at::Tensor t : iv.toTensorList()) {
+        if (t.defined() && t.device().type() == kXdnaType) any_xdna = true;
+      }
+    } else if (iv.isList()) {
+      for (const auto& e : iv.toListRef()) {
+        if (e.isTensor()) return false;
+      }
+    }
+  }
+  if (!any_xdna) return false;
+
+  // Keep the original arguments: they own the XRT storage behind the
+  // non-owning aliases, and they are restored if the CPU kernel throws.
+  std::vector<c10::IValue> originals(stack->begin() + base, stack->end());
+  std::vector<std::pair<at::Tensor, at::Tensor>> written;  // {cpu, xdna}
+  for (size_t i = 0; i < n; ++i) {
+    auto& iv = (*stack)[base + i];
+    const auto* alias = args[i].alias_info();
+    const bool is_write = alias && alias->isWrite();
+    if (iv.isTensor()) {
+      const auto t = iv.toTensor();
+      if (!t.defined() || t.device().type() != kXdnaType) continue;
+      auto cpu = cpu_alias(t);
+      if (is_write) written.emplace_back(cpu, t);
+      iv = c10::IValue(cpu);
+    } else if (iv.isTensorList()) {
+      auto list = iv.toTensorList();
+      c10::List<at::Tensor> cpu_list;
+      cpu_list.reserve(list.size());
+      for (const at::Tensor t : list) {
+        if (t.defined() && t.device().type() == kXdnaType) {
+          auto cpu = cpu_alias(t);
+          if (is_write) written.emplace_back(cpu, t);
+          cpu_list.push_back(cpu);
+        } else {
+          cpu_list.push_back(t);
+        }
+      }
+      iv = c10::IValue(cpu_list);
+    }
+  }
+
+  try {
+    AdoptHostAllocations adopt;
+    op.redispatchBoxed(c10::DispatchKeySet(c10::DispatchKey::CPU), stack);
+  } catch (const c10::Error&) {
+    stack->resize(base);
+    stack->insert(stack->end(), originals.begin(), originals.end());
+    return false;
+  }
+
+  for (const auto& [cpu, xdna] : written) mark_host_dirty(xdna);
+
+  const size_t r = rets.size();
+  TORCH_INTERNAL_ASSERT(stack->size() >= r);
+  for (size_t j = 0; j < r; ++j) {
+    auto& iv = (*stack)[stack->size() - r + j];
+    if (!iv.isTensor()) continue;
+    const auto t = iv.toTensor();
+    if (!t.defined() || t.device().type() != c10::DeviceType::CPU) continue;
+    bool mapped = false;
+    for (const auto& [cpu, xdna] : written) {
+      if (t.is_same(cpu)) {
+        iv = c10::IValue(xdna);
+        mapped = true;
+        break;
+      }
+    }
+    if (mapped) continue;
+    if (auto adopted = adopt_host_tensor(t)) {
+      iv = c10::IValue(*adopted);
+      continue;
+    }
+    const bool dense = t.is_non_overlapping_and_dense();
+    auto out = empty_strided(
+        t.sym_sizes(),
+        dense ? t.sym_strides()
+              : c10::SymIntArrayRef(c10::fromIntArrayRefSlow(
+                    c10::contiguous_strides(t.sizes()))),
+        t.scalar_type(),
+        at::Layout::Strided,
+        c10::Device(kXdnaType, 0),
+        false);
+    cpu_alias_unchecked(out).copy_(t);
+    mark_host_dirty(out);
+    iv = c10::IValue(out);
+  }
+  return true;
+}
+
+void run_cpu_fallback(
+    const c10::OperatorHandle& op,
+    torch::jit::Stack* stack) {
+  static const bool zero_copy = []() {
+    const char* raw = std::getenv("XDNA_ZERO_COPY_FALLBACK");
+    return raw == nullptr || std::strcmp(raw, "0") != 0;
+  }();
+  if (zero_copy && zero_copy_cpu_fallback(op, stack)) return;
+  at::native::cpu_fallback(op, stack, false, c10::DispatchKey::CPU);
+}
+
 void xdna_cpu_fallback(
     const c10::OperatorHandle& op,
     torch::jit::Stack* stack) {
+  sync_host_threads();
   if (!profile_fallbacks()) {
-    at::native::cpu_fallback(op, stack, false, c10::DispatchKey::CPU);
+    run_cpu_fallback(op, stack);
     return;
   }
   std::string name = op.schema().name();
@@ -3763,7 +4993,7 @@ void xdna_cpu_fallback(
     name += op.schema().overload_name();
   }
   const auto t0 = std::chrono::steady_clock::now();
-  at::native::cpu_fallback(op, stack, false, c10::DispatchKey::CPU);
+  run_cpu_fallback(op, stack);
   const auto t1 = std::chrono::steady_clock::now();
   const uint64_t ns = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
@@ -3779,6 +5009,11 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  init_host_threads();
+  if (const char* raw = std::getenv("XDNA_ADOPT_HOST_OUTPUTS");
+      raw == nullptr || std::strcmp(raw, "0") != 0) {
+    install_host_allocator();
+  }
   c10::SetStorageImplCreate(
       c10::DeviceType::PrivateUse1, &make_xdna_storage_impl);
   if (!at::isPrivateUse1HooksRegistered()) {
@@ -3813,11 +5048,48 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
          const std::string& fwd18,
          const std::string& dx18,
          const std::string& fwd36,
-         const std::string& dx36) {
+         const std::string& dx36,
+         int64_t m_sched18,
+         int64_t m_sched36) {
         auto runtime = std::make_unique<XdnaConvRuntime>();
-        runtime->open(xclbin, fwd18, dx18, fwd36, dx36);
+        runtime->open(xclbin, fwd18, dx18, fwd36, dx36, m_sched18, m_sched36);
         conv_runtime_slot() = std::move(runtime);
-      });
+      },
+      py::arg("xclbin"), py::arg("fwd18"), py::arg("dx18"), py::arg("fwd36"),
+      py::arg("dx36"), py::arg("m_sched18") = 12960, py::arg("m_sched36") = 51840);
+  m.def(
+      "configure_conv3x3w",
+      [](const std::string& dir,
+         const std::string& build_cmd,
+         int64_t min_macs,
+         bool sync_build) {
+        auto runtime = std::make_unique<XdnaConv3x3wRuntime>();
+        runtime->builder.dir = dir;
+        runtime->builder.cmd = build_cmd;
+        runtime->builder.sync = sync_build;
+        runtime->min_macs = min_macs;
+        conv3x3w_runtime_slot() = std::move(runtime);
+      },
+      py::arg("dir"), py::arg("build_cmd"), py::arg("min_macs") = 0,
+      py::arg("sync_build") = false);
+  m.def(
+      "configure_conv3x3w_dw",
+      [](const std::string& dir,
+         const std::string& build_cmd,
+         int64_t min_macs,
+         bool sync_build) {
+        auto runtime = std::make_unique<XdnaConv3x3wDwRuntime>();
+        runtime->builder.dir = dir;
+        runtime->builder.cmd = build_cmd;
+        runtime->builder.sync = sync_build;
+        runtime->min_macs = min_macs;
+        conv3x3w_dw_runtime_slot() = std::move(runtime);
+      },
+      py::arg("dir"), py::arg("build_cmd"), py::arg("min_macs") = 0,
+      py::arg("sync_build") = false);
+  m.def("conv3x3w_configured", []() {
+    return static_cast<bool>(conv3x3w_runtime_slot());
+  });
   m.def("conv_family_configured", []() {
     return static_cast<bool>(conv_runtime_slot());
   });
