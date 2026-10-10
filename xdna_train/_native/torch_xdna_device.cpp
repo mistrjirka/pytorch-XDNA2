@@ -102,6 +102,10 @@ extern "C" void xdna_conv3x3w_pack_weights_dx_bfp16(
     const uint16_t*, uint8_t*, int, int, int, int);
 extern "C" void xdna_conv3x3w_unpack_output_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int);
+extern "C" void xdna_conv3x3w_pack_input_range_bf16(
+    const uint16_t*, uint16_t*, int, int, int, int, int, int, int);
+extern "C" void xdna_conv3x3w_unpack_output_range_bf16(
+    const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int);
 extern "C" ShimRun* shim_run_kernel_start(
     ShimKernel*, unsigned int, ShimBo*, size_t, ShimBo* const*, size_t);
 
@@ -1818,6 +1822,18 @@ struct Conv3x3wPacked {
   void* ptr = nullptr;
   size_t bytes = 0;
   std::array<int64_t, 5> shape{};  // B, C, H, W, chunks of the last pack
+  std::map<std::pair<size_t, size_t>, ShimBo*> subs;  // (offset, size)
+
+  // A device-side window of this buffer (cached).
+  ShimBo* sub(size_t offset, size_t size) {
+    if (offset == 0 && size == bytes) return bo;
+    auto& b = subs[{offset, size}];
+    if (!b) {
+      b = shim_bo_subbuffer(bo, size, offset);
+      TORCH_CHECK(b, "failed to create conv3x3w sub-buffer: ", shim_last_error());
+    }
+    return b;
+  }
 };
 
 std::mutex& packed_pool_mutex() {
@@ -1980,6 +1996,12 @@ struct Conv3x3wRun {
     shim_run_free(h);
     TORCH_CHECK(rc == 0, "conv3x3w dispatch failed: ", shim_last_error());
   }
+};
+
+struct Conv3x3wStream;
+struct Conv3x3wPiece {
+  int64_t g0 = 0, ng = 0;
+  Conv3x3wStream* stream = nullptr;
 };
 
 struct Conv3x3wStream {
@@ -2197,6 +2219,38 @@ struct XdnaConv3x3wRuntime {
     return *slot;
   }
 
+  static int64_t piece_count(int64_t groups) {
+    if (const char* e = std::getenv("XDNA_CONV3X3W_PIECES")) {
+      const int64_t n = std::atoll(e);
+      if (n >= 1) return std::min(n, groups);
+    }
+    return groups >= 16 ? 4 : groups >= 6 ? 2 : 1;
+  }
+
+  // Pieces of p as (first group, groups, stream).  Falls back to one piece
+  // (the full stream s) until every piece stream is built.
+  std::vector<Conv3x3wPiece> piece_streams(const Conv3x3wPlan& p, Conv3x3wStream& s) {
+    const int64_t k = piece_count(p.groups);
+    std::vector<Conv3x3wPiece> out;
+    if (k > 1) {
+      const int64_t ng = ceil_div(p.groups, k);
+      for (int64_t g0 = 0; g0 < p.groups; g0 += ng) {
+        Conv3x3wPlan q = p;
+        q.groups = std::min(ng, p.groups - g0);
+        q.key = "g" + std::to_string(q.groups) + "_w" + std::to_string(q.wp) +
+            "_c" + std::to_string(q.chunks);
+        auto* st = stream(q);
+        if (!st) {
+          out.clear();
+          break;
+        }
+        out.push_back({g0, q.groups, st});
+      }
+    }
+    if (out.empty()) out.push_back({0, p.groups, &s});
+    return out;
+  }
+
   // out[:, :, :, :] = conv3x3(x, weight) (+ bias).  `weight` is the forward
   // weight [cout][cin][3][3]; for_dx convolves with its flipped/transposed form.
   at::Tensor run(
@@ -2224,12 +2278,29 @@ struct XdnaConv3x3wRuntime {
       raw[i] = acquire_npu_out(static_cast<size_t>(p.groups * kGroupOutRows * kN * 2));
     }
 
-    auto xin = acquire_packed(static_cast<size_t>(p.groups * p.chunks * kGroupRows * kKStep * 2));
+    // The conv runs as pieces of consecutive pixel groups, each with its own
+    // (smaller) stream over a window of the same buffers, so the host packs
+    // piece i+1 and unpacks piece i-1 while the NPU computes piece i.
+    auto pieces = piece_streams(p, s);
+    const size_t in_group = static_cast<size_t>(p.chunks * kGroupRows * kKStep * 2);
+    const size_t out_group = static_cast<size_t>(kGroupOutRows * kN * 2);
+    const int64_t m_total = p.batch * (p.h + 2) * p.wp;
+    auto xin = acquire_packed(static_cast<size_t>(p.groups) * in_group);
     xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
-    {
-      ScopedMappedCpu pack_phase("npu_conv3x3w.pack");
-      pack_conv3x3w_input(*xin, x_cpu, p.chunks);
+    const std::array<int64_t, 5> xshape = {p.batch, p.cin, p.h, p.w, p.chunks};
+    if (xin->shape != xshape) {
+      if (xin->shape != std::array<int64_t, 5>{}) std::memset(xin->ptr, 0, xin->bytes);
+      xin->shape = xshape;
     }
+    auto pack_piece = [&](const Conv3x3wPiece& pc) {
+      ScopedMappedCpu pack_phase("npu_conv3x3w.pack");
+      xdna_conv3x3w_pack_input_range_bf16(
+          static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
+          static_cast<uint16_t*>(xin->ptr) + pc.g0 * in_group / 2,
+          int(p.batch), int(p.cin), int(p.h), int(p.w), int(p.chunks), int(pc.g0), int(pc.ng));
+      TORCH_CHECK(shim_bo_sync_to_device(xin->sub(pc.g0 * in_group, pc.ng * in_group)) == 0,
+                  "failed to sync conv3x3w input: ", shim_last_error());
+    };
     if (keep_input) *keep_input = xin;
     std::lock_guard<std::mutex> guard(mutex);
     const uint64_t call_start = s.use_clock + 1;
@@ -2262,38 +2333,60 @@ struct XdnaConv3x3wRuntime {
       slot.valid = weight_cache_enabled() && static_cast<bool>(slot.pin);
       return slot;
     };
-    auto start = [&](Conv3x3wWeightSlot& slot, const std::shared_ptr<Conv3x3wPacked>& r,
-                     Conv3x3wRun& run) {
-      ShimBo* data[3] = {xin->bo, slot.bo, r->bo};
-      run.r = shim_run_kernel_start(kernel, 3, s.instr, s.instr_words, data, 3);
+
+    // Dispatch order: every piece of block 0, then of block 1, ...
+    struct Task {
+      int64_t nb;
+      const Conv3x3wPiece* pc;
+      Conv3x3wWeightSlot* slot;
+    };
+    std::vector<Task> tasks;
+    for (int64_t nb = 0; nb < n_blocks; ++nb)
+      for (const auto& pc : pieces) tasks.push_back({nb, &pc, nullptr});
+    auto start = [&](Task& t, Conv3x3wRun& run) {
+      const auto& pc = *t.pc;
+      ShimBo* data[3] = {xin->sub(pc.g0 * in_group, pc.ng * in_group), t.slot->bo,
+                         raw[t.nb & 1]->sub(pc.g0 * out_group, pc.ng * out_group)};
+      run.r = shim_run_kernel_start(kernel, 3, pc.stream->instr, pc.stream->instr_words, data, 3);
       TORCH_CHECK(run.r, "conv3x3w dispatch failed: ", shim_last_error());
     };
+    auto unpack = [&](const Task& t) {
+      const auto& pc = *t.pc;
+      ShimBo* r = raw[t.nb & 1]->sub(pc.g0 * out_group, pc.ng * out_group);
+      {
+        ScopedMappedCpu sync_phase("npu_conv3x3w.unpack_sync");
+        TORCH_CHECK(shim_bo_sync_from_device(r) == 0,
+                    "failed to sync conv3x3w output: ", shim_last_error());
+      }
+      ScopedMappedCpu unpack_phase("npu_conv3x3w.unpack");
+      const int64_t p0 = pc.g0 * kGroupOutRows;
+      const int64_t p1 = std::min(m_total, (pc.g0 + pc.ng) * kGroupOutRows);
+      xdna_conv3x3w_unpack_output_range_bf16(
+          static_cast<const uint16_t*>(raw[t.nb & 1]->ptr) + p0 * kN,
+          static_cast<uint16_t*>(out_cpu.data_ptr()),
+          int(p.batch), int(p.h), int(p.w),
+          int(std::min<int64_t>(kN, p.cout - t.nb * kN)), int(p.cout), int(t.nb * kN),
+          int(p0), int(p1));
+    };
 
-    Conv3x3wRun cur;
-    Conv3x3wWeightSlot* slot = &prepare(0);
     // The run phase is the host wait for the NPU, i.e. what the overlapped
     // CPU work did not hide.
-    start(*slot, raw[0], cur);
-    for (int64_t nb = 0; nb < n_blocks; ++nb) {
-      Conv3x3wWeightSlot* next = nullptr;
-      if (nb + 1 < n_blocks) next = &prepare(nb + 1);
+    Conv3x3wRun cur;
+    pack_piece(*tasks[0].pc);
+    tasks[0].slot = &prepare(0);
+    start(tasks[0], cur);
+    for (size_t j = 0; j < tasks.size(); ++j) {
+      if (j + 1 < tasks.size()) {
+        auto& nt = tasks[j + 1];
+        if (nt.nb == 0) pack_piece(*nt.pc);
+        nt.slot = nt.nb == tasks[j].nb ? tasks[j].slot : &prepare(nt.nb);
+      }
       {
         ScopedMappedCpu run_phase(phase);
         cur.wait();
       }
-      if (next) start(*next, raw[(nb + 1) & 1], cur);
-      auto& rw = raw[nb & 1];
-      {
-        ScopedMappedCpu sync_phase("npu_conv3x3w.unpack_sync");
-        TORCH_CHECK(shim_bo_sync_from_device(rw->bo) == 0,
-                    "failed to sync conv3x3w output: ", shim_last_error());
-      }
-      ScopedMappedCpu unpack_phase("npu_conv3x3w.unpack");
-      xdna_conv3x3w_unpack_output_bf16(
-          static_cast<const uint16_t*>(rw->ptr),
-          static_cast<uint16_t*>(out_cpu.data_ptr()),
-          int(p.batch), int(p.h), int(p.w),
-          int(std::min<int64_t>(kN, p.cout - nb * kN)), int(p.cout), int(nb * kN));
+      if (j + 1 < tasks.size()) start(tasks[j + 1], cur);
+      unpack(tasks[j]);
     }
     if (bias.has_value() && bias->defined()) {
       ensure_host_current(*bias);

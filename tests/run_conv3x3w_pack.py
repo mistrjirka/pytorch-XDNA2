@@ -19,6 +19,8 @@ lib.xdna_conv3x3w_pack_input_bf16.argtypes = [P, P, I, I, I, I, I]
 lib.xdna_conv3x3w_pack_weights_bfp16.argtypes = [P, P, I, I, I, I]
 lib.xdna_conv3x3w_pack_weights_dx_bfp16.argtypes = [P, P, I, I, I, I]
 lib.xdna_conv3x3w_unpack_output_bf16.argtypes = [P, P, I, I, I, I, I, I]
+lib.xdna_conv3x3w_pack_input_range_bf16.argtypes = [P, P, I, I, I, I, I, I, I]
+lib.xdna_conv3x3w_unpack_output_range_bf16.argtypes = [P, P, I, I, I, I, I, I, I, I]
 
 rng = np.random.default_rng(0)
 fails = 0
@@ -103,5 +105,81 @@ def case(B, C, H, W, Cout):
 for s in [(40, 256, 36, 36, 128), (40, 64, 36, 36, 64), (4, 195, 36, 36, 64),
           (40, 128, 9, 9, 128), (40, 256, 18, 18, 256), (3, 3, 5, 7, 10)]:
     case(*s)
+
+def splits(groups):
+    out = {"1": [groups], "each": [1] * groups}
+    out["2eq"] = [groups - groups // 2, groups // 2] if groups > 1 else [groups]
+    if groups >= 3:
+        a = max(1, groups // 5)
+        b = max(1, groups // 3)
+        out["3uneven"] = [a, b, groups - a - b] if groups - a - b > 0 else [groups]
+    return {k: [x for x in v if x > 0] for k, v in out.items()}
+
+
+def range_case(B, C, H, W, Cout):
+    print(f"range case B={B} C={C} H={H} W={W} Cout={Cout}")
+    chunks = -(-C // 64)
+    wp, m_total, groups = ref.geometry(B, H, W)
+    x = rng.standard_normal((B, C, H, W)).astype(np.float32)
+    xb = np.ascontiguousarray(ref.bf16_bits(x))
+    full_ref = ref.pack_input(x, chunks)
+    c = rng.integers(0, 65536, (groups * ref.GROUP_OUT_ROWS, 128), dtype=np.uint16)
+    expect = ref.unpack_output(c, B, H, W, Cout)
+    nv, ctot, cs = min(Cout, 128), Cout + 7, 3
+    ok_in = ok_out = True
+    for name, parts in splits(groups).items():
+        g = 0
+        outb = np.zeros((B, ctot, H, W), np.uint16)
+        for n in parts:
+            dst = np.zeros((n, chunks, ref.GROUP_ROWS, 64), np.uint16)
+            for _ in range(2):  # reuse without re-zeroing
+                lib.xdna_conv3x3w_pack_input_range_bf16(xb.ctypes.data, dst.ctypes.data, B, C, H, W, chunks, g, n)
+            ok_in &= np.array_equal(dst, full_ref[g:g + n])
+            p0, p1 = g * ref.GROUP_OUT_ROWS, (g + n) * ref.GROUP_OUT_ROWS
+            cs_ = np.ascontiguousarray(c[p0:p1])
+            lib.xdna_conv3x3w_unpack_output_range_bf16(cs_.ctypes.data, outb.ctypes.data, B, H, W, nv, ctot, cs, p0, p1)
+            g += n
+        got = ref.bf16_value(outb)
+        ok_out &= np.array_equal(got[:, cs:cs + nv].view(np.uint32), expect[:, :nv].view(np.uint32))
+        ok_out &= not outb[:, :cs].any() and not outb[:, cs + nv:].any()
+    report("rng-in", bool(ok_in), 0)
+    report("rng-out", bool(ok_out), 0)
+    # mid-row ranges: arbitrary p splits, tiny piece sizes
+    cuts = sorted(set([0, 1, wp + 3, 5 * wp - 1, m_total // 2, m_total - 1, groups * ref.GROUP_OUT_ROWS]))
+    outb = np.zeros((B, ctot, H, W), np.uint16)
+    for a, b_ in zip(cuts[:-1], cuts[1:]):
+        cs_ = np.ascontiguousarray(c[a:b_])
+        lib.xdna_conv3x3w_unpack_output_range_bf16(cs_.ctypes.data, outb.ctypes.data, B, H, W, nv, ctot, cs, a, b_)
+    got = ref.bf16_value(outb)
+    report("rng-mid", bool(np.array_equal(got[:, cs:cs + nv].view(np.uint32), expect[:, :nv].view(np.uint32))), 0)
+
+
+def range_timing():
+    B, C, H, W = 40, 256, 36, 36
+    chunks = 4
+    wp, m_total, groups = ref.geometry(B, H, W)
+    xb = np.ascontiguousarray(ref.bf16_bits(rng.standard_normal((B, C, H, W)).astype(np.float32)))
+    c = rng.integers(0, 65536, (groups * ref.GROUP_OUT_ROWS, 128), dtype=np.uint16)
+    dst = np.zeros((groups, chunks, ref.GROUP_ROWS, 64), np.uint16)
+    outb = np.zeros((B, 128, H, W), np.uint16)
+    print(f"timing B=40 C=256 36x36 groups={groups} (8 threads)")
+    print(f"  pack full   {timed(lambda: lib.xdna_conv3x3w_pack_input_bf16(xb.ctypes.data, dst.ctypes.data, B, C, H, W, chunks)):.3f} ms")
+    print(f"  unpack full {timed(lambda: lib.xdna_conv3x3w_unpack_output_bf16(c.ctypes.data, outb.ctypes.data, B, H, W, 128, 128, 0)):.3f} ms")
+    for k in (2, 4):
+        per = -(-groups // k)
+        parts = [(g, min(per, groups - g)) for g in range(0, groups, per)]
+        def fp():
+            for g, n in parts:
+                lib.xdna_conv3x3w_pack_input_range_bf16(xb.ctypes.data, dst[g:g + n].ctypes.data, B, C, H, W, chunks, g, n)
+        def fu():
+            for g, n in parts:
+                p0 = g * ref.GROUP_OUT_ROWS
+                lib.xdna_conv3x3w_unpack_output_range_bf16(c[p0:].ctypes.data, outb.ctypes.data, B, H, W, 128, 128, 0, p0, p0 + n * ref.GROUP_OUT_ROWS)
+        print(f"  {k} pieces: pack total {timed(fp):.3f} ms, unpack total {timed(fu):.3f} ms")
+
+
+for s in [(40, 256, 36, 36, 128), (3, 70, 5, 7, 10), (4, 195, 36, 36, 64), (40, 128, 9, 9, 128)]:
+    range_case(*s)
+range_timing()
 print("FAILED" if fails else "ALL OK")
 sys.exit(1 if fails else 0)

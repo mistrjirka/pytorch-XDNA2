@@ -773,3 +773,99 @@ extern "C" void xdna_conv3x3w_pack_weights_dx_bfp16(
     }
   }
 }
+
+// ---- conv3x3w group-range variants ----
+
+extern "C" {
+
+// Groups [g0, g0+ng) of xdna_conv3x3w_pack_input_bf16's result, written to
+// dst laid out [ng][chunks][GROUP_ROWS][64].  Same contract: only real
+// pixels/channels are written, the caller zero-fills dst once per shape.
+// Only the source rows that land in the range (incl. next group's halo) are read.
+void xdna_conv3x3w_pack_input_range_bf16(
+    const uint16_t* src,
+    uint16_t* dst,
+    int B,
+    int C,
+    int H,
+    int W,
+    int chunks,
+    int g0,
+    int ng) {
+  const int wp = W + 2;
+  const std::size_t img = std::size_t(H + 2) * wp;
+  const std::size_t plo = std::size_t(g0) * kGroupOutRows;
+  const std::size_t phi =
+      std::size_t(g0 + ng) * kGroupOutRows + (kGroupRows - kGroupOutRows);
+  const int b0 = int(plo / img);
+  const int b1 = int((phi - 1) / img) + 1 < B ? int((phi - 1) / img) + 1 : B;
+  if (b1 <= b0) return;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
+  for (int b = b0; b < b1; ++b) {
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+      for (int y = 0; y < H; ++y) {
+        const int cc = C - chunk * kKStep < kKStep ? C - chunk * kKStep : kKStep;
+        const std::size_t pr = (std::size_t(b) * (H + 2) + y + 1) * wp + 1;
+        if (cc <= 0 || pr + W <= plo || pr >= phi) continue;
+        const int x0 = pr < plo ? int(plo - pr) : 0;
+        const int x1 = pr + W > phi ? int(phi - pr) : W;
+        const uint16_t* s =
+            src + ((std::size_t(b) * C + chunk * kKStep) * H + y) * W;
+        for (int x = x0; x < x1; ++x) {
+          uint16_t px[kKStep];
+          for (int c = 0; c < cc; ++c) px[c] = s[std::size_t(c) * H * W + x];
+          const std::size_t p = pr + x;
+          const std::size_t g = p / kGroupOutRows;
+          const std::size_t r = p % kGroupOutRows;
+          if (g >= std::size_t(g0) && g < std::size_t(g0 + ng))
+            std::memcpy(
+                dst + (((g - g0) * chunks + chunk) * kGroupRows + r) * kKStep,
+                px, std::size_t(cc) * sizeof(uint16_t));
+          if (g > std::size_t(g0) && g <= std::size_t(g0 + ng) &&
+              r + kGroupOutRows < std::size_t(kGroupRows))
+            std::memcpy(
+                dst + (((g - 1 - g0) * chunks + chunk) * kGroupRows + r +
+                       kGroupOutRows) * kKStep,
+                px, std::size_t(cc) * sizeof(uint16_t));
+        }
+      }
+    }
+  }
+}
+
+// Rows [p0, p1) of xdna_conv3x3w_unpack_output_bf16.  `c` points at output
+// row p0 (row stride 128); only valid pixels with p in [p0, p1) are written.
+void xdna_conv3x3w_unpack_output_range_bf16(
+    const uint16_t* c,
+    uint16_t* dst,
+    int B,
+    int H,
+    int W,
+    int cout_valid,
+    int C_total,
+    int c_start,
+    int p0,
+    int p1) {
+  const int wp = W + 2;
+  const std::size_t img = std::size_t(H + 2) * wp;
+  if (p1 <= p0) return;
+  const int b0 = int(std::size_t(p0) / img);
+  const int b1 = int((std::size_t(p1) - 1) / img) + 1 < B ? int((std::size_t(p1) - 1) / img) + 1 : B;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int b = b0; b < b1; ++b) {
+    for (int y = 0; y < H; ++y) {
+      const long base = long(std::size_t(b) * (H + 2) + y) * wp;
+      const long xa = p0 - base > 0 ? p0 - base : 0;
+      const long xb = p1 - base < W ? p1 - base : W;
+      if (xb <= xa) continue;
+      const uint16_t* s = c + (base + xa - p0) * kN;
+      for (int n = 0; n < cout_valid; ++n) {
+        uint16_t* d =
+            dst + ((std::size_t(b) * C_total + c_start + n) * H + y) * W;
+        for (long x = xa; x < xb; ++x) d[x] = s[(x - xa) * kN + n];
+      }
+    }
+  }
+}
+
+}  // extern "C"
