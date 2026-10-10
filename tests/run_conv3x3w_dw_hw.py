@@ -80,11 +80,11 @@ def main():
                 bo_i.write(instr.tobytes(), 0)
                 bo_i.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
                 times = []
-                for _ in range(4):
+                for _ in range(int(__import__("os").environ.get("DW_REPS", "4"))):
                     t0 = time.perf_counter()
                     state = kern(3, bo_i, len(instr), bo_x, bo_d, bo_c).wait()
                     times.append(time.perf_counter() - t0)
-                total += np.median(times[1:])
+                total += np.median(times[1:] if len(times) > 1 else times)
                 bo_c.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
                 c = np.frombuffer(bo_c.read(6 * 4 * ACC * 4, 0), dtype=np.float32)
                 unpack_pass(c, dw, p, q, Cin, Cout)

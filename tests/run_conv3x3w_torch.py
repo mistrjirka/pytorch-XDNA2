@@ -11,6 +11,7 @@ import sys
 os.environ.setdefault("XDNA_CONV3X3W_SYNC_BUILD", "1")
 os.environ.setdefault("XDNA_PROFILE_MAPPED_CPU", "1")
 os.environ.setdefault("XDNA_CONV3X3W_MIN_MACS", "0")
+os.environ.setdefault("XDNA_CONV3X3W_FORCE", "1")  # tiny shapes must still hit the NPU
 os.environ.setdefault("XDNA_CONV3X3W_DW_MIN_MACS", "0")
 
 import torch  # noqa: E402

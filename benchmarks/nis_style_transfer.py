@@ -76,6 +76,12 @@ print("RESULT=" + json.dumps({
     "train_step_ms": [round(1e3 * d, 2) for d in _d],
     "train_t0_wall": __T0_WALL,
 }))
+if os.environ.get("XDNA_PROFILE_MAPPED_CPU") == "1":
+    from xdna_train import device as _xd
+    _n = max(1, len(_d))
+    print("PHASES (ms per step, incl. warmup):")
+    for _k, _v in sorted(_xd.mapped_cpu_stats().items(), key=lambda kv: -kv[1]["total_ms"])[:30]:
+        print(f"  {_k:44s} {_v['calls'] / _n:6.1f}/step {_v['total_ms'] / _n:8.2f} ms")
 """
 exec(compile(src, "style_transfer.py[bench]", "exec"), {"__name__": "__main__"})
 '''
@@ -161,6 +167,8 @@ def run_one(name: str, args, test_dir: str, out_root: str) -> dict:
     if result is None:
         return {"config": name, "error": (err.strip().splitlines() or ["no output"])[-1]}
     res = json.loads(result)
+    if "PHASES (" in out:
+        print(f"[{name}] " + out[out.index("PHASES ("):], flush=True)
     res.update(config=name, start_temp_c=start_temp, peak_temp_c=peak,
                telemetry=telemetry,
                package=next((l for l in out.splitlines() if l.startswith("xdna_train from")), ""))

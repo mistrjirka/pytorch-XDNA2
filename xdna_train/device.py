@@ -217,8 +217,10 @@ def register_xdna_device() -> None:
         )
 
     # General 3x3 conv family (BFP16 weights); XDNA_CONV3X3W=0 disables it.
-    # Below ~20 MMAC (e.g. RGB input layers) host packing and dispatch cost
-    # more than the CPU conv.
+    # Below ~20 MMAC host packing and dispatch cost more than the CPU conv; on
+    # top of that floor, plan() runs a padded-work cost model (RGB input convs
+    # stay on the CPU).  XDNA_CONV3X3W_FORCE=1 bypasses the model; see
+    # XDNA_CONV3X3W_{NPU_OVERHEAD_MS,NPU_GMACS,HOST_GBS,CPU_GMACS}.
     if os.environ.get("XDNA_CONV3X3W", "1") == "1":
         _configure_iron_family("conv3x3w", _C.configure_conv3x3w, 20_000_000)
         # Its weight gradient (BFP16 operands, fp32 sums), deferred to the
