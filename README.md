@@ -67,6 +67,13 @@ With pip:
 pip install "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
 ```
 
+The conv3x3w NPU convolution families (large 3x3 convs, forward/dX/dW) need an
+[mlir-aie / IRON](https://github.com/Xilinx/mlir-aie) Python environment to compile their
+instruction streams on first use (~7 s each, cached under `~/.cache/torch-xdna2/`). Point
+`XDNA_IRON_PYTHON` at it (or put it at `~/mlir-aie-env`); without it those convs silently
+stay on the CPU. See [docs/OPTIMIZATION_LOG.md](docs/OPTIMIZATION_LOG.md) for what is
+accelerated and what was tried.
+
 The first import builds a small native bridge against the **exact installed PyTorch ABI** and caches it under `~/.cache/torch-xdna2/`. Validated XDNA instruction streams are bundled with the package.
 
 To build/check explicitly:

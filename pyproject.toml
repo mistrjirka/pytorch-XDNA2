@@ -34,6 +34,8 @@ include = ["xdna_train*"]
 [tool.setuptools.package-data]
 xdna_train = [
   "_native/*.cpp",
+  "_designs/*.cc",
+  "_designs/*.h",
   "_vendor/xrt_shim/*.cpp",
   "_vendor/xrt_shim/*.h",
   "_artifacts/train_gemm_64x32x96/*",
