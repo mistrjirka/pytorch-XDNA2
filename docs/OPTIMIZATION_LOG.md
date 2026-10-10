@@ -73,3 +73,28 @@ upsample, mul) ~25-30 ms. Profile is flat; remaining wins are each 1-3 %.
 - Global `set_swap_module_params_on_conversion(True)` breaks LSTM `load_state_dict`; LSTM cell unoptimized (0.29x in model zoo).
 - NIS venv still imports the old installed package; reinstall needs user approval.
 - Re-run `benchmarks/model_zoo.py` for regressions with the new conv paths.
+
+## Generalization work (2026-10-10, branch `conv3x3w-tiling`)
+
+- **Width tiling** (images wider than 36 px): an image is cut into S vertical strips of <= 34 output
+  columns, each packed as a virtual image with one real neighbour column per side; only the
+  middle columns of each strip are valid. Host pack/unpack only: no new kernel, no new xclbin,
+  streams stay keyed `(groups, wp, chunks)`. dW packs dY with zeroed halo columns. Proof:
+  `tests/run_conv3x3w_pack.py` (bit-exact vs numpy, incl. group pieces and halo modes),
+  `tests/run_conv3x3w_torch.py` (W = 37, 56, 64, 112, 224: fwd/dX/dW ~1 % vs FP32).
+- **Shape sweep** (`benchmarks/conv_shape_sweep.py`, `results/conv_shape_sweep*.json`, 3 channel
+  configs x 9 sizes x 13 batches, fwd+bwd vs CPU BF16): NPU wins at 31-36 px with batch >= 16
+  (1.4-3.0x, 256->128 B100: 2.99x); loses at <= 18 px or batch <= 8. Wide images with 128+
+  channels: 1.8-2.7x (48-112 px); 64-channel convs break-even or slower (half of the 128-wide
+  output block is wasted). Max error 1.2 %, no hangs. Isolated tests include ~5 ms of dW
+  context switching that real models amortize.
+- **Cost model fixes**: NPU fixed overhead 0.15 -> 0.5 ms (traces: tiny ops 0.8-1.0 ms), padded rows use
+  whole 2048-row groups, break-even ops need `XDNA_CONV3X3W_MARGIN` (0.8) predicted gain: whole-model
+  runs showed break-even NPU convs lose ~10 % (resnet18 at 224 px, conv path on: 100-120 ms vs 92 off).
+- **Coverage tool** `benchmarks/conv_coverage.py` (no hardware): fraction of conv MACs eligible per
+  torchvision model, with and without tiling (VGG11@224 49 % -> 99 %, ResNet18@224 57 % -> 83 %).
+- **Not covered**: 1x1 convs (52-91 % of MACs in ResNet50/MobileNet/EfficientNet), depthwise, stride-2,
+  7x7. A 1x1 variant needs a tap-count parameter in the core loop and weight DMA (tap offsets are
+  already runtime parameters), the most valuable next widening.
+- Whole-model caveat: `vgg11_128` is dominated by its 130 M-parameter classifier/optimizer, so it
+  is a poor conv benchmark.

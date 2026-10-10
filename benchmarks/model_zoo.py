@@ -36,6 +36,20 @@ def _resnet18():
                          torch.randint(0, 100, (32,), generator=g)), F.cross_entropy
 
 
+def _resnet18_224():
+    import torchvision
+    m = torchvision.models.resnet18(num_classes=100)
+    return m, lambda g: (torch.randn(8, 3, 224, 224, generator=g),
+                         torch.randint(0, 100, (8,), generator=g)), F.cross_entropy
+
+
+def _vgg11_128():
+    import torchvision
+    m = torchvision.models.vgg11(num_classes=100)
+    return m, lambda g: (torch.randn(8, 3, 128, 128, generator=g),
+                         torch.randint(0, 100, (8,), generator=g)), F.cross_entropy
+
+
 def _mobilenet_v3():
     import torchvision
     m = torchvision.models.mobilenet_v3_small(num_classes=100)
@@ -153,6 +167,8 @@ def _nis_mynet():
 
 MODELS = {
     "resnet18": _resnet18,
+    "resnet18_224": _resnet18_224,
+    "vgg11_128": _vgg11_128,
     "mobilenet_v3": _mobilenet_v3,
     "unet": _unet,
     "transformer": _transformer,
