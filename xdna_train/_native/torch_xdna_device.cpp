@@ -2094,7 +2094,7 @@ struct XdnaConv3x3wRuntime {
       return raw != nullptr && raw[0] != 0 && std::strcmp(raw, "0") != 0;
     }();
     if (force) return true;
-    static const double overhead_ms = env_double("XDNA_CONV3X3W_NPU_OVERHEAD_MS", 0.15);
+    static const double overhead_ms = env_double("XDNA_CONV3X3W_NPU_OVERHEAD_MS", 0.5);
     static const double npu_gmacs = env_double("XDNA_CONV3X3W_NPU_GMACS", 5.5);
     static const double host_gbs = env_double("XDNA_CONV3X3W_HOST_GBS", 20.0);
     static const double cpu_gmacs = env_double("XDNA_CONV3X3W_CPU_GMACS", 0.9);

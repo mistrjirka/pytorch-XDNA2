@@ -24,7 +24,8 @@ xdna_train.register_xdna_device()
 CASES = [
     (40, 3, 36, 64, False, True),      # RGB input conv: both directions have a 3-channel side
     (40, 64, 36, 64, True, True),
-    (40, 128, 9, 128, True, True),
+    (40, 128, 9, 128, False, False),    # break-even (0.49 ms NPU vs 0.48 CPU): fixed overhead ~0.5 ms
+    (32, 256, 4, 256, False, False),    # tiny spatial size: dispatch overhead dominates
     (40, 195, 36, 64, True, True),
     (40, 256, 18, 128, True, True),
     (40, 256, 36, 128, True, True),
