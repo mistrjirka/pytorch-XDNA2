@@ -4,6 +4,7 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#include <emmintrin.h>
 #endif
 
 // Width of the pack loops only.  Set through num_threads() on each loop so the
@@ -601,6 +602,57 @@ constexpr int kGroupOutRows = 2048;
 constexpr int kGroupRows = 2126;
 constexpr int kKStep = 64;
 constexpr int kN = 128;
+
+// 8x8 transpose of 16-bit elements: out[j][i] = in[i][j] (row strides in elements).
+inline void transpose8x8_u16(const uint16_t* in, std::size_t is, uint16_t* out, std::size_t os) {
+  __m128i r0 = _mm_loadu_si128((const __m128i*)(in + 0 * is));
+  __m128i r1 = _mm_loadu_si128((const __m128i*)(in + 1 * is));
+  __m128i r2 = _mm_loadu_si128((const __m128i*)(in + 2 * is));
+  __m128i r3 = _mm_loadu_si128((const __m128i*)(in + 3 * is));
+  __m128i r4 = _mm_loadu_si128((const __m128i*)(in + 4 * is));
+  __m128i r5 = _mm_loadu_si128((const __m128i*)(in + 5 * is));
+  __m128i r6 = _mm_loadu_si128((const __m128i*)(in + 6 * is));
+  __m128i r7 = _mm_loadu_si128((const __m128i*)(in + 7 * is));
+  __m128i a0 = _mm_unpacklo_epi16(r0, r1), a1 = _mm_unpackhi_epi16(r0, r1);
+  __m128i a2 = _mm_unpacklo_epi16(r2, r3), a3 = _mm_unpackhi_epi16(r2, r3);
+  __m128i a4 = _mm_unpacklo_epi16(r4, r5), a5 = _mm_unpackhi_epi16(r4, r5);
+  __m128i a6 = _mm_unpacklo_epi16(r6, r7), a7 = _mm_unpackhi_epi16(r6, r7);
+  __m128i b0 = _mm_unpacklo_epi32(a0, a2), b1 = _mm_unpackhi_epi32(a0, a2);
+  __m128i b2 = _mm_unpacklo_epi32(a1, a3), b3 = _mm_unpackhi_epi32(a1, a3);
+  __m128i b4 = _mm_unpacklo_epi32(a4, a6), b5 = _mm_unpackhi_epi32(a4, a6);
+  __m128i b6 = _mm_unpacklo_epi32(a5, a7), b7 = _mm_unpackhi_epi32(a5, a7);
+  _mm_storeu_si128((__m128i*)(out + 0 * os), _mm_unpacklo_epi64(b0, b4));
+  _mm_storeu_si128((__m128i*)(out + 1 * os), _mm_unpackhi_epi64(b0, b4));
+  _mm_storeu_si128((__m128i*)(out + 2 * os), _mm_unpacklo_epi64(b1, b5));
+  _mm_storeu_si128((__m128i*)(out + 3 * os), _mm_unpackhi_epi64(b1, b5));
+  _mm_storeu_si128((__m128i*)(out + 4 * os), _mm_unpacklo_epi64(b2, b6));
+  _mm_storeu_si128((__m128i*)(out + 5 * os), _mm_unpackhi_epi64(b2, b6));
+  _mm_storeu_si128((__m128i*)(out + 6 * os), _mm_unpacklo_epi64(b3, b7));
+  _mm_storeu_si128((__m128i*)(out + 7 * os), _mm_unpackhi_epi64(b3, b7));
+}
+
+// tile[i][c] = s[c * hw + i] for i < n (n <= 8), c < cc.
+inline void gather_pixels(const uint16_t* s, std::size_t hw, int cc, int n, uint16_t (*tile)[kKStep]) {
+  int c = 0;
+  if (n == 8)
+    for (; c + 8 <= cc; c += 8) transpose8x8_u16(s + c * hw, hw, &tile[0][c], kKStep);
+  for (; c < cc; ++c)
+    for (int i = 0; i < n; ++i) tile[i][c] = s[std::size_t(c) * hw + i];
+}
+
+// d[n * dstride + x] = s[x * kN + n] for x < nx, n < nv.
+inline void scatter_channels(const uint16_t* s, uint16_t* d, std::size_t dstride, int nx, int nv) {
+  int x = 0;
+  for (; x + 8 <= nx; x += 8) {
+    int n = 0;
+    for (; n + 8 <= nv; n += 8)
+      transpose8x8_u16(s + std::size_t(x) * kN + n, kN, d + std::size_t(n) * dstride + x, dstride);
+    for (; n < nv; ++n)
+      for (int i = 0; i < 8; ++i) d[std::size_t(n) * dstride + x + i] = s[std::size_t(x + i) * kN + n];
+  }
+  for (; x < nx; ++x)
+    for (int n = 0; n < nv; ++n) d[std::size_t(n) * dstride + x] = s[std::size_t(x) * kN + n];
+}
 }  // namespace
 
 extern "C" {
@@ -626,9 +678,13 @@ void xdna_conv3x3w_pack_input_bf16(
         const uint16_t* s =
             src + ((std::size_t(b) * C + chunk * kKStep) * H + y) * W;
         const std::size_t p0 = (std::size_t(b) * (H + 2) + y + 1) * wp + 1;
-        for (int x = 0; x < W; ++x) {
-          uint16_t px[kKStep];
-          for (int c = 0; c < cc; ++c) px[c] = s[std::size_t(c) * H * W + x];
+        for (int xb = 0; xb < W; xb += 8) {
+          const int nx = W - xb < 8 ? W - xb : 8;
+          uint16_t tile[8][kKStep];
+          gather_pixels(s + xb, std::size_t(H) * W, cc, nx, tile);
+          for (int xi = 0; xi < nx; ++xi) {
+          const int x = xb + xi;
+          const uint16_t* px = tile[xi];
           const std::size_t p = p0 + x;
           const std::size_t g = p / kGroupOutRows;
           const std::size_t r = p % kGroupOutRows;
@@ -640,6 +696,7 @@ void xdna_conv3x3w_pack_input_bf16(
                 dst + (((g - 1) * chunks + chunk) * kGroupRows + r +
                        kGroupOutRows) * kKStep,
                 px, std::size_t(cc) * sizeof(uint16_t));
+          }
         }
       }
     }
@@ -712,11 +769,9 @@ void xdna_conv3x3w_unpack_output_bf16(
   for (int b = 0; b < B; ++b) {
     for (int y = 0; y < H; ++y) {
       const uint16_t* s = c + (std::size_t(b) * (H + 2) + y) * wp * kN;
-      for (int n = 0; n < cout_valid; ++n) {
-        uint16_t* d =
-            dst + ((std::size_t(b) * C_total + c_start + n) * H + y) * W;
-        for (int x = 0; x < W; ++x) d[x] = s[std::size_t(x) * kN + n];
-      }
+      scatter_channels(
+          s, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W,
+          std::size_t(H) * W, W, cout_valid);
     }
   }
 }
@@ -811,9 +866,13 @@ void xdna_conv3x3w_pack_input_range_bf16(
         const int x1 = pr + W > phi ? int(phi - pr) : W;
         const uint16_t* s =
             src + ((std::size_t(b) * C + chunk * kKStep) * H + y) * W;
-        for (int x = x0; x < x1; ++x) {
-          uint16_t px[kKStep];
-          for (int c = 0; c < cc; ++c) px[c] = s[std::size_t(c) * H * W + x];
+        for (int xb = x0; xb < x1; xb += 8) {
+          const int nx = x1 - xb < 8 ? x1 - xb : 8;
+          uint16_t tile[8][kKStep];
+          gather_pixels(s + xb, std::size_t(H) * W, cc, nx, tile);
+          for (int xi = 0; xi < nx; ++xi) {
+          const int x = xb + xi;
+          const uint16_t* px = tile[xi];
           const std::size_t p = pr + x;
           const std::size_t g = p / kGroupOutRows;
           const std::size_t r = p % kGroupOutRows;
@@ -827,6 +886,7 @@ void xdna_conv3x3w_pack_input_range_bf16(
                 dst + (((g - 1 - g0) * chunks + chunk) * kGroupRows + r +
                        kGroupOutRows) * kKStep,
                 px, std::size_t(cc) * sizeof(uint16_t));
+          }
         }
       }
     }
@@ -859,11 +919,9 @@ void xdna_conv3x3w_unpack_output_range_bf16(
       const long xb = p1 - base < W ? p1 - base : W;
       if (xb <= xa) continue;
       const uint16_t* s = c + (base + xa - p0) * kN;
-      for (int n = 0; n < cout_valid; ++n) {
-        uint16_t* d =
-            dst + ((std::size_t(b) * C_total + c_start + n) * H + y) * W;
-        for (long x = xa; x < xb; ++x) d[x] = s[(x - xa) * kN + n];
-      }
+      scatter_channels(
+          s, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W + xa,
+          std::size_t(H) * W, int(xb - xa), cout_valid);
     }
   }
 }

@@ -494,6 +494,8 @@ void materialize_virtual(
   allocation->coherency = XdnaCoherency::HostDirty;
 }
 
+void release_held_cpu_dw();
+
 void wait_pending_host_write(XdnaAllocation* allocation) {
   std::shared_future<void> pending;
   {
@@ -501,6 +503,8 @@ void wait_pending_host_write(XdnaAllocation* allocation) {
     pending = allocation->pending_host_write;
   }
   if (pending.valid()) {
+    // A held CPU dW only starts on release; never wait on one that has not.
+    release_held_cpu_dw();
     pending.get();
   }
 }
@@ -534,6 +538,38 @@ class AsyncHostWorkQueue {
         }()),
         worker_([this]() { run(); }) {}
 
+  // With XDNA_HOLD_CPU_DW (default on), submitted tasks wait until release():
+  // the CPU dWs then run while the CPU would otherwise idle on the deferred
+  // NPU dW, not competing with the backward chain for cores and bandwidth.
+  static bool hold_enabled() {
+    static const bool v = [] {
+      const char* raw = std::getenv("XDNA_HOLD_CPU_DW");
+      return raw == nullptr || raw[0] == 0 || std::strcmp(raw, "0") != 0;
+    }();
+    return v;
+  }
+
+  std::shared_future<void> submit_held(std::function<void()> fn) {
+    std::packaged_task<void()> task(std::move(fn));
+    auto future = task.get_future().share();
+    std::lock_guard<std::mutex> lock(mutex_);
+    held_.emplace_back(std::move(task));
+    return future;
+  }
+
+  void release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (held_.empty()) return;
+      for (auto& t : held_) {
+        ++outstanding_;
+        tasks_.emplace_back(std::move(t));
+      }
+      held_.clear();
+    }
+    work_cv_.notify_one();
+  }
+
   std::shared_future<void> submit(std::function<void()> fn) {
     std::packaged_task<void()> task(std::move(fn));
     auto future = task.get_future().share();
@@ -550,6 +586,7 @@ class AsyncHostWorkQueue {
   }
 
   void drain() {
+    release();
     submit([]() {}).get();
   }
 
@@ -579,6 +616,7 @@ class AsyncHostWorkQueue {
   std::condition_variable work_cv_;
   std::condition_variable space_cv_;
   std::deque<std::packaged_task<void()>> tasks_;
+  std::deque<std::packaged_task<void()>> held_;
   std::thread worker_;
 };
 
@@ -588,6 +626,8 @@ AsyncHostWorkQueue& cpu_dw_queue() {
   static auto* queue = new AsyncHostWorkQueue();
   return *queue;
 }
+
+void release_held_cpu_dw() { cpu_dw_queue().release(); }
 
 void ensure_host_current(const at::Tensor& tensor) {
   if (!tensor.defined() || tensor.device().type() != kXdnaType) {
@@ -2262,6 +2302,23 @@ struct XdnaConv3x3wRuntime {
       Conv3x3wStream& s,
       const char* phase,
       std::shared_ptr<Conv3x3wPacked>* keep_input = nullptr) {
+    static const bool trace = [] {
+      const char* e = std::getenv("XDNA_CONV3X3W_TRACE");
+      return e != nullptr && e[0] != 0 && e[0] != '0';
+    }();
+    const auto trace_t0 = std::chrono::steady_clock::now();
+    double trace_wait_ms = 0.0, trace_pack_ms = 0.0, trace_unpack_ms = 0.0, trace_sync_ms = 0.0;
+    auto now_ms = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    struct TraceOut {
+      bool on; const char* phase; const Conv3x3wPlan& p; std::chrono::steady_clock::time_point t0; double& wait;
+      double& pack; double& unpack; double& sync;
+      ~TraceOut() {
+        if (!on) return;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "TRACE %s B%ld %ldx%ld cin%ld cout%ld groups%ld total %.3f wait %.3f pack %.3f unpack %.3f sync %.3f ms\n",
+                     phase, long(p.batch), long(p.h), long(p.w), long(p.cin), long(p.cout), long(p.groups), ms, wait, pack, unpack, sync);
+      }
+    } trace_out{trace, phase, p, trace_t0, trace_wait_ms, trace_pack_ms, trace_unpack_ms, trace_sync_ms};
     ensure_host_current(x);
     auto x_cpu = cpu_alias(x);
     if (!x_cpu.is_contiguous()) x_cpu = x_cpu.contiguous();
@@ -2294,6 +2351,7 @@ struct XdnaConv3x3wRuntime {
     }
     auto pack_piece = [&](const Conv3x3wPiece& pc) {
       ScopedMappedCpu pack_phase("npu_conv3x3w.pack");
+      struct Acc { double& d; double t; decltype(now_ms)& f; ~Acc() { d += f() - t; } } acc{trace_pack_ms, now_ms(), now_ms};
       xdna_conv3x3w_pack_input_range_bf16(
           static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
           static_cast<uint16_t*>(xin->ptr) + pc.g0 * in_group / 2,
@@ -2355,10 +2413,13 @@ struct XdnaConv3x3wRuntime {
       ShimBo* r = raw[t.nb & 1]->sub(pc.g0 * out_group, pc.ng * out_group);
       {
         ScopedMappedCpu sync_phase("npu_conv3x3w.unpack_sync");
+        const double t0 = now_ms();
         TORCH_CHECK(shim_bo_sync_from_device(r) == 0,
                     "failed to sync conv3x3w output: ", shim_last_error());
+        trace_sync_ms += now_ms() - t0;
       }
       ScopedMappedCpu unpack_phase("npu_conv3x3w.unpack");
+      struct Acc { double& d; double t; decltype(now_ms)& f; ~Acc() { d += f() - t; } } acc{trace_unpack_ms, now_ms(), now_ms};
       const int64_t p0 = pc.g0 * kGroupOutRows;
       const int64_t p1 = std::min(m_total, (pc.g0 + pc.ng) * kGroupOutRows);
       xdna_conv3x3w_unpack_output_range_bf16(
@@ -2383,7 +2444,9 @@ struct XdnaConv3x3wRuntime {
       }
       {
         ScopedMappedCpu run_phase(phase);
+        const auto w0 = std::chrono::steady_clock::now();
         cur.wait();
+        trace_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
       }
       if (j + 1 < tasks.size()) start(tasks[j + 1], cur);
       unpack(tasks[j]);
@@ -2603,11 +2666,19 @@ struct XdnaConv3x3wDwRuntime {
       }
       {
         ScopedMappedCpu run_phase("npu_conv3x3w.dw.run");
+        const auto t0 = std::chrono::steady_clock::now();
         ShimBo* data[3] = {x_buf->bo, d_buf->bo, c};
         TORCH_CHECK(shim_run_kernel(kernel, 3, it->second.first, it->second.second, data, 3) == 0,
                     "conv3x3w_dw dispatch failed: ", shim_last_error());
         TORCH_CHECK(shim_bo_sync_from_device(c) == 0,
                     "failed to sync conv3x3w_dw output: ", shim_last_error());
+        static const bool trace = [] {
+          const char* e = std::getenv("XDNA_CONV3X3W_TRACE");
+          return e != nullptr && e[0] != 0 && e[0] != '0';
+        }();
+        if (trace)
+          std::fprintf(stderr, "TRACE dw %s run+sync %.3f ms\n", key.c_str(),
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
       }
       // C [6 col][4 row][3 dx][8 ci blk][4 co blk][8 ci][8 co] fp32; column =
       // 3 * local input chunk + dy, row = 32-channel slice of the 128 outputs.
@@ -4879,6 +4950,7 @@ convolution_backward_overrideable_xdna(
     auto* rt = w3_dw_slot.get();
     std::shared_future<void> pending =
         std::async(std::launch::deferred, [job, gw_ptr, rt, plan = *w3_dw_plan]() {
+          release_held_cpu_dw();
           rt->compute(job->input, job->grad_output, gw_ptr, plan,
                       std::move(job->x_buf), std::move(job->d_buf));
           *job = Conv3x3wDwJob();
@@ -4929,7 +5001,7 @@ convolution_backward_overrideable_xdna(
       auto input_xdna_keep = input;
       auto weight_xdna_keep = weight;
       auto gw_xdna_keep = gw;
-      auto pending = cpu_dw_queue().submit(
+      auto dw_task =
           [go_cpu_keep,
            input_cpu_keep,
            weight_cpu_keep,
@@ -4958,7 +5030,10 @@ convolution_backward_overrideable_xdna(
                 groups_v,
                 dw_mask);
             gw_cpu_keep.copy_(std::get<1>(grads), false);
-          });
+          };
+      auto pending = AsyncHostWorkQueue::hold_enabled()
+          ? cpu_dw_queue().submit_held(std::move(dw_task))
+          : cpu_dw_queue().submit(std::move(dw_task));
       set_pending_host_write(gw, std::move(pending));
     } else if (virtual_dw_sources.has_value()) {
       const auto src0_xdna = (*virtual_dw_sources)[0];
