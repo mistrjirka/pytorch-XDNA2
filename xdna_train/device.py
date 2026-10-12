@@ -623,9 +623,16 @@ def npu_mode() -> int:
 
 
 def try_register_xdna_device() -> bool:
+    """Register the device if possible (called on import).  On failure, warn
+    with the cause: otherwise the first sign is a confusing
+    "No module named 'torch.xdna'" much later."""
     try:
         register_xdna_device()
-    except (ImportError, RuntimeError, OSError):
+    except (ImportError, RuntimeError, OSError) as e:
+        import warnings
+
+        warnings.warn(f"xdna_train: XDNA device not registered: {type(e).__name__}: {e}",
+                      RuntimeWarning, stacklevel=2)
         return False
     return True
 
