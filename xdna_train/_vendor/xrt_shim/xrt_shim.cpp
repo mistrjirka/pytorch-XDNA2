@@ -125,7 +125,41 @@ static std::string state_or(const xrt::run& run, const char* fallback) {
   try { return ert_state_name(run.state()); } catch (...) { return fallback; }
 }
 
-static void wait_deadline(const xrt::run& run, const std::string& what) {
+// A wait that gave up leaves the command running; XRT makes aborting it the caller's job.  If
+// the abort works the command is over and its run and buffers may be released as usual.  If it
+// does not, the command may still touch its buffers, so nothing it uses may ever be released:
+// the run is kept alive here forever, every later release (shim_bo_free, shim_run_free, ...) leaks
+// instead, and every later dispatch is refused.
+static std::atomic<bool> g_poisoned{false};
+
+template <class T> static void release_unless_poisoned(T* p) {
+  if (!g_poisoned.load()) delete p;
+}
+
+static void check_dispatch_allowed() {
+  if (g_poisoned.load()) {
+    throw std::runtime_error(
+        "NPU dispatch refused: an earlier dispatch timed out and could not be aborted, so the "
+        "device may still be using its buffers; restart the process");
+  }
+}
+
+int shim_dispatch_poisoned(void) { return g_poisoned.load() ? 1 : 0; }
+
+// Returns true when the command is certainly over.
+static bool abort_stuck_run(xrt::run& run) {
+  try {
+    run.abort();
+    return true;
+  } catch (...) {
+    g_poisoned.store(true);
+    static auto* kept = new std::vector<xrt::run*>();  // never destroyed, by design
+    kept->push_back(new xrt::run(run));
+    return false;
+  }
+}
+
+static void wait_deadline(xrt::run& run, const std::string& what) {
   const long ms = dispatch_timeout_ms();
   auto t0 = shim_clock::now();
   if (ms == 0) {                    // opt-out: original block-forever semantics
@@ -161,13 +195,15 @@ static void wait_deadline(const xrt::run& run, const std::string& what) {
     // original problem. Elapsed time, not the exception type, decides which story this is.
     //
     // NOTE the command is still IN FLIGHT on the deadline path: XRT documents that after a
-    // timeout it is the caller's responsibility to abort it, and we do not -- there is no abort
-    // in this ABI, and this path reports a wedged device rather than recovering from one. Treat
-    // the process as unusable for further dispatches once it fires.
+    // timeout it is the caller's responsibility to abort it.  We abort it (synchronously); if
+    // that fails the process is poisoned (see g_poisoned) and unusable for further dispatches.
     const long waited = static_cast<long>(ms_since(t0));
-    const std::string where = "dispatch '" + what + "' (command state "
-                            + state_or(run, "UNREADABLE") + ", waited "
-                            + std::to_string(waited) + " ms): " + e.what();
+    std::string where = "dispatch '" + what + "' (command state "
+                      + state_or(run, "UNREADABLE") + ", waited "
+                      + std::to_string(waited) + " ms): " + e.what();
+    where += abort_stuck_run(run)
+                 ? " [command aborted]"
+                 : " [abort failed: buffers leaked, further NPU dispatches refused]";
     if (waited + 1 >= ms) {
       throw std::runtime_error(
           "deadline: " + where + " -- NPU_DISPATCH_TIMEOUT_MS changes it, 0 disables it");
@@ -196,7 +232,7 @@ const char* shim_last_error(void) { return g_err.c_str(); }
 ShimDevice* shim_device_open(unsigned int index) {
   GUARD_PTR( return new ShimDevice{ xrt::device(index) }; )
 }
-void shim_device_close(ShimDevice* d) { delete d; }
+void shim_device_close(ShimDevice* d) { release_unless_poisoned(d); }
 
 ShimKernel* shim_kernel_load(ShimDevice* d, const char* xclbin_path, const char* kernel_name,
                              int qos_priority) {
@@ -215,7 +251,7 @@ ShimKernel* shim_kernel_load(ShimDevice* d, const char* xclbin_path, const char*
     return new ShimKernel{ std::move(ctx), std::move(k) };
   )
 }
-void shim_kernel_close(ShimKernel* k) { delete k; }
+void shim_kernel_close(ShimKernel* k) { release_unless_poisoned(k); }
 
 int shim_kernel_group_id(ShimKernel* k, int arg_index) {
   GUARD_INT( return static_cast<int>(k->kern.group_id(arg_index)); )
@@ -238,7 +274,7 @@ ShimBo* shim_bo_alloc(ShimDevice* d, ShimKernel* /*k*/, size_t nbytes, int flag,
 ShimBo* shim_bo_subbuffer(ShimBo* parent, size_t size, size_t offset) {
   GUARD_PTR( return new ShimBo{ xrt::bo(parent->bo, size, offset) }; )
 }
-void shim_bo_free(ShimBo* b) { delete b; }
+void shim_bo_free(ShimBo* b) { release_unless_poisoned(b); }
 
 int shim_bo_write(ShimBo* b, const void* src, size_t nbytes, size_t offset) {
   GUARD_INT( b->bo.write(src, nbytes, offset); return 0; )
@@ -256,6 +292,7 @@ int shim_bo_sync_from_device(ShimBo* b) {
 int shim_run_matmul8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
                      ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace) {
   GUARD_INT(
+    check_dispatch_allowed();
     auto run = k->kern(opcode, instr->bo, instr_count,
                        a->bo, b->bo, c->bo, tmp->bo, trace->bo);
     wait_deadline(run, "matmul8");
@@ -266,6 +303,7 @@ int shim_run_matmul8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t i
 int shim_run_dwconv6(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
                      ShimBo* x, ShimBo* w, ShimBo* y) {
   GUARD_INT(
+    check_dispatch_allowed();
     auto run = k->kern(opcode, instr->bo, instr_count, x->bo, w->bo, y->bo);
     wait_deadline(run, "dwconv6");
     return 0;
@@ -277,6 +315,7 @@ int shim_run_dwconv6(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t i
 int shim_run_mha7(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
                   ShimBo* q, ShimBo* kk, ShimBo* v, ShimBo* o) {
   GUARD_INT(
+    check_dispatch_allowed();
     auto run = k->kern(opcode, instr->bo, instr_count, q->bo, kk->bo, v->bo, o->bo);
     wait_deadline(run, "mha7");
     return 0;
@@ -288,6 +327,7 @@ int shim_run_mha7(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t inst
 int shim_run_bd8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
                  ShimBo* qpv, ShimBo* p, ShimBo* kk, ShimBo* v, ShimBo* ctx) {
   GUARD_INT(
+    check_dispatch_allowed();
     auto run = k->kern(opcode, instr->bo, instr_count, qpv->bo, p->bo, kk->bo, v->bo, ctx->bo);
     wait_deadline(run, "bd8");
     return 0;
@@ -300,6 +340,7 @@ int shim_run_bd8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr
 int shim_run_kernel(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
                     ShimBo* const* data, size_t n_data) {
   GUARD_INT(
+    check_dispatch_allowed();
     xrt::run run(k->kern);
     run.set_arg(0, opcode);
     run.set_arg(1, instr->bo);
@@ -319,6 +360,7 @@ int shim_run_kernel(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t in
 ShimRun* shim_run_matmul8_start(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
                                 ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace) {
   GUARD_PTR(
+    check_dispatch_allowed();
     auto run = k->kern(opcode, instr->bo, instr_count,
                        a->bo, b->bo, c->bo, tmp->bo, trace->bo);
     return new ShimRun{ std::move(run),
@@ -329,12 +371,13 @@ ShimRun* shim_run_matmul8_start(ShimKernel* k, unsigned int opcode, ShimBo* inst
 
 int shim_run_wait(ShimRun* r) {
   GUARD_INT(
+    check_dispatch_allowed();
     wait_deadline(r->run, r->label);
     return 0;
   )
 }
 
-void shim_run_free(ShimRun* r) { delete r; }
+void shim_run_free(ShimRun* r) { release_unless_poisoned(r); }
 
 // --- Fused full-ELF dispatch (IRON FusedMLIROperator path) ---------------------------------------
 
@@ -366,10 +409,11 @@ ShimElfKernel* shim_elf_kernel_load(ShimDevice* d, const void* elf_bytes, size_t
   )
 }
 
-void shim_elf_kernel_close(ShimElfKernel* k) { delete k; }
+void shim_elf_kernel_close(ShimElfKernel* k) { release_unless_poisoned(k); }
 
 int shim_run_elf(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) {
   GUARD_INT(
+    check_dispatch_allowed();
     xrt::run run(k->kern);
     for (size_t i = 0; i < n_bos; ++i) {
       run.set_arg(static_cast<int>(i), bos[i]->bo);
@@ -385,6 +429,7 @@ int shim_run_elf(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) {
 // shim_run_wait blocks for completion. Same ShimRun handle as the matmul async path.
 ShimRun* shim_run_elf_start(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) {
   GUARD_PTR(
+    check_dispatch_allowed();
     xrt::run run(k->kern);
     std::vector<xrt::bo> args;
     args.reserve(n_bos);
@@ -413,7 +458,7 @@ ShimElfCtx* shim_elf_ctx_open(ShimDevice* d, const void* base_elf, size_t nbytes
   )
 }
 
-void shim_elf_ctx_close(ShimElfCtx* c) { delete c; }
+void shim_elf_ctx_close(ShimElfCtx* c) { release_unless_poisoned(c); }
 
 ShimElfKernel2* shim_elf_kernel_rebind(ShimElfCtx* c, const void* elf_bytes, size_t nbytes,
                                        const char* kernel_name) {
@@ -436,10 +481,11 @@ ShimElfKernel2* shim_elf_kernel_rebind(ShimElfCtx* c, const void* elf_bytes, siz
   )
 }
 
-void shim_elf_kernel2_close(ShimElfKernel2* k) { delete k; }
+void shim_elf_kernel2_close(ShimElfKernel2* k) { release_unless_poisoned(k); }
 
 int shim_run_elf2(ShimElfKernel2* k, ShimBo* const* bos, size_t n_bos) {
   GUARD_INT(
+    check_dispatch_allowed();
     xrt::run run(k->kern);
     for (size_t i = 0; i < n_bos; ++i) {
       run.set_arg(static_cast<int>(i), bos[i]->bo);
@@ -501,7 +547,7 @@ ShimElfResident* shim_elf_resident_open_named(ShimElfResident* base, const char*
   )
 }
 
-void shim_elf_resident_close(ShimElfResident* r) { delete r; }
+void shim_elf_resident_close(ShimElfResident* r) { release_unless_poisoned(r); }
 
 size_t shim_elf_resident_scratchpad_size(ShimElfResident* r) {
   return r ? r->scratch_size : 0;
@@ -527,6 +573,7 @@ int shim_elf_resident_write(ShimElfResident* r, size_t offset, const void* data,
 
 int shim_elf_resident_dispatch(ShimElfResident* r) {
   GUARD_INT(
+    check_dispatch_allowed();
     r->scratchpad.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     r->run.start();
     wait_deadline(r->run, "resident:" + r->name);

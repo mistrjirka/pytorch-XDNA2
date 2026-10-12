@@ -82,6 +82,9 @@ int      shim_run_wait(ShimRun*); /* 0 = completed, -1 = error/not-completed */
    (NPU_DISPATCH_TIMEOUT_MS) can be re-sized against measured dispatches rather than re-guessed. */
 double   shim_dispatch_max_wait_ms(void);
 void     shim_run_free(ShimRun*);
+/* 1 once a dispatch timed out and could not be aborted: the command may still use its buffers, so
+   shim_*_free/close then leak instead of releasing, and every later dispatch fails. */
+int      shim_dispatch_poisoned(void);
 
 /* --- Fused full-ELF dispatch (the IRON FusedMLIROperator path) ----------------------------------
  * A full ELF carries its own instructions+config (no xclbin, no insts BO). Mirrors IRON's

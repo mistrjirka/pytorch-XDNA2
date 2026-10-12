@@ -113,6 +113,7 @@ extern "C" void xdna_conv3x3w_pack_input_strips_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
 extern "C" void xdna_conv3x3w_unpack_output_strips_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
+extern "C" int shim_dispatch_poisoned(void);
 extern "C" ShimRun* shim_run_kernel_start(
     ShimKernel*, unsigned int, ShimBo*, size_t, ShimBo* const*, size_t);
 
@@ -175,6 +176,9 @@ struct CachedBo {
   ShimBo* bo = nullptr;
   void* mapped = nullptr;
   size_t bytes = 0;
+  // The CPU wrote this buffer after its last flush, so its cache lines may be
+  // dirty.  A tensor recycling it starts HostDirty, not Clean.
+  bool host_dirty = false;
 };
 
 struct ArenaBacking {
@@ -323,6 +327,11 @@ struct XdnaBoCache {
 
   void release(CachedBo item) {
     if (item.bo == nullptr) {
+      return;
+    }
+    // After an unabortable dispatch timeout the NPU may still write this
+    // buffer: never recycle it into a tensor.
+    if (shim_dispatch_poisoned()) {
       return;
     }
     std::lock_guard<std::mutex> guard(mutex);
@@ -668,6 +677,13 @@ void ensure_device_current(const at::Tensor& tensor) {
   }
 }
 
+// Before the NPU writes a tensor: flush CPU-dirty cache lines (a recycled
+// buffer the CPU wrote earlier), or they are written back over the NPU result.
+// Free for a fresh or already flushed buffer.
+void prepare_npu_output(const at::Tensor& tensor) {
+  ensure_device_current(tensor);
+}
+
 void mark_host_dirty(const at::Tensor& tensor) {
   if (tensor.defined() && tensor.device().type() == kXdnaType) {
     auto* allocation = allocation_from_tensor(tensor);
@@ -696,6 +712,7 @@ struct XdnaAllocator final : c10::Allocator {
           allocation->bo,
           allocation->mapped,
           allocation->bytes,
+          allocation->coherency == XdnaCoherency::HostDirty,
       });
       allocation->bo = nullptr;
     }
@@ -717,7 +734,12 @@ struct XdnaAllocator final : c10::Allocator {
     allocation->bo = cached.bo;
     allocation->mapped = cached.mapped;
     allocation->bytes = cached.bytes;
-    allocation->coherency = XdnaCoherency::Clean;
+    // A recycled buffer may still hold CPU-dirty cache lines.  Keeping it
+    // HostDirty makes ensure_device_current() flush it before the NPU writes
+    // or reads it; marking it Clean let those lines be written back over NPU
+    // results.
+    allocation->coherency =
+        cached.host_dirty ? XdnaCoherency::HostDirty : XdnaCoherency::Clean;
     return c10::DataPtr(
         cached.mapped,
         allocation,
@@ -1309,6 +1331,7 @@ struct XdnaGemmRuntime {
         false,
         at::MemoryFormat::Contiguous);
 
+    prepare_npu_output(out);
     auto* a = allocation_from_tensor(lhs);
     auto* b = allocation_from_tensor(rhs);
     auto* c = allocation_from_tensor(out);
@@ -1658,6 +1681,7 @@ struct XdnaConvRuntime {
           c10::Device(kXdnaType, 0),
           false,
           at::MemoryFormat::Contiguous);
+      prepare_npu_output(raw);
       auto* raw_alloc = allocation_from_tensor(raw);
       ScopedMappedCpu run_phase("npu_conv.dx.run");
       TORCH_CHECK(
@@ -1723,6 +1747,7 @@ struct XdnaConvRuntime {
         c10::Device(kXdnaType, 0),
         false,
         at::MemoryFormat::Contiguous);
+    prepare_npu_output(raw);
     auto* out = allocation_from_tensor(raw);
     {
       ScopedMappedCpu run_phase("npu_conv.fwd.run");
@@ -1932,6 +1957,7 @@ std::shared_ptr<Conv3x3wPacked> acquire_packed(size_t bytes) {
     std::memset(buf->ptr, 0, bytes);
   }
   return std::shared_ptr<Conv3x3wPacked>(buf, [](Conv3x3wPacked* b) {
+    if (shim_dispatch_poisoned()) return;  // a stuck command may still use it: leak
     std::lock_guard<std::mutex> lock(packed_pool_mutex());
     packed_pool().emplace(b->bytes, b);
   });
@@ -1973,6 +1999,7 @@ std::shared_ptr<Conv3x3wPacked> acquire_npu_out(size_t bytes) {
                 "failed to sync conv3x3w output: ", shim_last_error());
   }
   return std::shared_ptr<Conv3x3wPacked>(buf, [](Conv3x3wPacked* b) {
+    if (shim_dispatch_poisoned()) return;  // a stuck command may still use it: leak
     std::lock_guard<std::mutex> lock(out_pool_mutex());
     out_pool().emplace(b->bytes, b);
   });
@@ -2088,6 +2115,8 @@ struct Conv3x3wRun {
     ShimRun* h = r;
     r = nullptr;
     const int rc = shim_run_wait(h);
+    // After a timeout the shim aborts the command; if it cannot, it keeps the
+    // run and its buffers alive (this free leaks) and refuses further dispatch.
     shim_run_free(h);
     TORCH_CHECK(rc == 0, "conv3x3w dispatch failed: ", shim_last_error());
   }
@@ -3115,6 +3144,7 @@ struct XdnaFullFrameConvRuntime {
         c10::Device(kXdnaType, 0),
         false,
         at::MemoryFormat::Contiguous);
+    prepare_npu_output(raw);
     auto* out = allocation_from_tensor(raw);
     TORCH_CHECK(
         shim_run_matmul8(
@@ -3605,6 +3635,7 @@ struct XdnaFullFrameDwRuntime {
         c10::Device(kXdnaType, 0),
         false,
         at::MemoryFormat::Contiguous);
+    prepare_npu_output(raw);
     auto* raw_alloc = allocation_from_tensor(raw);
     TORCH_CHECK(
         shim_run_matmul8(
@@ -4558,7 +4589,12 @@ at::Tensor mm_xdna(
     const int64_t k = lhs.size(1);
     const int64_t n = rhs.size(1);
     if (auto* stream = slot->find(m, k, n)) {
-      return slot->run(lhs, rhs, *stream);
+      // The NPU is handed the whole allocation, so an operand that starts
+      // inside it (a[1:]) is copied to a fresh one first.
+      return slot->run(
+          lhs.storage_offset() != 0 ? lhs.clone() : lhs,
+          rhs.storage_offset() != 0 ? rhs.clone() : rhs,
+          *stream);
     }
   }
   return cpu_mm_xdna(lhs, rhs);
