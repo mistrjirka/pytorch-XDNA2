@@ -269,6 +269,9 @@ noise (`benchmarks/bfp16_training_gate.py`).
   `XDNA_CONV3X3W_MIN_MACS`, `XDNA_CONV3X3W_DW_MIN_MACS`,
   `XDNA_CONV3X3W_WEIGHT_CACHE=0`, `XDNA_CONV3X3W_SYNC_BUILD=1` (build before
   the first call, for tests).
+- Before pushing: `PYTHONPATH=. python tests/quick_check.py` (~15 s; trains a
+  small conv net on CPU and XDNA and compares the loss, then the fast
+  scripts below).
 - Tests: `tests/run_conv3x3w_pack.py`, `tests/run_conv3x3w_torch.py`
   (includes the weight cache under every optimizer, fused ones too),
   `tests/run_conv3x3w_hw.py`, `tests/run_conv3x3w_dw_hw.py`,
