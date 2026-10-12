@@ -182,30 +182,9 @@ struct CachedBo {
   bool host_dirty = false;
 };
 
-struct ArenaBacking {
-  ShimBo* bo = nullptr;
-  uint8_t* mapped = nullptr;
-  size_t bytes = 0;
-  size_t used = 0;
-};
-
-int tensor_bo_flag() {
-  static const int flag = []() {
-    const char* raw = std::getenv("XDNA_TENSOR_BO_FLAG");
-    if (raw == nullptr || raw[0] == 0 || std::strcmp(raw, "host_only") == 0)
-      return 2;
-    if (std::strcmp(raw, "cacheable") == 0)
-      return 1;
-    if (std::strcmp(raw, "normal") == 0)
-      return 0;
-    TORCH_CHECK(
-        false,
-        "XDNA_TENSOR_BO_FLAG must be host_only, cacheable, or normal; got ",
-        raw);
-    return 2;
-  }();
-  return flag;
-}
+// Tensor storage is host-only BOs (shim flag 2): mapped host memory the NPU DMAs
+// from and to, which the coherency tracking below flushes explicitly.
+constexpr int kTensorBoFlag = 2;
 
 struct XdnaBoCache {
   std::mutex mutex;
@@ -214,11 +193,6 @@ struct XdnaBoCache {
   size_t max_cached_bytes = size_t(512) << 20;
   uint64_t fresh_allocations = 0;
   uint64_t reuses = 0;
-  size_t arena_chunk_bytes = 0;
-  std::vector<ArenaBacking> arenas;
-  uint64_t arena_parent_allocations = 0;
-  uint64_t arena_subbuffer_allocations = 0;
-  size_t arena_reserved_bytes = 0;
 
   XdnaBoCache() {
     if (const char* raw = std::getenv("XDNA_BO_CACHE_MB")) {
@@ -226,13 +200,6 @@ struct XdnaBoCache {
       const unsigned long long mb = std::strtoull(raw, &end, 10);
       if (end != raw && mb > 0) {
         max_cached_bytes = static_cast<size_t>(mb) << 20;
-      }
-    }
-    if (const char* raw = std::getenv("XDNA_BO_ARENA_MB")) {
-      char* end = nullptr;
-      const unsigned long long mb = std::strtoull(raw, &end, 10);
-      if (end != raw && mb > 0) {
-        arena_chunk_bytes = static_cast<size_t>(mb) << 20;
       }
     }
   }
@@ -250,64 +217,8 @@ struct XdnaBoCache {
       }
     }
 
-    if (arena_chunk_bytes != 0 && bytes <= arena_chunk_bytes) {
-      std::lock_guard<std::mutex> guard(mutex);
-      ArenaBacking* backing = nullptr;
-      size_t offset = 0;
-      for (auto& candidate : arenas) {
-        const size_t aligned =
-            (candidate.used + kPageAlignment - 1) & ~(kPageAlignment - 1);
-        if (aligned <= candidate.bytes &&
-            bytes <= candidate.bytes - aligned) {
-          backing = &candidate;
-          offset = aligned;
-          break;
-        }
-      }
-      if (backing == nullptr) {
-        const size_t parent_bytes = std::max(arena_chunk_bytes, bytes);
-        ShimBo* parent = shim_bo_alloc(
-            xdna_device(), nullptr, parent_bytes, tensor_bo_flag(), 0);
-        TORCH_CHECK(
-            parent != nullptr,
-            "XDNA arena parent allocation failed for ",
-            parent_bytes,
-            " bytes: ",
-            shim_last_error());
-        void* parent_map = shim_bo_map(parent);
-        if (parent_map == nullptr) {
-          shim_bo_free(parent);
-          TORCH_CHECK(false, "XDNA arena parent map failed: ", shim_last_error());
-        }
-        arenas.push_back(ArenaBacking{
-            parent,
-            static_cast<uint8_t*>(parent_map),
-            parent_bytes,
-            0,
-        });
-        backing = &arenas.back();
-        offset = 0;
-        ++arena_parent_allocations;
-        arena_reserved_bytes += parent_bytes;
-      }
-
-      ShimBo* child = shim_bo_subbuffer(backing->bo, bytes, offset);
-      TORCH_CHECK(
-          child != nullptr,
-          "XDNA arena sub-buffer allocation failed for ",
-          bytes,
-          " bytes at offset ",
-          offset,
-          ": ",
-          shim_last_error());
-      backing->used = offset + bytes;
-      ++fresh_allocations;
-      ++arena_subbuffer_allocations;
-      return CachedBo{child, backing->mapped + offset, bytes};
-    }
-
     ShimBo* bo =
-        shim_bo_alloc(xdna_device(), nullptr, bytes, tensor_bo_flag(), 0);
+        shim_bo_alloc(xdna_device(), nullptr, bytes, kTensorBoFlag, 0);
     TORCH_CHECK(
         bo != nullptr,
         "XDNA XRT BO allocation failed for ",
@@ -336,8 +247,7 @@ struct XdnaBoCache {
       return;
     }
     std::lock_guard<std::mutex> guard(mutex);
-    if (arena_chunk_bytes != 0 ||
-        cached_bytes + item.bytes <= max_cached_bytes) {
+    if (cached_bytes + item.bytes <= max_cached_bytes) {
       cached_bytes += item.bytes;
       free[item.bytes].push_back(item);
       return;
@@ -346,9 +256,6 @@ struct XdnaBoCache {
   }
 
   void empty() {
-    if (arena_chunk_bytes != 0) {
-      return;
-    }
     std::unordered_map<size_t, std::vector<CachedBo>> old;
     {
       std::lock_guard<std::mutex> guard(mutex);
@@ -5738,14 +5645,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::dict out;
     out["cached_bytes"] = pybind11::int_(cache.cached_bytes);
     out["max_cached_bytes"] = pybind11::int_(cache.max_cached_bytes);
-    out["tensor_bo_flag"] = pybind11::int_(tensor_bo_flag());
-    out["arena_chunk_bytes"] = pybind11::int_(cache.arena_chunk_bytes);
-    out["arena_parent_allocations"] =
-        pybind11::int_(cache.arena_parent_allocations);
-    out["arena_subbuffer_allocations"] =
-        pybind11::int_(cache.arena_subbuffer_allocations);
-    out["arena_reserved_bytes"] =
-        pybind11::int_(cache.arena_reserved_bytes);
     out["fresh_allocations"] = pybind11::int_(cache.fresh_allocations);
     out["reuses"] = pybind11::int_(cache.reuses);
     return out;
