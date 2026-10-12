@@ -795,6 +795,9 @@ struct XdnaHostAllocator final : c10::Allocator {
     if (g_adopt_depth > 0 && nbytes >= kAdoptMinBytes) {
       auto dp = g_xdna_allocator.allocate(nbytes);
       auto* allocation = static_cast<XdnaAllocation*>(dp.release_context());
+      // The CPU writes this memory.  If it is freed without being adopted,
+      // the deleter must cache the BO as HostDirty, not Clean.
+      allocation->coherency = XdnaCoherency::HostDirty;
       void* data = allocation->mapped;
       {
         std::lock_guard<std::mutex> guard(host_bo_mutex());
@@ -983,7 +986,24 @@ void resize_xdna_storage(c10::StorageImpl* storage, size_t newsize) {
   }
   auto next = g_xdna_allocator.allocate(newsize);
   if (oldsize != 0 && storage->data() != nullptr) {
+    // Move the finished bytes: a deferred dW or a device write may still be
+    // outstanding for the old allocation, and it is released right below.
+    auto* old = static_cast<XdnaAllocation*>(storage->data_ptr().get_context());
+    if (storage->data_ptr().get_deleter() == &XdnaAllocator::deleter &&
+        old != nullptr && old->magic == kXdnaAllocationMagic) {
+      wait_pending_host_write(old);
+      if (old->coherency == XdnaCoherency::DeviceDirty) {
+        TORCH_CHECK(
+            shim_bo_sync_from_device(old->bo) == 0,
+            "XDNA sync-from-device failed: ",
+            shim_last_error());
+        old->coherency = XdnaCoherency::Clean;
+      }
+    }
     std::memcpy(next.get(), storage->data(), oldsize);
+    // The CPU wrote the new buffer.
+    static_cast<XdnaAllocation*>(next.get_context())->coherency =
+        XdnaCoherency::HostDirty;
   }
   storage->set_data_ptr(std::move(next));
   storage->set_nbytes(newsize);
@@ -1140,7 +1160,6 @@ const at::Tensor& resize_xdna_(
   // Like at::native::resize_impl_cpu_: an unchanged size keeps the strides
   // (and the storage); only an explicit contiguous format restrides.
   if (!self.sym_sizes().equals(size)) {
-    impl->generic_set_sizes_contiguous(size);
     const auto nbytes_sym = at::detail::computeStorageNbytesContiguous(
         size,
         c10::SymInt(static_cast<int64_t>(self.element_size())),
@@ -1148,7 +1167,12 @@ const at::Tensor& resize_xdna_(
     const auto nbytes = static_cast<size_t>(
         nbytes_sym.guard_int(__FILE__, __LINE__));
     auto storage = self.storage();
-    if (nbytes > storage.nbytes()) {
+    const bool grows = nbytes > storage.nbytes();
+    // Growing moves the old bytes: materialize a logical value while the
+    // tensor still has the shape it was produced with.
+    if (grows && storage.nbytes() != 0) ensure_host_current(self);
+    impl->generic_set_sizes_contiguous(size);
+    if (grows) {
       resize_xdna_storage(storage.unsafeGetStorageImpl(), nbytes);
     }
   }

@@ -16,6 +16,7 @@ extern "C" size_t shim_bo_size(ShimBo* b) {
 extern "C" ShimRun* shim_run_kernel_start(ShimKernel* k, unsigned int opcode, ShimBo* instr,
                                           size_t instr_count, ShimBo* const* data, size_t n_data) {
   GUARD_PTR(
+    check_dispatch_allowed();
     xrt::run run(k->kern);
     run.set_arg(0, opcode);
     run.set_arg(1, instr->bo);
