@@ -103,7 +103,7 @@ def script(name):
 ok = training_matches_cpu()
 for name in ("run_view_safety.py", "run_gemm_safety.py", "run_tensor_semantics.py",
              "run_deferred_dw.py", "run_import_scope.py", "run_cpu_islands.py",
-             "run_conv3x3w_pack.py"):
+             "run_conv3x3w_pack.py", "run_coherency_lifetime.py"):
     ok &= script(name)
 print("QUICK CHECK OK" if ok else "QUICK CHECK FAILED")
 sys.exit(0 if ok else 1)
