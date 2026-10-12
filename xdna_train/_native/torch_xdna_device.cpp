@@ -384,6 +384,11 @@ struct XdnaVirtualValue {
   std::array<int64_t, 2> output_size = {0, 0};
   std::optional<double> scales_h;
   std::optional<double> scales_w;
+  // The tensor the value belongs to, so it can be materialized from the
+  // storage alone (storage growth).
+  std::vector<int64_t> sizes, strides;
+  int64_t storage_offset = 0;
+  caffe2::TypeMeta dtype;
 };
 
 struct XdnaAllocation {
@@ -460,6 +465,10 @@ void set_virtual_value(
     const at::Tensor& tensor,
     std::shared_ptr<XdnaVirtualValue> value) {
   auto* allocation = allocation_from_tensor(tensor);
+  value->sizes.assign(tensor.sizes().begin(), tensor.sizes().end());
+  value->strides.assign(tensor.strides().begin(), tensor.strides().end());
+  value->storage_offset = tensor.storage_offset();
+  value->dtype = tensor.dtype();
   std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
   // Keep the coherency state: a recycled buffer may hold CPU-dirty lines, and
   // if this value is dropped unread the buffer must return to the cache
@@ -993,6 +1002,21 @@ void resize_xdna_storage(c10::StorageImpl* storage, size_t newsize) {
     auto* old = static_cast<XdnaAllocation*>(storage->data_ptr().get_context());
     if (storage->data_ptr().get_deleter() == &XdnaAllocator::deleter &&
         old != nullptr && old->magic == kXdnaAllocationMagic) {
+      // An unread lazy value (XDNA_LAZY_DECODER_VALUES) has no bytes yet:
+      // write it now, through a view with the metadata it was created with.
+      std::shared_ptr<XdnaVirtualValue> value;
+      {
+        std::lock_guard<std::mutex> guard(old->virtual_mutex);
+        value = old->virtual_value;
+      }
+      if (value) {
+        auto impl = c10::make_intrusive<c10::TensorImpl>(
+            c10::Storage(c10::intrusive_ptr<c10::StorageImpl>::reclaim_copy(storage)),
+            c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), value->dtype);
+        impl->set_sizes_and_strides(value->sizes, value->strides);
+        impl->set_storage_offset(value->storage_offset);
+        materialize_virtual(at::Tensor(std::move(impl)), old);
+      }
       wait_pending_host_write(old);
       if (old->coherency == XdnaCoherency::DeviceDirty) {
         TORCH_CHECK(
@@ -1192,15 +1216,35 @@ at::Tensor& set_storage_xdna_(
     c10::SymInt storage_offset,
     c10::SymIntArrayRef size,
     c10::SymIntArrayRef stride) {
+  // Validate before touching the source: CPU's set_ checks the device only
+  // after the growth below would already have altered a foreign storage.
+  TORCH_CHECK(
+      source.device() == self.storage().device(),
+      "Attempted to set the storage of a tensor on device \"",
+      self.storage().device(), "\" to a storage on different device \"",
+      source.device(), "\".  This is no longer allowed; the devices must match.");
   // CPU's set_ grows a too-small storage with its own raw copy, which would
-  // copy a pending (deferred dW) or device-written allocation before it is
-  // finished.  Grow it here through the XDNA path first.
-  // (An empty or malformed size/stride is left to CPU's set_ to handle.)
-  if (size.size() == stride.size() && source.resizable()) {
-    const auto needed = at::detail::computeStorageNbytes(
-        size, stride, c10::SymInt(static_cast<int64_t>(self.element_size())),
-        storage_offset);
-    const auto needed_bytes = static_cast<size_t>(needed.guard_int(__FILE__, __LINE__));
+  // copy a pending (deferred dW), device-written or lazy allocation before it
+  // is finished.  Grow it here through the XDNA path first.  An omitted stride
+  // means contiguous; a malformed one is left to CPU's set_ to reject.
+  const auto size_i = c10::asIntArrayRefSlow(size, __FILE__, __LINE__);
+  std::vector<int64_t> stride_i(stride.size());
+  for (size_t d = 0; d < stride.size(); ++d) {
+    stride_i[d] = stride[d].guard_int(__FILE__, __LINE__);
+  }
+  if (stride.empty()) {
+    stride_i.assign(size_i.size(), 1);
+    for (int64_t d = static_cast<int64_t>(size_i.size()) - 2; d >= 0; --d) {
+      stride_i[d] = stride_i[d + 1] * std::max<int64_t>(size_i[d + 1], 1);
+    }
+  }
+  const bool well_formed = size_i.size() == stride_i.size() &&
+      storage_offset.guard_int(__FILE__, __LINE__) >= 0 &&
+      std::all_of(stride_i.begin(), stride_i.end(), [](int64_t v) { return v >= 0; });
+  if (well_formed && source.resizable()) {
+    const size_t needed_bytes = at::detail::computeStorageNbytes(
+        size_i, stride_i, self.element_size(),
+        storage_offset.guard_int(__FILE__, __LINE__));
     if (source.nbytes() < needed_bytes) {
       resize_xdna_storage(source.unsafeGetStorageImpl(), needed_bytes);
     }

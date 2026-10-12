@@ -105,7 +105,8 @@ for name in ("run_view_safety.py", "run_gemm_safety.py", "run_tensor_semantics.p
              "run_deferred_dw.py", "run_import_scope.py", "run_cpu_islands.py",
              "run_conv3x3w_pack.py", "run_coherency_lifetime.py",
              "run_set_storage_pending.py", "run_lazy_recycle_coherency.py",
-             "run_cpu_island_higher_order.py"):
+             "run_cpu_island_higher_order.py",
+             "run_set_storage_variants.py", "run_gru_dropout_grad.py"):
     ok &= script(name)
 print("QUICK CHECK OK" if ok else "QUICK CHECK FAILED")
 sys.exit(0 if ok else 1)

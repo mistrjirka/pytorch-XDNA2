@@ -24,6 +24,9 @@ class _CpuIsland(torch.autograd.Function):
     @staticmethod
     def forward(ctx, fn, *tensors):
         C = _native()
+        # RNG state for an exact replay of the op (dropout) in a
+        # create_graph backward.
+        ctx.rng = torch.get_rng_state()
         with torch.enable_grad():
             cpu_in = []
             for t in tensors:
@@ -49,7 +52,7 @@ class _CpuIsland(torch.autograd.Function):
         # Reading saved_tensors raises if an input was modified in place.
         saved = ctx.saved_tensors
         if torch.is_grad_enabled():
-            return _differentiable_backward(ctx.fn, saved, grads)
+            return _differentiable_backward(ctx.fn, ctx.rng, saved, grads)
         outs, gs = [], []
         for o, g in zip(ctx.cpu_out, grads):
             if g is not None and o.requires_grad:
@@ -65,12 +68,16 @@ class _CpuIsland(torch.autograd.Function):
         return tuple(out)
 
 
-def _differentiable_backward(fn, inputs, grads):
+def _differentiable_backward(fn, rng, inputs, grads):
     """backward with create_graph=True: the CPU graph above is detached from
     the XDNA tensors, so redo the op on CPU copies made with differentiable
-    .to() calls, then the gradients (and their graph) lead back to XDNA."""
+    .to() calls, then the gradients (and their graph) lead back to XDNA.  The
+    op is replayed with the forward's RNG state (same dropout masks), and the
+    caller's RNG state is left untouched."""
     cpu_in = [t.to("cpu") for t in inputs]
-    outs = fn(*cpu_in)
+    with torch.random.fork_rng(devices=[]):
+        torch.set_rng_state(rng)
+        outs = fn(*cpu_in)
     sel = [(o, g.to("cpu")) for o, g in zip(outs, grads)
            if g is not None and o.requires_grad]
     wanted = [i for i, (t, c) in enumerate(zip(inputs, cpu_in)) if t.requires_grad]
