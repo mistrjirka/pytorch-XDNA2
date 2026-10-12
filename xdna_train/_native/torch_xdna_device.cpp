@@ -461,8 +461,10 @@ void set_virtual_value(
     std::shared_ptr<XdnaVirtualValue> value) {
   auto* allocation = allocation_from_tensor(tensor);
   std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
+  // Keep the coherency state: a recycled buffer may hold CPU-dirty lines, and
+  // if this value is dropped unread the buffer must return to the cache
+  // dirty.  materialize_virtual() marks it HostDirty when it writes.
   allocation->virtual_value = std::move(value);
-  allocation->coherency = XdnaCoherency::Clean;
 }
 
 void clear_virtual_value(XdnaAllocation* allocation) {
@@ -1190,6 +1192,19 @@ at::Tensor& set_storage_xdna_(
     c10::SymInt storage_offset,
     c10::SymIntArrayRef size,
     c10::SymIntArrayRef stride) {
+  // CPU's set_ grows a too-small storage with its own raw copy, which would
+  // copy a pending (deferred dW) or device-written allocation before it is
+  // finished.  Grow it here through the XDNA path first.
+  // (An empty or malformed size/stride is left to CPU's set_ to handle.)
+  if (size.size() == stride.size() && source.resizable()) {
+    const auto needed = at::detail::computeStorageNbytes(
+        size, stride, c10::SymInt(static_cast<int64_t>(self.element_size())),
+        storage_offset);
+    const auto needed_bytes = static_cast<size_t>(needed.guard_int(__FILE__, __LINE__));
+    if (source.nbytes() < needed_bytes) {
+      resize_xdna_storage(source.unsafeGetStorageImpl(), needed_bytes);
+    }
+  }
   return at::native::set_storage_cpu_(
       self,
       std::move(source),

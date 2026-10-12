@@ -39,6 +39,7 @@ class _CpuIsland(torch.autograd.Function):
         # the originals must outlive it even if a saved-tensor hook
         # (save_on_cpu) replaces the saved copies and lets their storage go.
         ctx.keep = tensors
+        ctx.fn = fn
         ctx.cpu_in, ctx.cpu_out = cpu_in, outs
         return tuple(C.from_cpu(o.detach()) for o in outs)
 
@@ -47,6 +48,8 @@ class _CpuIsland(torch.autograd.Function):
         C = _native()
         # Reading saved_tensors raises if an input was modified in place.
         saved = ctx.saved_tensors
+        if torch.is_grad_enabled():
+            return _differentiable_backward(ctx.fn, saved, grads)
         outs, gs = [], []
         for o, g in zip(ctx.cpu_out, grads):
             if g is not None and o.requires_grad:
@@ -60,6 +63,24 @@ class _CpuIsland(torch.autograd.Function):
             r = next(res) if c.requires_grad else None
             out.append(None if r is None else C.from_cpu(r))
         return tuple(out)
+
+
+def _differentiable_backward(fn, inputs, grads):
+    """backward with create_graph=True: the CPU graph above is detached from
+    the XDNA tensors, so redo the op on CPU copies made with differentiable
+    .to() calls, then the gradients (and their graph) lead back to XDNA."""
+    cpu_in = [t.to("cpu") for t in inputs]
+    outs = fn(*cpu_in)
+    sel = [(o, g.to("cpu")) for o, g in zip(outs, grads)
+           if g is not None and o.requires_grad]
+    wanted = [i for i, (t, c) in enumerate(zip(inputs, cpu_in)) if t.requires_grad]
+    res = torch.autograd.grad([o for o, _ in sel], [cpu_in[i] for i in wanted],
+                              [g for _, g in sel], allow_unused=True,
+                              create_graph=True) if sel and wanted else ()
+    out = [None] * (len(inputs) + 1)  # [fn, *inputs]
+    for i, r in zip(wanted, res):
+        out[i + 1] = None if r is None else r.to(inputs[i].device)
+    return tuple(out)
 
 
 def _lstm_input(input, hx, params, has_biases, num_layers, dropout, train,
