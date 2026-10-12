@@ -4436,9 +4436,13 @@ bool zero_copy_cpu_fallback(
   try {
     AdoptHostAllocations adopt;
     op.redispatchBoxed(c10::DispatchKeySet(c10::DispatchKey::CPU), stack);
-  } catch (const c10::Error&) {
+  } catch (const c10::Error& e) {
     stack->resize(base);
     stack->insert(stack->end(), originals.begin(), originals.end());
+    // The copying fallback retries only the out= resize of a non-owning
+    // alias, which fails before the kernel writes anything.  Any other error
+    // is final: retrying would run the op twice (RNG draws, partial writes).
+    if (std::strstr(e.what(), "not resizable") == nullptr) throw;
     return false;
   }
 
