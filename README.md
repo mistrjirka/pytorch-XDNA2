@@ -104,6 +104,25 @@ x = torch.ones(1024, dtype=torch.bfloat16, device="xdna")
 print(x.device, x.cpu()[:4])
 ```
 
+### What `import xdna_train` changes in the process
+
+Importing registers the device (like other out-of-tree PyTorch backends), so
+`torch.device("xdna")` works without further calls. The first import compiles
+the native extension into `~/.cache/torch-xdna2` (later imports reuse it).
+Effects outside XDNA tensors are kept small:
+
+- `Module.to("xdna")`, `.xdna()` and `.to_empty(device="xdna")` keep the
+  module's `Parameter` objects (PyTorch would create new ones for an
+  out-of-tree device, leaving an optimizer built before the move on the old
+  CPU tensors). Other conversions keep PyTorch's default behaviour.
+- Optimizer hooks act only on XDNA parameters: fused kernels by default, a
+  version bump after fused steps (the NPU weight cache relies on it), and the
+  step autotuner, which only times an optimizer that trains XDNA parameters.
+- The CPU allocator is wrapped so CPU fallback ops can write their outputs
+  straight into NPU-visible memory; other CPU allocations pass through
+  unchanged (`XDNA_ADOPT_HOST_OUTPUTS=0` disables the wrapper).
+- Backward runs on the calling thread for the importing thread (see below).
+
 ## What is implemented
 
 The current backend uses PyTorch `PrivateUse1` renamed to `xdna` and provides:
@@ -284,7 +303,8 @@ noise (`benchmarks/bfp16_training_gate.py`).
   device's backward on a separate thread with its own OpenMP pool, which
   fights the forward pool for cores. `register_xdna_device()` disables that
   for the registering thread (`XDNA_AUTOGRAD_THREAD=1` restores it).
-- **Step autotuner.** During the first ~21 optimizer steps the backend times
+- **Step autotuner.** During the first ~21 steps of the first optimizer
+  that trains XDNA parameters, the backend times
   whole training steps with all NPU paths, without NPU weight gradients, and
   CPU only (ABBA order), and keeps the fastest. An NPU mode must win by 3 %.
   `xdna_train.autotune_result()` shows the choice, and
@@ -295,7 +315,9 @@ noise (`benchmarks/bfp16_training_gate.py`).
   disables this).
 - **Fused optimizers.** Adam, AdamW and SGD param groups that left both
   `fused` and `foreach` unset use PyTorch's fused kernel
-  (`XDNA_FUSED_OPTIMIZER=0` disables this).
+  (`XDNA_FUSED_OPTIMIZER=0` disables this). Fused kernels do not bump the
+  parameters' version counters, so a post-step hook does, or NPU convs
+  would keep using cached old weights.
 
 NIS style transfer (MyNet(3,3,5), B40, 36x36, VGG loss, Adam), Ryzen AI 9 365
 on AC, quick-mode ABBA (`benchmarks/nis_style_transfer.py`): CPU BF16 171.4

@@ -167,15 +167,6 @@ def register_xdna_device() -> None:
     if _INITIALIZED:
         return
 
-    # Preserve Parameter object identity when Module.to("xdna") is called.
-    # This matters for ordinary notebooks that construct an optimizer before
-    # moving the model: Adam/SGD retain references to the same Parameter
-    # objects and those objects are swapped to XDNA storage in place.
-    future = getattr(torch, "__future__", None)
-    set_swap = getattr(future, "set_swap_module_params_on_conversion", None)
-    if set_swap is not None:
-        set_swap(True)
-
     _configure_default_allocator_budget()
 
     _load_native()
@@ -376,6 +367,7 @@ def register_xdna_device() -> None:
         for_module=True,
         for_storage=False,
     )
+    _install_scoped_param_swap()
     if os.environ.get("XDNA_CPU_ISLANDS", "1") == "1":
         from . import cpu_islands
 
@@ -390,6 +382,59 @@ def register_xdna_device() -> None:
     if os.environ.get("XDNA_FUSED_OPTIMIZER", "1") == "1":
         register_optimizer_step_pre_hook(_prefer_fused_optimizer)
     _INITIALIZED = True
+
+
+class _SwapModuleParams:
+    """Use torch.utils.swap_tensors while a module moves to XDNA.
+
+    PyTorch keeps Parameter identity in Module.to() only for backends it
+    considers shallow-copy compatible (CPU, CUDA, MPS, HIP, XPU, ...), not for
+    PrivateUse1: model.to("xdna") would create new Parameter objects, and an
+    optimizer built before the move would keep updating the old CPU tensors.
+    Swapping keeps the same objects.  It is enabled only for conversions to
+    XDNA, so other modules keep PyTorch's default behaviour (swapping fails on
+    parameters that have weak references, e.g. after LSTM.load_state_dict).
+    """
+
+    def __enter__(self):
+        self.prev = torch.__future__.get_swap_module_params_on_conversion()
+        torch.__future__.set_swap_module_params_on_conversion(True)
+
+    def __exit__(self, *exc):
+        torch.__future__.set_swap_module_params_on_conversion(self.prev)
+
+
+def _install_scoped_param_swap() -> None:
+    import functools
+
+    module = torch.nn.Module
+    if getattr(module.to, "_xdna_scoped_swap", False):
+        return
+
+    def is_xdna(device) -> bool:
+        return device is not None and torch.device(device).type == "xdna"
+
+    def scoped(fn, targets_xdna):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            if not targets_xdna(*args, **kwargs):
+                return fn(self, *args, **kwargs)
+            with _SwapModuleParams():
+                return fn(self, *args, **kwargs)
+
+        wrapper._xdna_scoped_swap = True
+        return wrapper
+
+    def to_targets(*args, **kwargs):
+        try:
+            device = torch._C._nn._parse_to(*args, **kwargs)[0]
+        except Exception:
+            return False  # let Module.to raise its own error
+        return is_xdna(device)
+
+    module.to = scoped(module.to, to_targets)
+    module.to_empty = scoped(module.to_empty, lambda *, device=None, **k: is_xdna(device))
+    module.xdna = scoped(module.xdna, lambda *a, **k: True)
 
 
 _FUSED_CHECKED: set[int] = set()
@@ -486,6 +531,10 @@ class _StepAutotuner:
         if not self.active:
             return
         if self.optimizer_id is None:
+            # Time the first optimizer that trains XDNA parameters; a CPU
+            # model's optimizer in the same process says nothing about NPU modes.
+            if not any(p.device.type == "xdna" for g in optimizer.param_groups for p in g["params"]):
+                return
             self.optimizer_id = id(optimizer)
         if id(optimizer) != self.optimizer_id:
             return

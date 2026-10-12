@@ -8,7 +8,8 @@ pushing backend changes:
    upsample, skip concat) trained with default Adam on CPU bf16 and on XDNA
    from the same seed must reach the same loss.  This catches anything that
    silently corrupts training, e.g. NPU convs running on stale weights.
-2. The existing fast scripts: view safety, LSTM/GRU islands, conv packing.
+2. The fast scripts: view safety, import side effects, LSTM/GRU islands,
+   conv packing.
 """
 import os
 import subprocess
@@ -100,7 +101,8 @@ def script(name):
 
 
 ok = training_matches_cpu()
-for name in ("run_view_safety.py", "run_cpu_islands.py", "run_conv3x3w_pack.py"):
+for name in ("run_view_safety.py", "run_import_scope.py", "run_cpu_islands.py",
+             "run_conv3x3w_pack.py"):
     ok &= script(name)
 print("QUICK CHECK OK" if ok else "QUICK CHECK FAILED")
 sys.exit(0 if ok else 1)
