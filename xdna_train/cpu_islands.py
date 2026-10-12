@@ -35,14 +35,17 @@ class _CpuIsland(torch.autograd.Function):
         # The CPU views share bytes but not version counters; saving the
         # XDNA originals makes backward fail on in-place changes like CPU does.
         ctx.save_for_backward(*tensors)
+        # The CPU graph reads the XDNA bytes through non-owning aliases, so
+        # the originals must outlive it even if a saved-tensor hook
+        # (save_on_cpu) replaces the saved copies and lets their storage go.
+        ctx.keep = tensors
         ctx.cpu_in, ctx.cpu_out = cpu_in, outs
         return tuple(C.from_cpu(o.detach()) for o in outs)
 
     @staticmethod
     def backward(ctx, *grads):
         C = _native()
-        # Reading saved_tensors raises if an input was modified in place, and
-        # keeps the XDNA storage behind the CPU views alive meanwhile.
+        # Reading saved_tensors raises if an input was modified in place.
         saved = ctx.saved_tensors
         outs, gs = [], []
         for o, g in zip(ctx.cpu_out, grads):

@@ -234,5 +234,177 @@ c, x = run(inplace_ok, "cpu"), run(inplace_ok, "xdna")
 check("in-place ops and disjoint out= keep working",
       c[0] is None and x[0] is None and all(torch.allclose(a, b) for a, b in zip(c[1], x[1])))
 
+# --- save_on_cpu must not free storage a CPU island still reads ---
+def save_on_cpu_reuse():
+    """The island's CPU graph reads x through a non-owning alias, so x's buffer
+    must stay reserved until backward: either it is never handed out again, or
+    (if it were) backward would read the new contents."""
+    import gc
+    import weakref
+    from xdna_train.cpu_islands import _CpuIsland
+    xdna_train.empty_cache()
+    x = torch.ones(1000, device="xdna")
+    w = torch.ones(1000, device="xdna", requires_grad=True)
+    ptr = x.data_ptr()
+    wx = weakref.ref(x)
+    with torch.autograd.graph.save_on_cpu():
+        y = _CpuIsland.apply(lambda a, b: (a * b,), x, w)[0]
+    del x
+    gc.collect()
+    held = []
+    reused = False
+    for _ in range(40):
+        p = torch.full((1000,), 9.0, device="xdna")
+        held.append(p)
+        if p.data_ptr() == ptr:
+            reused = True
+            break
+    if not reused and wx() is None:
+        return "reuse not reproduced"      # freed, yet the test could not see it
+    y.sum().backward()
+    return "ok" if bool((w.grad == 1).all()) else f"grad {w.grad.min()}..{w.grad.max()} instead of 1"
+
+
+r = save_on_cpu_reuse()
+print(f"CpuIsland under save_on_cpu keeps its input alive: {r} {'OK' if r == 'ok' else 'FAIL'}")
+if r != "ok":
+    failures.append("CpuIsland under save_on_cpu keeps its input alive")
+
+
+def rnn_save_on_cpu(cls):
+    out = {}
+    for dev in ("cpu", "xdna"):
+        torch.manual_seed(13)
+        model = cls(4, 5, num_layers=2).to(dev)
+        x = torch.randn(6, 2, 4, device=dev, requires_grad=True)
+        with torch.autograd.graph.save_on_cpu():
+            y = model(x)[0]
+            # churn the allocator so freed buffers get recycled before backward
+            junk = [torch.full((s,), 7.0, device=dev) for s in (24, 48, 60, 120, 240) * 4]
+            y = y * 1.0
+        y.square().sum().backward()
+        del junk
+        out[dev] = (x.grad.cpu(), model.weight_ih_l0.grad.cpu(), model.weight_hh_l1.grad.cpu())
+    return all(torch.allclose(a, b, atol=1e-5) for a, b in zip(*out.values()))
+
+
+for cls in (torch.nn.LSTM, torch.nn.GRU):
+    check(f"{cls.__name__} under save_on_cpu matches CPU gradients", rnn_save_on_cpu(cls))
+
+
+def rnn_no_leak(cls):
+    import gc
+    import weakref
+    model = cls(4, 5).to("xdna")
+    refs = []
+
+    def step():
+        x = torch.randn(3, 2, 4, device="xdna", requires_grad=True)
+        model(x)[0].sum().backward()
+        refs.append(weakref.ref(x))
+
+    for _ in range(3):
+        step()
+    gc.collect()
+    base = xdna_train.allocator_stats()["fresh_allocations"]
+    for _ in range(20):
+        step()
+    gc.collect()
+    grown = xdna_train.allocator_stats()["fresh_allocations"] - base
+    return grown == 0 and all(r() is None for r in refs)
+
+
+for cls in (torch.nn.LSTM, torch.nn.GRU):
+    check(f"{cls.__name__} forward/backward loop does not leak buffers", rnn_no_leak(cls))
+
+
+# --- out= that is also an input must not be resized by broadcast ---
+BROADCAST = "doesn't match the broadcast shape"
+same_error("add(x, y, out=x) with broadcasting x",
+           lambda d: (lambda x, y: torch.add(x, y, out=x))(
+               torch.tensor([2.0], device=d), torch.tensor([1.0, 2.0, 3.0], device=d)), BROADCAST)
+same_error("mul(x, y, out=x) with broadcasting x",
+           lambda d: (lambda x, y: torch.mul(x, y, out=x))(
+               torch.tensor([2.0], device=d), torch.tensor([1.0, 2.0, 3.0], device=d)), BROADCAST)
+same_error("add(y, x, out=x) with broadcasting x",
+           lambda d: (lambda x, y: torch.add(y, x, out=x))(
+               torch.tensor([2.0], device=d), torch.tensor([1.0, 2.0, 3.0], device=d)), BROADCAST)
+same_error("addcmul(x, y, y, out=x) with broadcasting x",
+           lambda d: (lambda x, y: torch.addcmul(x, y, y, out=x))(
+               torch.tensor([2.0], device=d), torch.tensor([1.0, 2.0, 3.0], device=d)), BROADCAST)
+same_error("lerp(x, y, 0.5, out=x) with broadcasting x",
+           lambda d: (lambda x, y: torch.lerp(x, y, 0.5, out=x))(
+               torch.tensor([2.0], device=d), torch.tensor([1.0, 2.0, 3.0], device=d)), BROADCAST)
+
+
+def failed_inplace_leaves_input(dev):
+    x = torch.tensor([2.0], device=dev)
+    y = torch.tensor([1.0, 2.0, 3.0], device=dev)
+    try:
+        torch.add(x, y, out=x)
+    except RuntimeError:
+        pass
+    return x.shape, x.cpu()
+
+
+same_result("rejected add(out=x) leaves x untouched", failed_inplace_leaves_input)
+
+
+def broadcast_into_other_out(dev):
+    x = torch.tensor([2.0], device=dev)
+    y = torch.tensor([1.0, 2.0, 3.0], device=dev)
+    z = torch.zeros(1, device=dev)
+    torch.add(x, y, out=z)                       # separate out still resizes
+    return z.shape, z.cpu(), x.cpu()
+
+
+same_result("add(x, y, out=z) still resizes a separate out", broadcast_into_other_out)
+
+
+# --- addmm.out / bmm.out resize out like CPU ---
+def addmm_out_shape(dev):
+    a = torch.ones(2, 2, device=dev)
+    o = torch.zeros(4, device=dev)
+    torch.addmm(a, a, a, out=o)
+    return o.shape, o.cpu()
+
+
+def bmm_out_shape(dev):
+    a = torch.arange(4.0, device=dev).view(1, 2, 2)
+    o = torch.zeros(4, device=dev)
+    torch.bmm(a, a, out=o)
+    return o.shape, o.cpu()
+
+
+def addmm_out_empty(dev):
+    o = torch.empty(0, device=dev)
+    torch.addmm(torch.ones(2, 3, device=dev), torch.ones(2, 2, device=dev),
+                torch.ones(2, 3, device=dev), beta=2, alpha=3, out=o)
+    return o.shape, o.cpu()
+
+
+def bmm_out_bigger(dev):
+    a = torch.ones(2, 3, 4, device=dev)
+    o = torch.zeros(100, device=dev)
+    torch.bmm(a, a.transpose(1, 2), out=o)
+    return o.shape, o.cpu()
+
+
+same_result("addmm(out=) resizes out to the result shape", addmm_out_shape)
+same_result("addmm(out=) with empty out", addmm_out_empty)
+same_result("bmm(out=) resizes out to the result shape", bmm_out_shape)
+same_result("bmm(out=) resizes a larger out", bmm_out_bigger)
+same_error("addmm(self, ..., out=self-view) partial overlap",
+           lambda d: (lambda w: torch.addmm(w[:4].view(2, 2), torch.ones(2, 2, device=d),
+                                            torch.ones(2, 2, device=d), out=w[2:6].view(2, 2)))(
+               torch.arange(8.0, device=d)), OVERLAP)
+same_error("bmm shape mismatch",
+           lambda d: torch.bmm(torch.ones(1, 2, 3, device=d), torch.ones(1, 2, 3, device=d),
+                               out=torch.zeros(4, device=d)))
+same_error("addmm shape mismatch",
+           lambda d: torch.addmm(torch.ones(2, 2, device=d), torch.ones(2, 3, device=d),
+                                 torch.ones(2, 2, device=d), out=torch.zeros(4, device=d)))
+
+
 print("ALL OK" if not failures else f"FAILED: {failures}")
 raise SystemExit(1 if failures else 0)

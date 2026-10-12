@@ -3860,6 +3860,14 @@ void prepare_out_xdna(
     }
   }
   if (!out.sizes().equals(shape)) {
+    // CPU's TensorIterator treats an out that is itself an input (in-place) as
+    // read-write and refuses to resize it, which would also change the input.
+    for (const at::Tensor* t : inputs) {
+      TORCH_CHECK(
+          !out.is_same(*t),
+          "output with shape ", out.sizes(),
+          " doesn't match the broadcast shape ", c10::IntArrayRef(shape));
+    }
     at::native::resize_output(out, shape);
   }
   at::assert_no_internal_overlap(out);
@@ -4029,6 +4037,15 @@ at::Tensor& addmm_out_xdna(
     const at::Scalar& alpha,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::addmm.out");
+  TORCH_CHECK(
+      mat1.dim() == 2 && mat2.dim() == 2,
+      "addmm: expected 2D matrices, got ", mat1.dim(), "D and ", mat2.dim(), "D");
+  if (mat1.size(1) == mat2.size(0)) {
+    // Resize like CPU's meta function; a shape mismatch is left to the CPU
+    // kernel below, which reports it.
+    at::native::resize_output(out, {mat1.size(0), mat2.size(1)});
+  }
+  at::assert_no_partial_overlap(out, self);  // CPU checks only the bias operand
   ensure_host_current(self);
   ensure_host_current(mat1);
   ensure_host_current(mat2);
@@ -4047,6 +4064,13 @@ at::Tensor& bmm_out_xdna(
     const at::Tensor& mat2,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::bmm.out");
+  TORCH_CHECK(
+      self.dim() == 3 && mat2.dim() == 3,
+      "batch1 and batch2 must be 3D tensors, got ", self.dim(), "D and ",
+      mat2.dim(), "D");
+  if (self.size(0) == mat2.size(0) && self.size(2) == mat2.size(1)) {
+    at::native::resize_output(out, {self.size(0), self.size(1), mat2.size(2)});
+  }
   ensure_host_current(self);
   ensure_host_current(mat2);
   auto self_cpu = cpu_alias(self);
