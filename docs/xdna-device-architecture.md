@@ -97,8 +97,8 @@ Conceptually:
 The DataPtr context owns the allocation and releases it to a caching allocator
 when the final PyTorch tensor/view disappears.
 
-For steady-state training, prefer large persistent BO arenas and XRT native
-sub-buffers over one BO allocation per logical tensor.
+For steady-state training, reuse BOs through the size-bin cache (`XDNA_BO_CACHE_MB`).
+A single large XRT sub-buffer arena was measured slower (see the rejected experiment below).
 
 ### Coherency
 

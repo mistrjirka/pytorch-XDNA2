@@ -143,7 +143,7 @@ The current backend uses PyTorch `PrivateUse1` renamed to `xdna` and provides:
 - batch-4 CPU `dW` reduction split into batch-1 oneDNN calls by default, reducing shared LPDDR/fabric pressure during NPU `dX` overlap;
 - full-frame batch-4 decoder/residual programs for the current Strix training path.
 
-The bundled full-frame family is enabled automatically. The current Strix package also enables validated resident-weight / queue-pipelined fast paths for the large decoder dX family and conv11 dX when their bundled artifacts are present. Disable them independently for A/B debugging with:
+The bundled full-frame family is enabled automatically. The current Strix package also enables validated resident-weight / queue-pipelined fast paths for the large decoder dX family and conv11 dX when their bundled artifacts are present. Disable them independently for A/B debugging (about +7 % step time each on the B4 584x564 workload) with:
 
 ```bash
 XDNA_ENABLE_FAST_FULLFRAME=0 python ...
@@ -162,6 +162,25 @@ For batch-4 heterogeneous Conv backward, the CPU weight-gradient reduction is sp
 XDNA_CPU_DW_BATCH_CHUNK=0 python ...   # disable
 XDNA_CPU_DW_BATCH_CHUNK=2 python ...   # alternate chunk size
 ```
+
+## Environment variables
+
+Nothing needs to be set for normal use. Every variable, its default and the evidence for
+it is listed in [docs/MODES_AUDIT.md](docs/MODES_AUDIT.md); the ones worth knowing:
+
+| Purpose | Variables |
+|---|---|
+| Choose NPU paths | `XDNA_NPU_MODE=0\|1\|2` (fixes the mode, disables the tuner), `XDNA_AUTOTUNE=0` (no step tuning), `XDNA_AUTOTUNE_VERBOSE=1` (print the choice), `XDNA_AUTOTUNE_{WARMUP,STEPS,ROUNDS,TOLERANCE}` |
+| Kill switches (A/B runs) | `XDNA_CONV3X3W=0`, `XDNA_CONV3X3W_DW=0`, `XDNA_ENABLE_FAST_FULLFRAME=0`, `XDNA_ENABLE_FAST_CONV11=0`, `XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_CONV=0`, `XDNA_DISABLE_CPU_DW_OVERLAP=1`, `XDNA_CPU_DW_BATCH_CHUNK=0`, `XDNA_CPU_ISLANDS=0`, `XDNA_FUSED_OPTIMIZER=0`, `XDNA_ZERO_COPY_FALLBACK=0`, `XDNA_ADOPT_HOST_OUTPUTS=0` |
+| Keep PyTorch behaviour | `XDNA_AUTOGRAD_THREAD=1` (keep PyTorch's separate autograd device thread) |
+| conv3x3w build and tuning | `XDNA_IRON_PYTHON` (mlir-aie Python; empty disables on-demand builds), `XDNA_CONV3X3W_SYNC_BUILD=1` (build before the first call), `XDNA_CONV3X3W_{MIN_MACS,DW_MIN_MACS}` (size floors), `XDNA_CONV3X3W_FORCE=1` (bypass the cost model), `XDNA_CONV3X3W_PIECES` (pipelined piece count), `XDNA_CONV3X3W_WEIGHT_CACHE=0`, cost-model constants `XDNA_CONV3X3W_{NPU_OVERHEAD_MS,NPU_GMACS,HOST_GBS,CPU_GMACS,MARGIN}` |
+| Artifact overrides (use another build) | `XDNA_CONV3X3W_DIR`, `XDNA_CONV3X3W_DW_DIR` (xclbin + streams), `XDNA_FULLFRAME_ARTIFACT_DIR`, `XDNA_FAST_FULLFRAME_ARTIFACT_DIR`, `XDNA_FAST_CONV11_ARTIFACT_DIR` |
+| Host resources | `XDNA_BO_CACHE_MB` (freed-BO cache size), `XDNA_HOST_THREADS` (intra-op width), `XDNA_CONV_PACK_THREADS` (full-frame pack/unpack width), `XDNA_CPU_DW_BATCH_CHUNK` (batch-split CPU dW, default 1 for B4) |
+| Diagnostics | `XDNA_CONV3X3W_TRACE=1` (per-conv trace), `XDNA_PROFILE_MAPPED_CPU=1` (`xdna_train.mapped_cpu_stats()`), `XDNA_PROFILE_FALLBACK=1` (per-op CPU-fallback counters) |
+| Build and tests | `TORCH_XDNA2_CACHE` (native build cache), `TORCH_XDNA2_BUILD_VERBOSE=1`, `XRT_INCLUDE_DIR`, `XRT_LIB_DIR`, `XDNA_TRAIN_PHYSICAL=1` (enable the pytest hardware tests) |
+
+Variables that were removed (experiments that were slower or dead code) are no
+longer read; `docs/MODES_AUDIT.md` lists each one with the measurement behind the removal.
 
 ## Current measured checkpoint
 
@@ -211,7 +230,7 @@ See:
 
 ## Conv output layout
 
-NPU convolutions return contiguous NCHW tensors. An earlier fixed-shape family
+NPU convolutions return contiguous NCHW tensors. A fixed-shape family (since removed)
 returned the kernel's native `[Y,X,B,C]` layout as a strided view; **CPU BatchNorm
 forward/backward was substantially slower** on those strides (zero-copy does not imply
 cheap CPU execution), and one producer-side conversion to NCHW took the real NIS
@@ -248,7 +267,9 @@ noise (`benchmarks/bfp16_training_gate.py`).
   (includes the weight cache under every optimizer, fused ones too),
   `tests/run_conv3x3w_hw.py`, `tests/run_conv3x3w_dw_hw.py`,
   `tests/run_view_safety.py` (out-of-bounds `as_strided`, overlapping
-  `copy_`, `unfold` as a view).
+  `copy_`, `unfold` as a view), `tests/run_deferred_dw.py` (deferred NPU dW
+  does not read X / dY after backward), `tests/run_conv_output_layout.py`
+  (contiguous NCHW output feeds CPU BatchNorm), `tests/run_conv3x3w_costmodel.py`.
 
 ### Never slower than the CPU: what the backend does for every model
 

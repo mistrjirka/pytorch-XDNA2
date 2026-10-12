@@ -156,3 +156,16 @@ conv1d_audio 1.18, conv_autoencoder 1.20, embedding 1.78, nis_mynet 1.72. First 
 to CPU. Last losses can drift slightly because the fused optimizer rounds differently in bf16 (NIS proxy after 34
 steps: 0.5195 CPU vs 0.5625 XDNA, within the zoo's 10 % check). The real NIS script: 122.5-123.2 ms/step
 vs CPU BF16 184 ms.
+
+## 2026-10-12: modes cleanup (removals)
+
+Removed after the audit in `docs/MODES_AUDIT.md`; the rows above keep their history.
+Each removal is its own commit on the pruning branch (`9e1a5de..HEAD`):
+
+- Fixed-shape patch conv family (`XDNA_ENABLE_PATCH_CONV`, `XDNA_PATCH_CONV_ARTIFACT_DIR`, `XDNA_CONV_OUTPUT_NCHW`); the `conv3x3_patch40_128` artifacts.
+- Full-frame NPU dW experiment (`XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_DW`, `XDNA_FULLFRAME_DW_ARTIFACT_DIR`); no artifact existed.
+- Deferred CPU dW worker queue (`XDNA_DEFER_CPU_DW`, `XDNA_DEFER_CPU_DW_WINDOW`, `XDNA_HOLD_CPU_DW`) and `AsyncHostWorkQueue`.
+- BO sub-buffer arena and tensor BO flag (`XDNA_BO_ARENA_MB`, `XDNA_TENSOR_BO_FLAG`).
+- Lazy decoder values (`XDNA_LAZY_DECODER_VALUES`, `XDNA_LAZY_DECODER_DW`), virtual values, fused cat2+upsample2 forward; their two tests.
+- Shadowed legacy full-frame streams (res146 / dX292 / dX584 of the legacy family), `configure_fast_dx584` and the `XDNA_ENABLE_FAST_DX584` / `XDNA_FAST_DX584_ARTIFACT_DIR` aliases; the `XDNA_FULLFRAME_TM` environment channel (tile M is now passed as an argument).
+- Unused C pack entry points in `conv_pack.cpp`.
