@@ -272,6 +272,10 @@ struct XdnaAllocation {
   void* mapped = nullptr;
   size_t bytes = 0;
   XdnaCoherency coherency = XdnaCoherency::Clean;
+  // Bumped by every write (mark_host_dirty / mark_device_dirty / a deferred
+  // gradient).  Unlike the autograd version counter it also sees writes made
+  // through .data, which has its own counter.
+  std::atomic<uint64_t> write_epoch{0};
 
   // Host work may fill this mapped BO after the producing ATen op returns.
   // Consumers fence on this future only when the storage is actually read.
@@ -279,10 +283,10 @@ struct XdnaAllocation {
   std::shared_future<void> pending_host_write;
 
   // conv3x3w: this tensor packed for the NPU, kept for its deferred dW
-  // (Conv3x3wPacked).  The tag identifies the packed view and version.
+  // (Conv3x3wPacked).  The tag identifies the packed view, version and epoch.
   std::mutex packed_mutex;
   std::shared_ptr<void> packed;
-  std::array<int64_t, 11> packed_tag{};
+  std::array<int64_t, 12> packed_tag{};
 };
 
 ShimDevice* xdna_device() {
@@ -347,6 +351,7 @@ void set_pending_host_write(
   // The producer is a host writer.  A host consumer needs only the completion
   // fence; a device consumer additionally performs the normal sync-to-device.
   allocation->coherency = XdnaCoherency::HostDirty;
+  ++allocation->write_epoch;
 }
 
 void ensure_host_current(const at::Tensor& tensor) {
@@ -390,6 +395,7 @@ void mark_host_dirty(const at::Tensor& tensor) {
   if (tensor.defined() && tensor.device().type() == kXdnaType) {
     auto* allocation = allocation_from_tensor(tensor);
     allocation->coherency = XdnaCoherency::HostDirty;
+    ++allocation->write_epoch;
   }
 }
 
@@ -397,6 +403,32 @@ void mark_device_dirty(const at::Tensor& tensor) {
   if (tensor.defined() && tensor.device().type() == kXdnaType) {
     auto* allocation = allocation_from_tensor(tensor);
     allocation->coherency = XdnaCoherency::DeviceDirty;
+    ++allocation->write_epoch;
+  }
+}
+
+uint64_t write_epoch_of(const at::Tensor& tensor) {
+  return allocation_from_tensor(tensor)->write_epoch.load();
+}
+
+// Frees the deferred host write of an allocation being released.  A job that
+// has not started is dropped: nothing else holds it, and running it would
+// only compute a gradient nobody reads.  A started job must finish before the
+// BO is reused; its error cannot leave a destructor, so it is reported here.
+void release_pending_host_write(XdnaAllocation* allocation) {
+  std::shared_future<void> pending;
+  {
+    std::lock_guard<std::mutex> guard(allocation->pending_mutex);
+    pending = std::move(allocation->pending_host_write);
+  }
+  if (!pending.valid() ||
+      pending.wait_for(std::chrono::seconds(0)) == std::future_status::deferred) {
+    return;
+  }
+  try {
+    pending.get();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "XDNA: deferred host write failed: %s\n", e.what());
   }
 }
 
@@ -407,7 +439,7 @@ struct XdnaAllocator final : c10::Allocator {
       return;
     }
     if (allocation->bo != nullptr) {
-      wait_pending_host_write(allocation);
+      release_pending_host_write(allocation);
       bo_cache().release(CachedBo{
           allocation->bo,
           allocation->mapped,
@@ -951,6 +983,9 @@ at::Tensor cpu_alias(const at::Tensor& t) {
 void host_storage_copy(
     const at::Tensor& src,
     const at::Tensor& dst) {
+  // dst is written: a pending host write (a deferred gradient) must finish
+  // first, or it would overwrite this copy when it runs.
+  ensure_host_current(dst);
   ensure_host_current(src);
   TORCH_CHECK(
       src.sizes().equals(dst.sizes()),
@@ -1443,9 +1478,10 @@ void pack_conv3x3w_input(Conv3x3wPacked& buf, const at::Tensor& x_cpu, int64_t c
               "failed to sync conv3x3w input: ", shim_last_error());
 }
 
-std::array<int64_t, 11> packed_tag_of(const at::Tensor& t, int64_t chunks) {
+std::array<int64_t, 12> packed_tag_of(const at::Tensor& t, int64_t chunks) {
   return {reinterpret_cast<int64_t>(t.const_data_ptr()),
           static_cast<int64_t>(t.unsafeGetTensorImpl()->version_counter().current_version()),
+          static_cast<int64_t>(write_epoch_of(t)),
           t.size(0), t.size(1), t.size(2), t.size(3),
           t.stride(0), t.stride(1), t.stride(2), t.stride(3), chunks};
 }
@@ -1483,11 +1519,13 @@ struct Conv3x3wWeightSlot {
   ShimBo* bo = nullptr;
   void* ptr = nullptr;
   bool valid = false;
-  // Tag: storage pointer + TensorImpl version counter identify the contents;
-  // the storage is pinned while tagged so its address cannot be reused.
+  // Tag: storage pointer, TensorImpl version counter and write epoch identify
+  // the contents; the storage is pinned while tagged so its address cannot be
+  // reused.
   at::Storage pin;
   const void* data = nullptr;
   uint32_t version = 0;
+  uint64_t epoch = 0;
   std::array<int64_t, 8> geom{};  // sizes, strides
   bool dx = false;
   int64_t nb = 0;
@@ -1693,11 +1731,12 @@ struct XdnaConv3x3wRuntime {
     const uint32_t version = cache
         ? static_cast<uint32_t>(weight.unsafeGetTensorImpl()->version_counter().current_version())
         : 0;
+    const uint64_t epoch = cache ? write_epoch_of(weight) : 0;
     Conv3x3wWeightSlot* slot = nullptr;
     hit = false;
     if (cache) {
       for (auto& c : s.wslots) {
-        if (c.valid && c.data == data && c.version == version && c.dx == dx &&
+        if (c.valid && c.data == data && c.version == version && c.epoch == epoch && c.dx == dx &&
             c.nb == nb && c.geom == geom) {
           slot = &c;
           hit = true;
@@ -1734,6 +1773,7 @@ struct XdnaConv3x3wRuntime {
         slot->pin = weight.storage();
         slot->data = data;
         slot->version = version;
+        slot->epoch = epoch;
         slot->geom = geom;
         slot->dx = dx;
         slot->nb = nb;
