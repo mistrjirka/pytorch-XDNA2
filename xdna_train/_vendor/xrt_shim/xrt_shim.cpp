@@ -121,13 +121,19 @@ double shim_dispatch_max_wait_ms(void) { return g_max_wait_ms.load(std::memory_o
 // A timeout that cannot say WHICH dispatch wedged is only marginally better than a hang.
 // `run.state()` is itself a device call and can throw once the command is in a bad state, so it is
 // only ever read defensively -- a diagnostic that takes the process down is not a diagnostic.
-static std::string state_or(const xrt::run& run, const char* fallback) {
-  try { return ert_state_name(run.state()); } catch (...) { return fallback; }
+static bool read_state(const xrt::run& run, ert_cmd_state& out) {
+  try { out = run.state(); return true; } catch (...) { return false; }
+}
+
+// Over for good: completed, failed, aborted or timed out by the scheduler.  SUBMITTED (7) sorts
+// above COMPLETED (4) in ert.h but is an internal in-flight state, so it is not terminal.
+static bool ert_state_terminal(ert_cmd_state st) {
+  return st >= ERT_CMD_STATE_COMPLETED && st != ERT_CMD_STATE_SUBMITTED;
 }
 
 // A wait that gave up leaves the command running; XRT makes aborting it the caller's job.  If
-// the abort works the command is over and its run and buffers may be released as usual.  If it
-// does not, the command may still touch its buffers, so nothing it uses may ever be released:
+// the command is terminal afterwards it is over and its run and buffers may be released as usual.
+// If it is not, the command may still touch its buffers, so nothing it uses may ever be released:
 // the run is kept alive here forever, every later release (shim_bo_free, shim_run_free, ...) leaks
 // instead, and every later dispatch is refused.
 static std::atomic<bool> g_poisoned{false};
@@ -147,16 +153,22 @@ static void check_dispatch_allowed() {
 int shim_dispatch_poisoned(void) { return g_poisoned.load() ? 1 : 0; }
 
 // Returns true when the command is certainly over.
+// NOTE: on this stack run.abort() is unbounded.  It submits ERT_ABORT and then waits with no
+// limit, but the amdxdna driver rejects ERT_ABORT as "Unsupported op", so the abort does not stop
+// a running command.  The call returns only once the driver's TDR (default 2000 ms) ends the
+// command, so the effective bound on this path is that TDR, not NPU_DISPATCH_TIMEOUT_MS.
 static bool abort_stuck_run(xrt::run& run) {
   try {
     run.abort();
-    return true;
   } catch (...) {
-    g_poisoned.store(true);
-    static auto* kept = new std::vector<xrt::run*>();  // never destroyed, by design
-    kept->push_back(new xrt::run(run));
-    return false;
+    // The state check below decides; an abort that threw may still have ended the command.
   }
+  ert_cmd_state st{};
+  if (read_state(run, st) && ert_state_terminal(st)) return true;
+  g_poisoned.store(true);
+  static auto* kept = new std::vector<xrt::run*>();  // never destroyed, by design
+  kept->push_back(new xrt::run(run));
+  return false;
 }
 
 static void wait_deadline(xrt::run& run, const std::string& what) {
@@ -196,14 +208,21 @@ static void wait_deadline(xrt::run& run, const std::string& what) {
     //
     // NOTE the command is still IN FLIGHT on the deadline path: XRT documents that after a
     // timeout it is the caller's responsibility to abort it.  We abort it (synchronously); if
-    // that fails the process is poisoned (see g_poisoned) and unusable for further dispatches.
+    // the command is not terminal afterwards the process is poisoned (see g_poisoned) and
+    // unusable for further dispatches.  A command that already finished is neither aborted nor
+    // poisoned.
     const long waited = static_cast<long>(ms_since(t0));
+    ert_cmd_state st{};
+    const bool readable = read_state(run, st);
+    const bool in_flight = !readable || !ert_state_terminal(st);
     std::string where = "dispatch '" + what + "' (command state "
-                      + state_or(run, "UNREADABLE") + ", waited "
+                      + (readable ? ert_state_name(st) : "UNREADABLE") + ", waited "
                       + std::to_string(waited) + " ms): " + e.what();
-    where += abort_stuck_run(run)
-                 ? " [command aborted]"
-                 : " [abort failed: buffers leaked, further NPU dispatches refused]";
+    if (in_flight) {
+      where += abort_stuck_run(run)
+                   ? " [command ended after abort request]"
+                   : " [abort failed: buffers leaked, further NPU dispatches refused]";
+    }
     if (waited + 1 >= ms) {
       throw std::runtime_error(
           "deadline: " + where + " -- NPU_DISPATCH_TIMEOUT_MS changes it, 0 disables it");
