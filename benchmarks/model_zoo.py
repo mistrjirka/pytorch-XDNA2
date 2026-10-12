@@ -231,11 +231,27 @@ def _run_worker(name, device, args) -> dict:
     return {"error": err[:300]}
 
 
+def _combine(results: list[dict]) -> dict:
+    ok = [r for r in results if "error" not in r]
+    if not ok:
+        return results[0]
+    out = dict(ok[0])
+    out["median_ms"] = statistics.median(r["median_ms"] for r in ok)
+    out["round_ms"] = [r["median_ms"] for r in ok]
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", default=",".join(MODELS))
     ap.add_argument("--steps", type=int, default=10)
-    ap.add_argument("--warmup", type=int, default=3)
+    # 24 warmup steps on both devices: the XDNA step autotuner (device.py) needs
+    # ~21 steps to pick its NPU mode, like cudnn.benchmark.
+    ap.add_argument("--warmup", type=int, default=24)
+    # rounds > 1: CPU and XDNA alternate in ABBA order (cpu xdna xdna cpu ...)
+    # so heat / background drift does not favour one device; per device the
+    # median of the per-round medians is reported.
+    ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--threads", type=int, default=torch.get_num_threads())
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--json", default="")
@@ -250,8 +266,11 @@ def main() -> None:
     rows = []
     print(f"{'model':18s} {'cpu ms':>9s} {'xdna ms':>9s} {'speedup':>8s}  {'loss cpu→xdna (first / last)':34s} status")
     for name in args.models.split(","):
-        cpu = _run_worker(name, "cpu", args)
-        npu = _run_worker(name, "xdna", args)
+        runs = {"cpu": [], "xdna": []}
+        for r in range(args.rounds):
+            for dev in (("cpu", "xdna") if r % 2 == 0 else ("xdna", "cpu")):
+                runs[dev].append(_run_worker(name, dev, args))
+        cpu, npu = (_combine(runs[d]) for d in ("cpu", "xdna"))
         row = {"model": name, "cpu": cpu, "xdna": npu}
         if "error" in cpu or "error" in npu:
             status = "ERROR: " + (npu.get("error") or cpu.get("error"))

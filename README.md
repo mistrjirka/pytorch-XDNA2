@@ -272,6 +272,25 @@ noise (`benchmarks/bfp16_training_gate.py`).
 - Tests: `tests/run_conv3x3w_pack.py`, `tests/run_conv3x3w_torch.py`,
   `tests/run_conv3x3w_hw.py`, `tests/run_conv3x3w_dw_hw.py`.
 
+### Never slower than the CPU: what the backend does for every model
+
+- **Backward on the calling thread.** PyTorch normally runs a non-CPU
+  device's backward on a separate thread with its own OpenMP pool, which
+  fights the forward pool for cores. `register_xdna_device()` disables that
+  for the registering thread (`XDNA_AUTOGRAD_THREAD=1` restores it).
+- **Step autotuner.** During the first ~21 optimizer steps the backend times
+  whole training steps with all NPU paths, without NPU weight gradients, and
+  CPU only (ABBA order), and keeps the fastest. An NPU mode must win by 3 %.
+  `xdna_train.autotune_result()` shows the choice, and
+  `XDNA_AUTOTUNE_VERBOSE=1` prints it. `XDNA_NPU_MODE=0|1|2` fixes the mode,
+  and `XDNA_AUTOTUNE=0` keeps all NPU paths without measuring.
+- **CPU islands.** `nn.LSTM` and `nn.GRU` run as PyTorch's fused oneDNN CPU
+  kernels on zero-copy views of the XDNA tensors (`XDNA_CPU_ISLANDS=0`
+  disables this).
+- **Fused optimizers.** Adam, AdamW and SGD param groups that left both
+  `fused` and `foreach` unset use PyTorch's fused kernel
+  (`XDNA_FUSED_OPTIMIZER=0` disables this).
+
 NIS style transfer (MyNet(3,3,5), B40, 36x36, VGG loss, Adam), Ryzen AI 9 365
 on AC, quick-mode ABBA (`benchmarks/nis_style_transfer.py`): CPU BF16 171.4
 ms/step, XDNA 147.7 ms/step (1.16x); without NPU dW 167.7 ms/step.

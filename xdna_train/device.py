@@ -189,6 +189,15 @@ def register_xdna_device() -> None:
             "XDNA cannot coexist with another PrivateUse1 backend in one process."
         )
 
+    # Autograd runs a non-CPU device's backward on its own worker thread, which
+    # gets its own OpenMP pool; the forward pool's spinning threads then compete
+    # with it (MLP train step 8.0 -> 3.8 ms, autograd hand-off ~90 us per
+    # backward).  Run backward on the calling thread, as for CPU tensors.  The
+    # setting is thread-local: it applies to the thread that registers the
+    # device.  XDNA_AUTOGRAD_THREAD=1 keeps PyTorch's device thread.
+    if os.environ.get("XDNA_AUTOGRAD_THREAD", "0") != "1":
+        torch.autograd.set_multithreading_enabled(False)
+
     gemm = _ROOT / "_artifacts" / "train_gemm_64x32x96"
     if gemm.is_dir():
         _C.configure_gemm_family(
@@ -367,7 +376,180 @@ def register_xdna_device() -> None:
         for_module=True,
         for_storage=False,
     )
+    if os.environ.get("XDNA_CPU_ISLANDS", "1") == "1":
+        from . import cpu_islands
+
+        cpu_islands.install()
+    _start_npu_mode_selection()
+    if os.environ.get("XDNA_FUSED_OPTIMIZER", "1") == "1":
+        from torch.optim.optimizer import register_optimizer_step_pre_hook
+
+        register_optimizer_step_pre_hook(_prefer_fused_optimizer)
     _INITIALIZED = True
+
+
+_FUSED_CHECKED: set[int] = set()
+
+
+def _prefer_fused_optimizer(optimizer, args, kwargs) -> None:
+    """Default XDNA optimizers to PyTorch's fused CPU kernels.
+
+    PyTorch picks the `foreach` implementation by default for a PrivateUse1
+    device, i.e. ~10 list ops per step that each run as a CPU fallback; the
+    fused kernel (one pass per parameter, numerically the same update) is
+    supported on XDNA storage through the CPU fallback (model zoo MLP
+    4.4 -> 3.6 ms per step).  Only param groups that left both `fused` and
+    `foreach` unset, contain only XDNA parameters and have no optimizer state
+    yet are changed, so it happens before the first step or not at all.
+    XDNA_FUSED_OPTIMIZER=0 disables it.
+    """
+    if id(optimizer) in _FUSED_CHECKED:
+        return
+    _FUSED_CHECKED.add(id(optimizer))
+    for group in optimizer.param_groups:
+        if (
+            "fused" not in group
+            or group.get("fused") is not None
+            or group.get("foreach") is not None
+            or group.get("differentiable")
+        ):
+            continue
+        params = group["params"]
+        if params and all(
+            p.device.type == "xdna" and p.is_floating_point() and not optimizer.state.get(p)
+            for p in params
+        ):
+            group["fused"] = True
+
+
+# --------------------------------------------------------------------------
+# Step autotuner: which NPU paths pay off for this model.
+# --------------------------------------------------------------------------
+
+NPU_MODES = {2: "all NPU paths", 1: "NPU without weight gradients", 0: "CPU only"}
+
+
+class _StepAutotuner:
+    """Times real training steps under each NPU mode and keeps the fastest.
+
+    The per-op cost models decide shape by shape, but they cannot see costs
+    that are paid once per step: NPU weight gradients run from a second
+    xclbin, so a step that uses both pays two ~2.6 ms context switches, and a
+    model with only a few NPU-friendly convolutions (UNet in the model zoo:
+    67 ms with NPU convs, 50 ms without, 56 ms on CPU) loses overall.  Like
+    cudnn.benchmark, this measures instead: steps are the intervals between
+    calls of the first optimizer's step().  After `warmup` steps (and once
+    pending kernel builds are done) the modes run in blocks of one transition
+    step plus `steps` timed steps, in ABBA order (2 1 0 0 1 2, `rounds` times)
+    so that drift (heat, background load) does not favour one mode; an NPU mode
+    must beat CPU-only by `tolerance`.
+    """
+
+    def __init__(self, warmup: int, steps: int, rounds: int, tolerance: float) -> None:
+        self.warmup, self.steps, self.tolerance = warmup, steps, tolerance
+        self.optimizer_id = None
+        self.last = None
+        self.seen = 0
+        self.order = [2, 1, 0, 0, 1, 2] * rounds
+        self.phase = 0          # index into order while measuring
+        self.skip = 1           # transition steps left in this block
+        self.timed = 0          # timed steps in this block
+        self.samples: dict[int, list[float]] = {m: [] for m in (2, 1, 0)}
+        self.result: dict | None = None
+        self.handle = None
+
+    def __call__(self, optimizer, args, kwargs) -> None:
+        import time
+
+        if self.optimizer_id is None:
+            self.optimizer_id = id(optimizer)
+        if id(optimizer) != self.optimizer_id:
+            return
+        now = time.perf_counter()
+        last, self.last = self.last, now
+        self.seen += 1
+        if last is None:
+            return
+        if self.seen <= self.warmup or (
+            _C.iron_builds_pending() > 0 and self.seen <= 20 * self.warmup
+        ):
+            return
+        if self.skip > 0:
+            self.skip -= 1
+            return
+        self.samples[self.order[self.phase]].append((now - last) * 1e3)
+        self.timed += 1
+        if self.timed < self.steps:
+            return
+        self.phase += 1
+        self.timed = 0
+        if self.phase < len(self.order):
+            _C.set_npu_mode(self.order[self.phase])
+            self.skip = 1
+            return
+        self._decide()
+
+    def _decide(self) -> None:
+        import statistics
+
+        med = {m: statistics.median(v) for m, v in self.samples.items()}
+        best = min((1, 2), key=lambda m: med[m])
+        if med[best] > med[0] * (1.0 - self.tolerance):
+            best = 0
+        _C.set_npu_mode(best)
+        self.result = {"mode": best, "step_ms": med, "samples": self.samples}
+        if self.handle is not None:
+            self.handle.remove()
+            self.handle = None
+        if os.environ.get("XDNA_AUTOTUNE_VERBOSE", "0") == "1":
+            times = ", ".join(f"{NPU_MODES[m]} {med[m]:.1f}" for m in (2, 1, 0))
+            print(f"xdna: using {NPU_MODES[best]} (median step ms: {times})",
+                  file=sys.stderr, flush=True)
+
+
+_AUTOTUNER: _StepAutotuner | None = None
+
+
+def _start_npu_mode_selection() -> None:
+    """XDNA_NPU_MODE=0/1/2 fixes the mode; XDNA_AUTOTUNE=0 keeps mode 2
+    (all NPU paths, per-op cost models only) without measuring."""
+    global _AUTOTUNER
+    forced = os.environ.get("XDNA_NPU_MODE")
+    if forced is not None:
+        _C.set_npu_mode(int(forced))
+        return
+    if os.environ.get("XDNA_AUTOTUNE", "1") != "1":
+        return
+    _AUTOTUNER = _StepAutotuner(
+        warmup=int(os.environ.get("XDNA_AUTOTUNE_WARMUP", "3")),
+        steps=int(os.environ.get("XDNA_AUTOTUNE_STEPS", "2")),
+        rounds=int(os.environ.get("XDNA_AUTOTUNE_ROUNDS", "1")),
+        tolerance=float(os.environ.get("XDNA_AUTOTUNE_TOLERANCE", "0.03")),
+    )
+    from torch.optim.optimizer import register_optimizer_step_post_hook
+
+    _AUTOTUNER.handle = register_optimizer_step_post_hook(_AUTOTUNER)
+
+
+def autotune_result() -> dict | None:
+    """The step autotuner's choice once it has finished, else None:
+    {"mode": 0|1|2, "step_ms": {mode: median step ms}}."""
+    return None if _AUTOTUNER is None else _AUTOTUNER.result
+
+
+def set_npu_mode(mode: int) -> None:
+    """2: all NPU paths, 1: no NPU weight gradients, 0: CPU only.  Stops the
+    step autotuner."""
+    register_xdna_device()
+    if _AUTOTUNER is not None and _AUTOTUNER.handle is not None:
+        _AUTOTUNER.handle.remove()
+        _AUTOTUNER.handle = None
+    _C.set_npu_mode(int(mode))
+
+
+def npu_mode() -> int:
+    register_xdna_device()
+    return _C.npu_mode()
 
 
 def try_register_xdna_device() -> bool:
