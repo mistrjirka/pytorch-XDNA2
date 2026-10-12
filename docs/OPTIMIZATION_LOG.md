@@ -73,3 +73,84 @@ upsample, mul) ~25-30 ms. Profile is flat; remaining wins are each 1-3 %.
 - Global `set_swap_module_params_on_conversion(True)` breaks LSTM `load_state_dict`; LSTM cell unoptimized (0.29x in model zoo).
 - NIS venv still imports the old installed package; reinstall needs user approval.
 - Re-run `benchmarks/model_zoo.py` for regressions with the new conv paths.
+
+## Generalization work (2026-10-10, branch `conv3x3w-tiling`)
+
+- **Width tiling** (images wider than 36 px): an image is cut into S vertical strips of <= 34 output
+  columns, each packed as a virtual image with one real neighbour column per side; only the
+  middle columns of each strip are valid. Host pack/unpack only: no new kernel, no new xclbin,
+  streams stay keyed `(groups, wp, chunks)`. dW packs dY with zeroed halo columns. Proof:
+  `tests/run_conv3x3w_pack.py` (bit-exact vs numpy, incl. group pieces and halo modes),
+  `tests/run_conv3x3w_torch.py` (W = 37, 56, 64, 112, 224: fwd/dX/dW ~1 % vs FP32).
+- **Shape sweep** (`benchmarks/conv_shape_sweep.py`, `results/conv_shape_sweep*.json`, 3 channel
+  configs x 9 sizes x 13 batches, fwd+bwd vs CPU BF16): NPU wins at 31-36 px with batch >= 16
+  (1.4-3.0x, 256->128 B100: 2.99x); loses at <= 18 px or batch <= 8. Wide images with 128+
+  channels: 1.8-2.7x (48-112 px); 64-channel convs break-even or slower (half of the 128-wide
+  output block is wasted). Max error 1.2 %, no hangs. Isolated tests include ~5 ms of dW
+  context switching that real models amortize.
+- **Cost model fixes**: NPU fixed overhead 0.15 -> 0.5 ms (traces: tiny ops 0.8-1.0 ms), padded rows use
+  whole 2048-row groups, break-even ops need `XDNA_CONV3X3W_MARGIN` (0.8) predicted gain: whole-model
+  runs showed break-even NPU convs lose ~10 % (resnet18 at 224 px, conv path on: 100-120 ms vs 92 off).
+- **Coverage tool** `benchmarks/conv_coverage.py` (no hardware): fraction of conv MACs eligible per
+  torchvision model, with and without tiling (VGG11@224 49 % -> 99 %, ResNet18@224 57 % -> 83 %).
+- **Not covered**: 1x1 convs (52-91 % of MACs in ResNet50/MobileNet/EfficientNet), depthwise, stride-2,
+  7x7. A 1x1 variant needs a tap-count parameter in the core loop and weight DMA (tap offsets are
+  already runtime parameters), the most valuable next widening.
+- Whole-model caveat: `vgg11_128` is dominated by its 130 M-parameter classifier/optimizer, so it
+  is a poor conv benchmark.
+
+## Universality round (2026-10-12): every model at least as fast as CPU BF16
+
+Starting point (`zoo_round3_ac.json`, CPU first then XDNA): geomean **0.68x**, with only NIS
+(1.59x) and the transformer (1.09x) faster than CPU, and the MLP at 0.33x and the LSTM at
+0.26x. The losses came almost entirely from the host side, not from the NPU.
+
+| Change | Why it works | Proof |
+|---|---|---|
+| Backward on the calling thread (`torch.autograd.set_multithreading_enabled(False)` in `register_xdna_device`) | PyTorch runs a non-CPU device's backward on its own worker thread with its own OpenMP pool; the forward pool's spinning threads compete with it | `a*2 .sum() .backward()` 131 -> 46 us (CPU 43); MLP 8.0 -> 3.8 ms (CPU 3.8), embedding 11.3 -> 5.9 (5.3), mobilenet 60 -> 49; NIS proxy neutral (95-100 ms both) |
+| Step autotuner (`device._StepAutotuner`, global optimizer step hook) | Per-op cost models cannot see per-step costs: NPU dW lives in a second xclbin, 2 x ~2.6 ms switches per step. UNet: 67-74 ms with NPU convs, 56-59 without NPU dW, 51-53 CPU only (CPU 56) | UNet picks CPU only (53.8 ms); NIS picks all NPU (2 of 2 runs, `nis_round5_ac.json` style runs: 122.5 / 123.2 ms vs 125.5 / 127.2 old behaviour) |
+| ABBA order inside the tuner | First version measured modes in a fixed order; the mode measured last looked 30 % slower (resnet18 CPU-only 65 ms vs 47-54 in fixed-mode runs) | fixed-mode A/B runs |
+| CPU islands for `aten::lstm.input` / `gru.input` (`xdna_train/cpu_islands.py`) | CPU picks the fused oneDNN RNN only for CPU tensors; on XDNA the op decomposed into ~5000 per-timestep ops per step | `tests/run_cpu_islands.py` (bit-identical outputs and all gradients vs CPU); LSTM 48 -> 18.5-20.8 ms (CPU 17.2-18.3) |
+| Fused optimizer default (`_prefer_fused_optimizer`) | PyTorch defaults PrivateUse1 optimizers to `foreach` (~10 CPU-fallback list ops per step); the fused kernel runs through the zero-copy fallback | MLP 3.7-4.2 -> 2.9-3.5 ms; transformer fused 75-80 vs 78-100 ms |
+| `model_zoo.py --rounds` (ABBA) and 24 warmup steps on both devices | The zoo ran CPU then XDNA, so XDNA always ran on a warmer chip: transformer 0.85x single-order vs 1.01x ABBA | `zoo_round4_ac.json` vs ABBA rerun |
+
+Measured and not adopted:
+
+| Idea | Verdict | Proof |
+|---|---|---|
+| `OMP_WAIT_POLICY=PASSIVE` instead of the thread fix | Rejected: slows the CPU itself | LSTM CPU 19.7 -> 31.8 ms, `a*2` bwd CPU 43 -> 103 us |
+| Better per-op NPU rate in the cost model for 1-chunk (Cin <= 64) convs | Not the UNet problem | standalone NPU rate 3.8 GMAC/ms at 1 chunk vs 4.6-7.7 at 2-4 chunks (`rate.py`, B16 32x32, 10 groups); UNet's dX waited 3.3 ms in situ vs ~0.9 ms standalone = context switch |
+| Channels-last for the CPU baseline | Note, not a backend change | CPU BF16 with `channels_last`: UNet 57 -> 49, resnet18 53 -> 47, NIS proxy 155 -> 133 ms. XDNA's CPU conv fallback already gets this (UNet NPU-off 49.6 ms with a contiguous model) |
+
+### What the documentation offers for small shapes (not yet implemented)
+
+NPU side, ranked by expected value:
+
+1. **Reconfigure inside one hardware context** (`aiex.configure` blocks in a full-ELF runtime
+   sequence; `mlir-aie/test/npu-xrt/reconfigure_loadpdi`, `..._persistent_memtile`,
+   `ctrl_packet_reconfig*`). The fwd/dX and dW designs could live in one ELF and switch with a PDI
+   load in the instruction stream instead of a firmware context switch (2.6 ms). The cost of
+   that PDI load is unmeasured. It needs a NOOP microbenchmark before porting the conv runtime to the
+   full-ELF flow (open bugs mlir-aie#3654/#3656, research note). It would remove the main reason
+   the tuner rejects NPU dW for mid-sized models.
+2. **`xrt::runlist` / command chains** (`test/npu-xrt/add_one_two_runlist`, driver
+   `aie2_cmdlist_multi_execbuf`). It submits several dispatches with one ioctl and one wait. The
+   fixed ~0.5 ms per op makes 9x9 / 4x4 convs break-even; chaining the convs of a block would
+   amortize it.
+3. **Small spatial sizes: im2col GEMM instead of the halo grid.** A 4x4 image becomes a 6x6
+   padded grid (2.25x MACs) and still occupies a whole 2048-row group. Host im2col
+   (K = 9*Cin) has no halo waste, and batch*H*W rows fill the 2048-row groups densely.
+4. **1x1 convs** are plain GEMMs (52-91 % of MACs in ResNet50 / MobileNet / EfficientNet): a
+   tap-count parameter in conv3x3w (tap offsets are already runtime parameters).
+
+CPU side: CPU kernels that PyTorch selects by device type are reachable through CPU islands
+(the LSTM pattern) or through zero-copy fallback with the right flag (fused optimizers).
+Candidates still on the slow path: `nn.MultiheadAttention`'s fused CPU path
+(`_native_multi_head_attention` only for CPU in eval/no-grad), `embedding_bag`.
+
+**Result** (`benchmarks/results/zoo_round5_ac.json`, ABBA, 2 rounds, AC): geomean **1.24x**, every model
+>= 1.04x: resnet18 1.14, mobilenet_v3 1.04, unet 1.13, transformer 1.05, mlp 1.16, lstm 1.21,
+conv1d_audio 1.18, conv_autoencoder 1.20, embedding 1.78, nis_mynet 1.72. First losses are identical
+to CPU. Last losses can drift slightly because the fused optimizer rounds differently in bf16 (NIS proxy after 34
+steps: 0.5195 CPU vs 0.5625 XDNA, within the zoo's 10 % check). The real NIS script: 122.5-123.2 ms/step
+vs CPU BF16 184 ms.

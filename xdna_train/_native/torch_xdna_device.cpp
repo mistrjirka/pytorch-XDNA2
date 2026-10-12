@@ -106,6 +106,10 @@ extern "C" void xdna_conv3x3w_pack_input_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int);
 extern "C" void xdna_conv3x3w_unpack_output_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int);
+extern "C" void xdna_conv3x3w_pack_input_strips_range_bf16(
+    const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
+extern "C" void xdna_conv3x3w_unpack_output_strips_range_bf16(
+    const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
 extern "C" ShimRun* shim_run_kernel_start(
     ShimKernel*, unsigned int, ShimBo*, size_t, ShimBo* const*, size_t);
 
@@ -1315,6 +1319,11 @@ struct XdnaGemmRuntime {
   }
 };
 
+// Which NPU paths may run: 2 = all, 1 = no NPU weight gradients (they live in
+// a second xclbin, so every step pays two ~2.6 ms context switches), 0 = CPU
+// only.  Set from Python (the step autotuner in device.py) between steps.
+std::atomic<int> g_npu_mode{2};
+
 std::unique_ptr<XdnaGemmRuntime>& gemm_runtime_slot() {
   static auto* slot = new std::unique_ptr<XdnaGemmRuntime>();
   return *slot;
@@ -1790,6 +1799,7 @@ struct IronStreamBuilder {
   std::deque<std::pair<std::string, std::string>> queue;  // key, args
   std::set<std::string> seen;
   bool started = false;
+  std::atomic<int> outstanding{0};  // queued or building (async mode)
 
   std::filesystem::path path(const std::string& key) const {
     return std::filesystem::path(dir) / (key + ".bin");
@@ -1826,6 +1836,7 @@ struct IronStreamBuilder {
       return;
     }
     queue.emplace_back(key, args);
+    ++outstanding;
     if (!started) {
       started = true;
       std::thread([this] {
@@ -1838,6 +1849,7 @@ struct IronStreamBuilder {
             queue.pop_front();
           }
           build(args);
+          --outstanding;
         }
       }).detach();
     }
@@ -1952,18 +1964,46 @@ std::shared_ptr<Conv3x3wPacked> acquire_npu_out(size_t bytes) {
   });
 }
 
-// x (host NCHW bf16, contiguous) -> buf, then sync to the device.
-void pack_conv3x3w_input(Conv3x3wPacked& buf, const at::Tensor& x_cpu, int64_t chunks) {
+// Width tiling: images wider than 36 run as S vertical strips of `so` output
+// columns, each a virtual image of so + 2 data columns (one real neighbour
+// column per side); S == 1 is the plain layout.  Mirrors
+// conv3x3w_host.strip_geometry.
+constexpr int64_t kConv3x3wMaxWidth = 36;
+constexpr int64_t kConv3x3wMaxStrip = 34;
+
+struct Conv3x3wStrips {
+  int64_t s = 1, so = 0, wg = 0;  // strips, output columns per strip, grid data width
+};
+
+Conv3x3wStrips conv3x3w_strips(int64_t w) {
+  Conv3x3wStrips g;
+  if (w <= kConv3x3wMaxWidth) {
+    g.s = 1; g.so = w; g.wg = w;
+  } else {
+    g.s = (w + kConv3x3wMaxStrip - 1) / kConv3x3wMaxStrip;
+    g.so = (w + g.s - 1) / g.s;
+    g.wg = g.so + 2;
+  }
+  return g;
+}
+
+// x (host NCHW bf16, contiguous) -> buf, then sync to the device.  halo_zero:
+// zero halo columns (dY for the weight gradient) when the image is tiled.
+void pack_conv3x3w_input(Conv3x3wPacked& buf, const at::Tensor& x_cpu, int64_t chunks,
+                         bool halo_zero = false) {
   const std::array<int64_t, 5> shape = {
       x_cpu.size(0), x_cpu.size(1), x_cpu.size(2), x_cpu.size(3), chunks};
   if (buf.shape != shape) {
     if (buf.shape != std::array<int64_t, 5>{}) std::memset(buf.ptr, 0, buf.bytes);
     buf.shape = shape;
   }
-  xdna_conv3x3w_pack_input_bf16(
+  const auto g = conv3x3w_strips(shape[3]);
+  const int64_t groups = (shape[0] * g.s * (shape[2] + 2) * (g.wg + 2) + 2047) / 2048;
+  xdna_conv3x3w_pack_input_strips_range_bf16(
       static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
       static_cast<uint16_t*>(buf.ptr),
-      int(shape[0]), int(shape[1]), int(shape[2]), int(shape[3]), int(chunks));
+      int(shape[0]), int(shape[1]), int(shape[2]), int(shape[3]), int(g.s), int(g.so),
+      halo_zero ? 1 : 0, int(chunks), 0, int(groups));
   TORCH_CHECK(shim_bo_sync_to_device(buf.bo) == 0,
               "failed to sync conv3x3w input: ", shim_last_error());
 }
@@ -1998,8 +2038,9 @@ std::shared_ptr<Conv3x3wPacked> take_packed(const at::Tensor& t, int64_t chunks)
 bool conv3x3w_dw_wants(int64_t batch, int64_t cin, int64_t cout, int64_t h, int64_t w);
 
 struct Conv3x3wPlan {
-  int64_t batch = 0, cin = 0, cout = 0, h = 0, w = 0;
-  int64_t groups = 0, wp = 0, chunks = 0;
+  int64_t batch = 0, cin = 0, cout = 0, h = 0, w = 0;  // the real tensor
+  int64_t strips = 1, strip_out = 0, grid_w = 0;       // width tiling (see conv3x3w_strips)
+  int64_t groups = 0, wp = 0, chunks = 0;              // of the (virtual) padded grid
   std::string key;
 };
 
@@ -2094,18 +2135,21 @@ struct XdnaConv3x3wRuntime {
       return raw != nullptr && raw[0] != 0 && std::strcmp(raw, "0") != 0;
     }();
     if (force) return true;
-    static const double overhead_ms = env_double("XDNA_CONV3X3W_NPU_OVERHEAD_MS", 0.15);
+    static const double overhead_ms = env_double("XDNA_CONV3X3W_NPU_OVERHEAD_MS", 0.5);
     static const double npu_gmacs = env_double("XDNA_CONV3X3W_NPU_GMACS", 5.5);
     static const double host_gbs = env_double("XDNA_CONV3X3W_HOST_GBS", 20.0);
     static const double cpu_gmacs = env_double("XDNA_CONV3X3W_CPU_GMACS", 0.9);
-    const double padded_macs = double(p.batch) * (p.h + 2) * p.wp *
+    const double padded_macs = double(p.groups * kGroupOutRows) *
         double(p.chunks * kKStep) * double(ceil_div(p.cout, kN) * kN) * 9.0;
     const double io_bytes =
-        2.0 * double(p.batch) * (double(p.cin) + double(p.cout)) * p.h * p.w;
+        2.0 * double(p.batch) * (double(p.cin) + double(p.cout)) * p.h * p.w;  // real tensors
     const double npu_ms =
         overhead_ms + padded_macs / (npu_gmacs * 1e9) + io_bytes / (host_gbs * 1e6);
     const double cpu_ms = double(real_macs) / (cpu_gmacs * 1e9);
-    return npu_ms < cpu_ms;
+    // Break-even convs lose in practice (host-thread contention, extra memory
+    // traffic), so require a margin.
+    static const double margin = env_double("XDNA_CONV3X3W_MARGIN", 0.8);
+    return npu_ms < margin * cpu_ms;
   }
 
   // Shape check only (no stream lookup).  `x` is the conv input (or dY for
@@ -2140,13 +2184,15 @@ struct XdnaConv3x3wRuntime {
     p.h = x.size(2);
     p.w = x.size(3);
     if (x.size(1) != p.cin || p.batch < 1 || p.h < 1 || p.w < 1 ||
-        p.w > kMaxWidth || p.cin < 1 || p.cout < 1) {
+        p.cin < 1 || p.cout < 1) {
       return std::nullopt;
     }
     const int64_t real_macs = p.batch * p.h * p.w * p.cin * p.cout * 9;
     if (real_macs < min_macs) return std::nullopt;
-    p.wp = p.w + 2;
-    p.groups = ceil_div(p.batch * (p.h + 2) * p.wp, kGroupOutRows);
+    const auto tiles = conv3x3w_strips(p.w);
+    p.strips = tiles.s; p.strip_out = tiles.so; p.grid_w = tiles.wg;
+    p.wp = p.grid_w + 2;
+    p.groups = ceil_div(p.batch * p.strips * (p.h + 2) * p.wp, kGroupOutRows);
     p.chunks = ceil_div(p.cin, kKStep);
     if (!cost_model_prefers_npu(p, real_macs)) return std::nullopt;
     if (p.groups > kMaxGroups) return std::nullopt;
@@ -2341,7 +2387,7 @@ struct XdnaConv3x3wRuntime {
     auto pieces = piece_streams(p, s);
     const size_t in_group = static_cast<size_t>(p.chunks * kGroupRows * kKStep * 2);
     const size_t out_group = static_cast<size_t>(kGroupOutRows * kN * 2);
-    const int64_t m_total = p.batch * (p.h + 2) * p.wp;
+    const int64_t m_total = p.batch * p.strips * (p.h + 2) * p.wp;
     auto xin = acquire_packed(static_cast<size_t>(p.groups) * in_group);
     xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
     const std::array<int64_t, 5> xshape = {p.batch, p.cin, p.h, p.w, p.chunks};
@@ -2352,10 +2398,11 @@ struct XdnaConv3x3wRuntime {
     auto pack_piece = [&](const Conv3x3wPiece& pc) {
       ScopedMappedCpu pack_phase("npu_conv3x3w.pack");
       struct Acc { double& d; double t; decltype(now_ms)& f; ~Acc() { d += f() - t; } } acc{trace_pack_ms, now_ms(), now_ms};
-      xdna_conv3x3w_pack_input_range_bf16(
+      xdna_conv3x3w_pack_input_strips_range_bf16(
           static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
           static_cast<uint16_t*>(xin->ptr) + pc.g0 * in_group / 2,
-          int(p.batch), int(p.cin), int(p.h), int(p.w), int(p.chunks), int(pc.g0), int(pc.ng));
+          int(p.batch), int(p.cin), int(p.h), int(p.w), int(p.strips), int(p.strip_out), 0,
+          int(p.chunks), int(pc.g0), int(pc.ng));
       TORCH_CHECK(shim_bo_sync_to_device(xin->sub(pc.g0 * in_group, pc.ng * in_group)) == 0,
                   "failed to sync conv3x3w input: ", shim_last_error());
     };
@@ -2422,10 +2469,10 @@ struct XdnaConv3x3wRuntime {
       struct Acc { double& d; double t; decltype(now_ms)& f; ~Acc() { d += f() - t; } } acc{trace_unpack_ms, now_ms(), now_ms};
       const int64_t p0 = pc.g0 * kGroupOutRows;
       const int64_t p1 = std::min(m_total, (pc.g0 + pc.ng) * kGroupOutRows);
-      xdna_conv3x3w_unpack_output_range_bf16(
+      xdna_conv3x3w_unpack_output_strips_range_bf16(
           static_cast<const uint16_t*>(raw[t.nb & 1]->ptr) + p0 * kN,
           static_cast<uint16_t*>(out_cpu.data_ptr()),
-          int(p.batch), int(p.h), int(p.w),
+          int(p.batch), int(p.h), int(p.w), int(p.strips), int(p.strip_out),
           int(std::min<int64_t>(kN, p.cout - t.nb * kN)), int(p.cout), int(t.nb * kN),
           int(p0), int(p1));
     };
@@ -2516,6 +2563,7 @@ std::unique_ptr<XdnaConv3x3wRuntime>& conv3x3w_runtime_slot() {
 // All deferred dWs of a step then run back to back in one context.
 struct Conv3x3wDwPlan {
   int64_t batch = 0, cin = 0, cout = 0, h = 0, w = 0;
+  int64_t strips = 1, strip_out = 0, grid_w = 0;
   int64_t groups = 0, wp = 0, chunks = 0, cochunks = 0;
   std::string buf_key;
   std::vector<std::pair<std::string, std::string>> passes;  // key, build args
@@ -2571,13 +2619,15 @@ struct XdnaConv3x3wDwRuntime {
     p.cout = grad_output.size(1);
     if (weight.size(0) != p.cout || weight.size(1) != p.cin ||
         grad_output.size(0) != p.batch || grad_output.size(2) != p.h ||
-        grad_output.size(3) != p.w || p.w > kMaxWidth || p.batch < 1 || p.h < 1 ||
+        grad_output.size(3) != p.w || p.batch < 1 || p.h < 1 ||
         p.w < 1) {
       return std::nullopt;
     }
     if (p.batch * p.h * p.w * p.cin * p.cout * 9 < min_macs) return std::nullopt;
-    p.wp = p.w + 2;
-    p.groups = ceil_div(p.batch * (p.h + 2) * p.wp, kGroupOutRows);
+    const auto tiles = conv3x3w_strips(p.w);
+    p.strips = tiles.s; p.strip_out = tiles.so; p.grid_w = tiles.wg;
+    p.wp = p.grid_w + 2;
+    p.groups = ceil_div(p.batch * p.strips * (p.h + 2) * p.wp, kGroupOutRows);
     p.chunks = ceil_div(p.cin, kKStep);
     p.cochunks = ceil_div(p.cout, kKStep);
     if (p.chunks > kMaxChunks || p.cochunks > kMaxChunks || p.groups > 1024) {
@@ -2638,17 +2688,21 @@ struct XdnaConv3x3wDwRuntime {
       load_kernel();
     }
     xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
-    auto pack = [&](std::shared_ptr<Conv3x3wPacked>& buf, const at::Tensor& t, int64_t chunks) {
+    // Tiled dY needs zero halo columns, which the dX run's packed copy (real
+    // neighbours) does not have: repack it.
+    if (p.strips > 1) d_buf.reset();
+    auto pack = [&](std::shared_ptr<Conv3x3wPacked>& buf, const at::Tensor& t, int64_t chunks,
+                    bool halo_zero) {
       if (buf) return;
       ScopedMappedCpu pack_phase("npu_conv3x3w.dw.pack");
       ensure_host_current(t);
       auto t_cpu = cpu_alias(t);
       if (!t_cpu.is_contiguous()) t_cpu = t_cpu.contiguous();
       buf = acquire_packed(static_cast<size_t>(p.groups * chunks * kGroupRows * kKStep * 2));
-      pack_conv3x3w_input(*buf, t_cpu, chunks);
+      pack_conv3x3w_input(*buf, t_cpu, chunks, halo_zero);
     };
-    pack(x_buf, input, p.chunks);
-    pack(d_buf, grad_output, p.cochunks);
+    pack(x_buf, input, p.chunks, false);
+    pack(d_buf, grad_output, p.cochunks, true);
 
     std::lock_guard<std::mutex> guard(mutex);
     const int64_t co_passes = ceil_div(p.cochunks, 2);
@@ -2727,7 +2781,7 @@ struct Conv3x3wDwJob {
 
 bool conv3x3w_dw_wants(int64_t batch, int64_t cin, int64_t cout, int64_t h, int64_t w) {
   auto& rt = conv3x3w_dw_runtime_slot();
-  return rt && w <= XdnaConv3x3wDwRuntime::kMaxWidth &&
+  return rt && g_npu_mode.load(std::memory_order_relaxed) > 1 &&
       XdnaConv3x3wDwRuntime::ceil_div(cin, 64) <= XdnaConv3x3wDwRuntime::kMaxChunks &&
       XdnaConv3x3wDwRuntime::ceil_div(cout, 64) <= XdnaConv3x3wDwRuntime::kMaxChunks &&
       batch * h * w * cin * cout * 9 >= rt->min_macs;
@@ -4481,7 +4535,7 @@ at::Tensor mm_xdna(
       "mm_xdna expects compatible 2-D matrices");
 
   auto& slot = gemm_runtime_slot();
-  if (slot &&
+  if (slot && g_npu_mode.load(std::memory_order_relaxed) > 0 &&
       lhs.scalar_type() == at::ScalarType::BFloat16 &&
       rhs.scalar_type() == at::ScalarType::BFloat16 &&
       lhs.is_contiguous() &&
@@ -4574,6 +4628,7 @@ at::Tensor convolution_overrideable_xdna(
     bool transposed,
     c10::SymIntArrayRef output_padding,
     c10::SymInt groups) {
+  auto npu_forward = [&]() -> std::optional<at::Tensor> {
   if (auto& w3 = conv3x3w_runtime_slot()) {
     if (auto out = w3->try_forward(
             input, weight, bias, stride, padding, dilation, transposed,
@@ -4656,6 +4711,11 @@ at::Tensor convolution_overrideable_xdna(
             bias)) {
       return full_conv_slot->forward(input, weight, *stream);
     }
+  }
+  return std::nullopt;
+  };
+  if (g_npu_mode.load(std::memory_order_relaxed) > 0) {
+    if (auto out = npu_forward()) return *out;
   }
 
   ScopedMappedCpu mapped_phase("aten::convolution.cpu_mapped");
@@ -4835,8 +4895,9 @@ convolution_backward_overrideable_xdna(
   XdnaConvStream* small_dx = nullptr;
   XdnaFullFrameConvStream* full_dx = nullptr;
   XdnaFullFrameConvRuntime* full_dx_owner = nullptr;
+  const int npu_mode = g_npu_mode.load(std::memory_order_relaxed);
   auto& w3_slot = conv3x3w_runtime_slot();
-  if (output_mask[0] && w3_slot) {
+  if (output_mask[0] && npu_mode > 0 && w3_slot) {
     w3_dx_plan = w3_slot->plan(
         grad_output, weight, true, stride, padding, dilation, transposed,
         output_padding, groups);
@@ -4846,7 +4907,7 @@ convolution_backward_overrideable_xdna(
   auto& full_conv_slot = fullframe_conv_runtime_slot();
   auto& fast_dx584_slot = fast_dx584_runtime_slot();
   auto& fast_conv11_slot = fast_conv11_runtime_slot();
-  if (output_mask[0] && !w3_dx && conv_slot) {
+  if (output_mask[0] && npu_mode > 0 && !w3_dx && conv_slot) {
     small_dx = conv_slot->find_dx(
         grad_output,
         weight,
@@ -4857,19 +4918,19 @@ convolution_backward_overrideable_xdna(
         output_padding,
         groups);
   }
-  if (output_mask[0] && !small_dx && fast_conv11_slot) {
+  if (output_mask[0] && npu_mode > 0 && !small_dx && fast_conv11_slot) {
     full_dx = fast_conv11_slot->find_dx(
         grad_output, weight, stride, padding, dilation,
         transposed, output_padding, groups);
     if (full_dx) full_dx_owner = fast_conv11_slot.get();
   }
-  if (output_mask[0] && !small_dx && !full_dx && fast_dx584_slot) {
+  if (output_mask[0] && npu_mode > 0 && !small_dx && !full_dx && fast_dx584_slot) {
     full_dx = fast_dx584_slot->find_dx(
         grad_output, weight, stride, padding, dilation,
         transposed, output_padding, groups);
     if (full_dx) full_dx_owner = fast_dx584_slot.get();
   }
-  if (output_mask[0] && !small_dx && !full_dx && full_conv_slot) {
+  if (output_mask[0] && npu_mode > 0 && !small_dx && !full_dx && full_conv_slot) {
     full_dx = full_conv_slot->find_dx(
         grad_output, weight, stride, padding, dilation,
         transposed, output_padding, groups);
@@ -4880,7 +4941,7 @@ convolution_backward_overrideable_xdna(
 
   auto& full_dw_slot = fullframe_dw_runtime_slot();
   const bool have_npu_dw =
-      output_mask[1] && full_dw_slot &&
+      output_mask[1] && npu_mode > 1 && full_dw_slot &&
       full_dw_slot->supports(
           input,
           grad_output,
@@ -4898,7 +4959,7 @@ convolution_backward_overrideable_xdna(
   std::shared_ptr<Conv3x3wPacked> w3_dy_packed;
   std::shared_ptr<Conv3x3wDwJob> w3_dw_job;
   auto& w3_dw_slot = conv3x3w_dw_runtime_slot();
-  if (output_mask[1] && w3_dw_slot && !have_npu_dw) {
+  if (output_mask[1] && npu_mode > 1 && w3_dw_slot && !have_npu_dw) {
     w3_dw_plan = w3_dw_slot->plan(
         input, grad_output, weight, stride, padding, dilation, transposed,
         output_padding, groups);
@@ -5671,6 +5732,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       },
       py::arg("dir"), py::arg("build_cmd"), py::arg("min_macs") = 0,
       py::arg("sync_build") = false);
+  // CPU islands (cpu_islands.py): a CPU view of an XDNA tensor (non-owning:
+  // the caller keeps the XDNA tensor alive) and an XDNA tensor holding a
+  // CPU result.
+  m.def("cpu_alias", [](const at::Tensor& t) { return cpu_alias(t); });
+  m.def("from_cpu", [](const at::Tensor& t) { return adopt_or_copy(t); });
+  m.def("set_npu_mode", [](int mode) { g_npu_mode.store(mode); });
+  m.def("iron_builds_pending", []() {
+    int n = 0;
+    if (auto& rt = conv3x3w_runtime_slot()) n += rt->builder.outstanding.load();
+    if (auto& rt = conv3x3w_dw_runtime_slot()) n += rt->builder.outstanding.load();
+    return n;
+  });
+  m.def("npu_mode", []() { return g_npu_mode.load(); });
   m.def("conv3x3w_configured", []() {
     return static_cast<bool>(conv3x3w_runtime_slot());
   });

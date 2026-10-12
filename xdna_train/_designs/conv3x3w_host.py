@@ -88,3 +88,53 @@ def unpack_output(c_bits, batch, height, width, cout):
     c = bf16_value(c_bits.reshape(-1, N)[:m_total])
     c = c.reshape(batch, height + 2, wp, N)[:, :height, :width, :cout]
     return np.ascontiguousarray(c.transpose(0, 3, 1, 2))
+
+
+# ---- width tiling: images wider than MAX_STRIP_W run as vertical strips ----
+
+MAX_STRIP_W = 34     # output columns per strip (data width 36 incl. halos)
+
+
+def strip_geometry(width):
+    """-> (strips S, output columns per strip So).  S == 1 is the plain layout."""
+    if width <= MAX_WIDTH:
+        return 1, width
+    s = -(-width // MAX_STRIP_W)
+    return s, -(-width // s)
+
+
+def strip_batch(x_nchw, halo_zero=False):
+    """NCHW -> virtual NCHW [B*S][C][H][So+2]: strip s holds source columns
+    [s*So-1, s*So+So+1) (zero outside the image; halo columns zeroed when
+    halo_zero, the layout dY needs for the weight gradient)."""
+    B, C, H, W = x_nchw.shape
+    S, So = strip_geometry(W)
+    if S == 1:
+        return x_nchw
+    out = np.zeros((B * S, C, H, So + 2), x_nchw.dtype)
+    for b in range(B):
+        for s in range(S):
+            lo = s * So - 1
+            for j in range(So + 2):
+                if halo_zero and j in (0, So + 1):
+                    continue
+                if 0 <= lo + j < W:
+                    out[b * S + s, :, :, j] = x_nchw[b, :, :, lo + j]
+    return out
+
+
+def pack_input_strips(x_nchw, chunks, halo_zero=False):
+    return pack_input(strip_batch(x_nchw, halo_zero), chunks)
+
+
+def unpack_output_strips(c_bits, batch, height, width, cout):
+    S, So = strip_geometry(width)
+    if S == 1:
+        return unpack_output(c_bits, batch, height, width, cout)
+    v = unpack_output(c_bits, batch * S, height, So + 2, cout)  # [B*S][cout][H][So+2]
+    out = np.zeros((batch, cout, height, width), np.float32)
+    for b in range(batch):
+        for s in range(S):
+            n = min(So, width - s * So)
+            out[b, :, :, s * So:s * So + n] = v[b * S + s, :, :, 1:1 + n]
+    return out

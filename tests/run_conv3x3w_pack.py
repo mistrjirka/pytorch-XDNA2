@@ -21,6 +21,8 @@ lib.xdna_conv3x3w_pack_weights_dx_bfp16.argtypes = [P, P, I, I, I, I]
 lib.xdna_conv3x3w_unpack_output_bf16.argtypes = [P, P, I, I, I, I, I, I]
 lib.xdna_conv3x3w_pack_input_range_bf16.argtypes = [P, P, I, I, I, I, I, I, I]
 lib.xdna_conv3x3w_unpack_output_range_bf16.argtypes = [P, P, I, I, I, I, I, I, I, I]
+lib.xdna_conv3x3w_pack_input_strips_range_bf16.argtypes = [P, P, I, I, I, I, I, I, I, I, I, I]
+lib.xdna_conv3x3w_unpack_output_strips_range_bf16.argtypes = [P, P, I, I, I, I, I, I, I, I, I]
 
 rng = np.random.default_rng(0)
 fails = 0
@@ -181,5 +183,66 @@ def range_timing():
 for s in [(40, 256, 36, 36, 128), (3, 70, 5, 7, 10), (4, 195, 36, 36, 64), (40, 128, 9, 9, 128)]:
     range_case(*s)
 range_timing()
-print("FAILED" if fails else "ALL OK")
+
+
+def strip_case(B, C, H, W, Cout):
+    """Strip layout (S >= 1) vs the numpy reference, incl. group-range pieces."""
+    global fails
+    S, So = ref.strip_geometry(W)
+    print(f"strip case B={B} C={C} H={H} W={W} Cout={Cout} -> S={S} So={So}")
+    chunks = -(-C // 64)
+    Wg = W if S == 1 else So + 2
+    wp, m_total, groups = ref.geometry(B * S, H, Wg)
+    for halo_zero in ([0] if S == 1 else [0, 1]):
+        x = rng.standard_normal((B, C, H, W)).astype(np.float32)
+        xb = np.ascontiguousarray(ref.bf16_bits(x))
+        expect = ref.pack_input_strips(x, chunks, bool(halo_zero))
+        dst = np.zeros(expect.shape, np.uint16)
+        # stale data from the other halo mode must be overwritten
+        if halo_zero:
+            lib.xdna_conv3x3w_pack_input_strips_range_bf16(
+                xb.ctypes.data, dst.ctypes.data, B, C, H, W, S, So, 0, chunks, 0, groups)
+        lib.xdna_conv3x3w_pack_input_strips_range_bf16(
+            xb.ctypes.data, dst.ctypes.data, B, C, H, W, S, So, halo_zero, chunks, 0, groups)
+        ok = np.array_equal(dst, expect)
+        # pieces
+        for cuts in ([groups], [1] * groups, [max(1, groups // 3), groups - max(1, groups // 3)] if groups > 1 else [groups]):
+            if sum(cuts) != groups:
+                continue
+            d2 = np.zeros(expect.shape, np.uint16)
+            g0 = 0
+            for n in cuts:
+                piece = np.zeros((n,) + expect.shape[1:], np.uint16)
+                lib.xdna_conv3x3w_pack_input_strips_range_bf16(
+                    xb.ctypes.data, piece.ctypes.data, B, C, H, W, S, So, halo_zero, chunks, g0, n)
+                d2[g0:g0 + n] = piece
+                g0 += n
+            ok &= np.array_equal(d2[:, :, :ref.GROUP_OUT_ROWS], expect[:, :, :ref.GROUP_OUT_ROWS]) or True
+            ok &= np.array_equal(d2, expect)
+        report(f"pack h{halo_zero}", bool(ok), 0.0)
+    # unpack
+    c = rng.integers(0, 65536, (groups * ref.GROUP_OUT_ROWS, 128), dtype=np.uint16)
+    expect = ref.unpack_output_strips(c, B, H, W, Cout)
+    ctot, cs = Cout + 3, 2
+    nv = min(Cout, 128)
+    ok = True
+    for cuts in ([groups], [1] * groups):
+        outb = np.zeros((B, ctot, H, W), np.uint16)
+        g0 = 0
+        for n in cuts:
+            p0, p1 = g0 * ref.GROUP_OUT_ROWS, min(m_total, (g0 + n) * ref.GROUP_OUT_ROWS)
+            lib.xdna_conv3x3w_unpack_output_strips_range_bf16(
+                c[p0:].ctypes.data, outb.ctypes.data, B, H, W, S, So, nv, ctot, cs, p0, p1) if p1 > p0 else None
+            g0 += n
+        full = ref.bf16_value(outb)
+        ok &= np.array_equal(full[:, cs:cs + nv].view(np.uint32), expect[:, :nv].view(np.uint32))
+        ok &= not outb[:, :cs].any() and not outb[:, cs + nv:].any()
+    report("unpack", bool(ok), 0.0)
+
+
+for s in [(2, 64, 8, 36, 64), (3, 64, 8, 37, 64), (2, 70, 9, 56, 10), (2, 64, 6, 64, 128),
+          (2, 3, 7, 68, 64), (1, 64, 5, 69, 64), (3, 128, 4, 112, 128), (2, 64, 3, 224, 128), (2, 64, 5, 35, 64)]:
+    strip_case(*s)
+
+print("ALL OK" if not fails else f"{fails} FAILED")
 sys.exit(1 if fails else 0)

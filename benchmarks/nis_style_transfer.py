@@ -43,7 +43,10 @@ def sub(old, new):
     global src
     assert src.count(old) == 1, "style_transfer.py changed near: " + old[:60]
     src = src.replace(old, new)
-sub("    training_dtype = torch.float32",
+# The lab script is bf16 since 2026-10; older copies are patched to bf16.
+if "    training_dtype = torch.float32" in src:
+    sub("    training_dtype = torch.float32", "    training_dtype = torch.bfloat16")
+sub("    training_dtype = torch.bfloat16",
     "    training_dtype = torch.bfloat16\n"
     "    print('xdna_train from', xdna_train.__file__, flush=True)")
 sub('    out_pth = "./output"', '    out_pth = os.environ["BENCH_OUT"]')
@@ -75,6 +78,8 @@ print("RESULT=" + json.dumps({
     "stylize_frames_timed": len(_g),
     "train_step_ms": [round(1e3 * d, 2) for d in _d],
     "train_t0_wall": __T0_WALL,
+    "xdna_autotune": (__import__("xdna_train").autotune_result()
+                      if __import__("sys").modules.get("xdna_train") else None),
 }))
 if os.environ.get("XDNA_PROFILE_MAPPED_CPU") == "1":
     from xdna_train import device as _xd

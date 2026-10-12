@@ -926,4 +926,131 @@ void xdna_conv3x3w_unpack_output_range_bf16(
   }
 }
 
+
+// ---- conv3x3w width tiling ----
+//
+// Images wider than the family limit are cut into S vertical strips of So
+// output columns; each strip becomes a virtual image of Wg = So + 2 data
+// columns (one real neighbour column on each side) and runs as an ordinary
+// padded-grid image: only its middle So columns are valid outputs.  S = 1
+// is the plain layout (Wg = W, no halo).  Virtual image vb = b * S + s covers
+// source columns [s*So - 1, s*So + So + 1), zero outside [0, W).
+
+// Groups [g0, g0+ng) of the packed input of the strip layout (see
+// xdna_conv3x3w_pack_input_range_bf16 for the buffer contract).  halo_zero
+// writes zeros in the two halo data columns instead of the neighbours (the
+// layout dY needs for the weight gradient).
+void xdna_conv3x3w_pack_input_strips_range_bf16(
+    const uint16_t* src,
+    uint16_t* dst,
+    int B,
+    int C,
+    int H,
+    int W,
+    int S,
+    int So,
+    int halo_zero,
+    int chunks,
+    int g0,
+    int ng) {
+  const int Wg = S == 1 ? W : So + 2;
+  const int wp = Wg + 2;
+  const int Bv = B * S;
+  const std::size_t img = std::size_t(H + 2) * wp;
+  const std::size_t plo = std::size_t(g0) * kGroupOutRows;
+  const std::size_t phi =
+      std::size_t(g0 + ng) * kGroupOutRows + (kGroupRows - kGroupOutRows);
+  const int v0 = int(plo / img);
+  const int v1 = int((phi - 1) / img) + 1 < Bv ? int((phi - 1) / img) + 1 : Bv;
+  if (v1 <= v0) return;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
+  for (int vb = v0; vb < v1; ++vb) {
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+      for (int y = 0; y < H; ++y) {
+        const int cc = C - chunk * kKStep < kKStep ? C - chunk * kKStep : kKStep;
+        const int b = vb / S, sidx = vb % S;
+        const int xs0 = S == 1 ? 0 : sidx * So - 1;  // source column of data column 0
+        const std::size_t pr = (std::size_t(vb) * (H + 2) + y + 1) * wp + 1;
+        if (cc <= 0 || pr + Wg <= plo || pr >= phi) continue;
+        // data columns [ja, jb) have a source pixel
+        int ja = xs0 < 0 ? -xs0 : 0;
+        int jb = W - xs0 < Wg ? W - xs0 : Wg;
+        // restrict to the group range
+        const int j0 = pr < plo ? int(plo - pr) : 0;
+        const int j1 = pr + Wg > phi ? int(phi - pr) : Wg;
+        if (ja < j0) ja = j0;
+        if (jb > j1) jb = j1;
+        const uint16_t* s =
+            src + ((std::size_t(b) * C + chunk * kKStep) * H + y) * W + xs0;
+        for (int xb = ja; xb < jb; xb += 8) {
+          const int nx = jb - xb < 8 ? jb - xb : 8;
+          uint16_t tile[8][kKStep];
+          gather_pixels(s + xb, std::size_t(H) * W, cc, nx, tile);
+          for (int xi = 0; xi < nx; ++xi) {
+            const int j = xb + xi;
+            if (halo_zero && S > 1 && (j == 0 || j == Wg - 1))
+              std::memset(tile[xi], 0, sizeof(tile[xi]));
+            const std::size_t p = pr + j;
+            const std::size_t g = p / kGroupOutRows;
+            const std::size_t r = p % kGroupOutRows;
+            if (g >= std::size_t(g0) && g < std::size_t(g0 + ng))
+              std::memcpy(
+                  dst + (((g - g0) * chunks + chunk) * kGroupRows + r) * kKStep,
+                  tile[xi], std::size_t(cc) * sizeof(uint16_t));
+            if (g > std::size_t(g0) && g <= std::size_t(g0 + ng) &&
+                r + kGroupOutRows < std::size_t(kGroupRows))
+              std::memcpy(
+                  dst + (((g - 1 - g0) * chunks + chunk) * kGroupRows + r +
+                         kGroupOutRows) * kKStep,
+                  tile[xi], std::size_t(cc) * sizeof(uint16_t));
+          }
+        }
+      }
+    }
+  }
+}
+
+// Rows [p0, p1) of the strip layout's output (rows of 128 channels, `c`
+// points at row p0) -> channel slice [c_start, c_start + cout_valid) of an
+// NCHW [B][C_total][H][W] tensor.  Strip s's output column t sits at grid row
+// base + 1 + t and lands at image column s*So + t.
+void xdna_conv3x3w_unpack_output_strips_range_bf16(
+    const uint16_t* c,
+    uint16_t* dst,
+    int B,
+    int H,
+    int W,
+    int S,
+    int So,
+    int cout_valid,
+    int C_total,
+    int c_start,
+    int p0,
+    int p1) {
+  const int Wg = S == 1 ? W : So + 2;
+  const int wp = Wg + 2;
+  const int Bv = B * S;
+  const std::size_t img = std::size_t(H + 2) * wp;
+  if (p1 <= p0) return;
+  const int v0 = int(std::size_t(p0) / img);
+  const int v1 = int((std::size_t(p1) - 1) / img) + 1 < Bv ? int((std::size_t(p1) - 1) / img) + 1 : Bv;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int vb = v0; vb < v1; ++vb) {
+    for (int y = 0; y < H; ++y) {
+      const int b = vb / S, sidx = vb % S;
+      const long base = long(std::size_t(vb) * (H + 2) + y) * wp;
+      const long first = S == 1 ? 0 : 1;           // grid offset of output column 0
+      const int cols = S == 1 ? W : (W - sidx * So < So ? W - sidx * So : So);
+      const long ta = p0 - (base + first) > 0 ? p0 - (base + first) : 0;
+      const long tb = p1 - (base + first) < cols ? p1 - (base + first) : cols;
+      if (tb <= ta) continue;
+      const int x0 = (S == 1 ? 0 : sidx * So);
+      const uint16_t* s = c + (base + first + ta - p0) * kN;
+      scatter_channels(
+          s, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W + x0 + ta,
+          std::size_t(H) * W, int(tb - ta), cout_valid);
+    }
+  }
+}
+
 }  // extern "C"

@@ -2,6 +2,7 @@
 
 from .device import (
     allocator_stats,
+    autotune_result,
     bo_handle,
     coherency_state,
     empty_cache,
@@ -10,9 +11,11 @@ from .device import (
     is_available,
     is_xrt_backed,
     native_library_path,
+    npu_mode,
     register_xdna_device,
     reset_fallback_stats,
     reset_mapped_cpu_stats,
+    set_npu_mode,
     synchronize,
     try_register_xdna_device,
 )
@@ -29,6 +32,9 @@ __all__ = [
     "synchronize",
     "empty_cache",
     "allocator_stats",
+    "autotune_result",
+    "set_npu_mode",
+    "npu_mode",
     "reset_fallback_stats",
     "fallback_stats",
     "mapped_cpu_stats",
