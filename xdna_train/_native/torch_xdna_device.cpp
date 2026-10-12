@@ -67,18 +67,12 @@
 extern "C" void* shim_bo_map(ShimBo*);
 extern "C" size_t shim_bo_size(ShimBo*);
 extern "C" void xdna_conv_set_threads(int);
-extern "C" void xdna_pack_conv3x3_halo_bf16(
-    const uint16_t*, uint16_t*, int, int, int, int);
 extern "C" void xdna_pack_conv3x3_halo_padded_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
 extern "C" void xdna_pack_conv3x3_halo_padded_channels_last_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
-extern "C" void xdna_yxbc_to_nchw_bf16(
-    const uint16_t*, uint16_t*, int, int, int, int, int);
 extern "C" void xdna_yxbc_to_channels_last_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
-extern "C" void xdna_yxbc_slice_to_channels_last_bf16(
-    const uint16_t*, uint16_t*, int, int, int, int, int, int, int);
 extern "C" void xdna_pack_conv3x3_halo_padded_channels_last_stripe_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int);
 extern "C" void xdna_yxbc_slice_stripe_to_channels_last_bf16(
@@ -91,10 +85,6 @@ extern "C" void xdna_pack_conv3x3_weight_dx_slice_padded_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
 extern "C" void xdna_yxbc_slice_stripe_to_channels_last_partial_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
-extern "C" void xdna_pack_conv3x3_dy_channels_last_bf16(
-    const uint16_t*, uint16_t*, int, int, int, int);
-extern "C" void xdna_pack_conv3x3_dy_bf16(
-    const uint16_t*, uint16_t*, int, int, int, int, int);
 extern "C" void xdna_conv3x3w_pack_input_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
 extern "C" void xdna_conv3x3w_pack_weights_bfp16(
@@ -2348,32 +2338,41 @@ struct XdnaFullFrameConvRuntime {
     stream.instr_words = blob.size() / 4;
   }
 
-  void open(
-      const std::string& xclbin,
-      const std::string& res146,
-      const std::string& fwd292,
-      const std::string& fwd584,
-      const std::string& dx292,
-      const std::string& dx584) {
+  // Loads the program and sets the pack/unpack width (XDNA_CONV_PACK_THREADS).
+  // `tile_m` is the M tile the streams were built with (artifact manifest); the
+  // schedule is padded to whole tiles of tile_m / kBatch columns.
+  int64_t load_kernel(
+      const std::string& xclbin, const char* what, int64_t tile_m) {
     kernel = shim_kernel_load(
         xdna_device(), xclbin.c_str(), nullptr, QOS_PRIORITY_NONE);
     TORCH_CHECK(
         kernel != nullptr,
-        "failed to load full-frame XDNA Conv family: ",
-        shim_last_error());
+        "failed to load ", what, ": ", shim_last_error());
     int pack_threads = 12;
     if (const char* raw = std::getenv("XDNA_CONV_PACK_THREADS")) {
       const int parsed = std::atoi(raw);
       if (parsed > 0) pack_threads = parsed;
     }
     xdna_conv_set_threads(pack_threads);
+    TORCH_CHECK(
+        tile_m > 0 && tile_m % kBatch == 0,
+        what, ": tile M must be a positive multiple of ", kBatch, ", got ", tile_m);
+    return tile_m / kBatch;
+  }
 
-    int64_t tile_m = 32;
-    if (const char* raw = std::getenv("XDNA_FULLFRAME_TM")) {
-      const int parsed = std::atoi(raw);
-      if (parsed > 0 && parsed % kBatch == 0) tile_m = parsed;
-    }
-    const int64_t x_per_tile = tile_m / kBatch;
+  // Any stream may be empty (not loaded): the fwd292/fwd584 program of the
+  // strix_b4 artifact and the res146/dX program of the q4 resident artifact
+  // are separate xclbins.
+  void open(
+      const std::string& xclbin,
+      const std::string& res146,
+      const std::string& fwd292,
+      const std::string& fwd584,
+      const std::string& dx292,
+      const std::string& dx584,
+      int64_t tile_m) {
+    const int64_t x_per_tile = load_kernel(
+        xclbin, "full-frame XDNA Conv family", tile_m);
     const auto sched_width = [x_per_tile](int64_t w) {
       return ((w + x_per_tile - 1) / x_per_tile) * x_per_tile;
     };
@@ -2381,10 +2380,11 @@ struct XdnaFullFrameConvRuntime {
       return kBatch * h * sched_width(w);
     };
 
-    TORCH_CHECK(!res146.empty(), "full-frame residual stream is required");
-    open_stream(
-        forward_streams[0], "res146", res146,
-        128, 146, 141, sched_width(141), sched_m(146, 141), 1152);
+    if (!res146.empty()) {
+      open_stream(
+          forward_streams[0], "res146", res146,
+          128, 146, 141, sched_width(141), sched_m(146, 141), 1152);
+    }
     if (!fwd292.empty()) {
       open_stream(
           forward_streams[1], "fwd292", fwd292,
@@ -2412,28 +2412,13 @@ struct XdnaFullFrameConvRuntime {
   void open_conv11_only(
       const std::string& xclbin,
       const std::string& insts,
-      int64_t n_phys) {
-    kernel = shim_kernel_load(
-        xdna_device(), xclbin.c_str(), nullptr, QOS_PRIORITY_NONE);
-    TORCH_CHECK(
-        kernel != nullptr,
-        "failed to load fast conv11 XDNA program: ",
-        shim_last_error());
-    int pack_threads = 12;
-    if (const char* raw = std::getenv("XDNA_CONV_PACK_THREADS")) {
-      const int parsed = std::atoi(raw);
-      if (parsed > 0) pack_threads = parsed;
-    }
-    xdna_conv_set_threads(pack_threads);
+      int64_t n_phys,
+      int64_t tile_m) {
+    const int64_t x_per_tile = load_kernel(
+        xclbin, "fast conv11 XDNA program", tile_m);
     TORCH_CHECK(
         n_phys == 128 || n_phys == 256,
         "conv11 dX physical N must be 128 or 256");
-    int64_t tile_m = 32;
-    if (const char* raw = std::getenv("XDNA_FULLFRAME_TM")) {
-      const int parsed = std::atoi(raw);
-      if (parsed > 0 && parsed % kBatch == 0) tile_m = parsed;
-    }
-    const int64_t x_per_tile = tile_m / kBatch;
     const int64_t w_sched = ((564 + x_per_tile - 1) / x_per_tile) * x_per_tile;
     const int64_t m_sched = kBatch * 584 * w_sched;
     open_stream(
@@ -4633,13 +4618,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "configure_fullframe_conv_family",
       [](const std::string& xclbin,
-         const std::string& res146,
          const std::string& fwd292,
          const std::string& fwd584,
-         const std::string& dx292,
-         const std::string& dx584) {
+         int64_t tile_m) {
         auto runtime = std::make_unique<XdnaFullFrameConvRuntime>();
-        runtime->open(xclbin, res146, fwd292, fwd584, dx292, dx584);
+        runtime->open(xclbin, "", fwd292, fwd584, "", "", tile_m);
         fullframe_conv_runtime_slot() = std::move(runtime);
       });
   m.def("fullframe_conv_family_configured", []() {
@@ -4649,9 +4632,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "configure_fast_conv11_dx",
       [](const std::string& xclbin,
          const std::string& insts,
-         int64_t n_phys) {
+         int64_t n_phys,
+         int64_t tile_m) {
         auto runtime = std::make_unique<XdnaFullFrameConvRuntime>();
-        runtime->open_conv11_only(xclbin, insts, n_phys);
+        runtime->open_conv11_only(xclbin, insts, n_phys, tile_m);
         fast_conv11_runtime_slot() = std::move(runtime);
       });
   m.def("fast_conv11_dx_configured", []() {
@@ -4662,16 +4646,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       [](const std::string& xclbin,
          const std::string& res146,
          const std::string& dx292,
-         const std::string& dx584) {
+         const std::string& dx584,
+         int64_t tile_m) {
         auto runtime = std::make_unique<XdnaFullFrameConvRuntime>();
-        runtime->open(xclbin, res146, "", "", dx292, dx584);
-        fast_dx584_runtime_slot() = std::move(runtime);
-      });
-  m.def(
-      "configure_fast_dx584",
-      [](const std::string& xclbin, const std::string& dx584) {
-        auto runtime = std::make_unique<XdnaFullFrameConvRuntime>();
-        runtime->open(xclbin, dx584, "", "", "", dx584);
+        runtime->open(xclbin, res146, "", "", dx292, dx584, tile_m);
         fast_dx584_runtime_slot() = std::move(runtime);
       });
   m.def("fast_dx584_configured", []() {
