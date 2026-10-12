@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Storage growth must preserve pending/lazy values and validate the device."""
+"""Storage growth must preserve pending values and validate the device."""
 import os
 import sys
 os.environ["XDNA_CONV3X3W_SYNC_BUILD"] = "1"
@@ -39,19 +39,17 @@ for explicit in (True,False):
     check(f"prefix preserved, explicit={explicit}", torch.equal(got,reference),
           f"sum={got.float().sum().item():.0f} expected={reference.float().sum().item():.0f}")
     held.extend((g,out))
-# Eager control then unread lazy concat, with identical logical values.
-for lazy in ("0","1"):
-    os.environ["XDNA_LAZY_DECODER_VALUES"] = lazy
-    a = torch.ones(1,32,2,2,device="xdna",dtype=torch.bfloat16).contiguous(memory_format=torch.channels_last)
-    b = torch.full_like(a,2)
-    expected = torch.cat((a.cpu(),b.cpu()),1)
-    c = torch.cat((a,b),1)
-    out = torch.empty(0,device="xdna",dtype=c.dtype)
-    out.set_(c.untyped_storage(),0,(c.numel()+1,),(1,))
-    got = c.cpu()
-    check(f"concat survives shared storage growth, lazy={lazy}", torch.equal(got,expected),
-          f"sum={got.float().sum().item():.0f} expected={expected.float().sum().item():.0f}")
-    held.extend((a,b,c,out))
+# A concat that shares its storage with a grown tensor keeps its values.
+a = torch.ones(1,32,2,2,device="xdna",dtype=torch.bfloat16).contiguous(memory_format=torch.channels_last)
+b = torch.full_like(a,2)
+expected = torch.cat((a.cpu(),b.cpu()),1)
+c = torch.cat((a,b),1)
+out = torch.empty(0,device="xdna",dtype=c.dtype)
+out.set_(c.untyped_storage(),0,(c.numel()+1,),(1,))
+got = c.cpu()
+check("concat survives shared storage growth", torch.equal(got,expected),
+      f"sum={got.float().sum().item():.0f} expected={expected.float().sum().item():.0f}")
+held.extend((a,b,c,out))
 # A rejected cross-device binding must not alter its source.
 source = torch.arange(4.,dtype=torch.float32)
 destination = torch.empty(0,device="xdna",dtype=source.dtype)

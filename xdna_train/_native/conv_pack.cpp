@@ -113,54 +113,6 @@ void xdna_pack_conv3x3_halo_padded_channels_last_bf16(
   }
 }
 
-
-// Two compact channels-last tensors are logically concatenated along C and
-// nearest-upsampled by 2, then packed directly into the Conv virtual-im2col
-// halo layout. This deliberately avoids materializing either the concatenated
-// or the upsampled PyTorch tensor. C0/C1 must be multiples of 32.
-void xdna_pack_conv3x3_halo_cat2_upsample2_channels_last_bf16(
-    const uint16_t* src0,
-    int C0,
-    const uint16_t* src1,
-    int C1,
-    uint16_t* dst,
-    int B,
-    int H,
-    int W,
-    int W_sched) {
-  const int C = C0 + C1;
-  const int cb0 = C0 / 32;
-  const int cb = C / 32;
-  const int OH = H * 2;
-  const int OW = W * 2;
-  const std::size_t elems =
-      std::size_t(OH + 2) * (W_sched + 2) * cb * B * 32;
-  std::memset(dst, 0, elems * sizeof(uint16_t));
-
-#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
-  for (int oy = 0; oy < OH; ++oy) {
-    for (int ox = 0; ox < OW; ++ox) {
-      const int sy = oy >> 1;
-      const int sx = ox >> 1;
-      for (int cblock = 0; cblock < cb; ++cblock) {
-        const bool first = cblock < cb0;
-        const int local_block = first ? cblock : cblock - cb0;
-        const int SC = first ? C0 : C1;
-        const uint16_t* src = first ? src0 : src1;
-        for (int b = 0; b < B; ++b) {
-          const uint16_t* srcp =
-              src + (((std::size_t(b) * H + sy) * W + sx) * SC +
-                     local_block * 32);
-          uint16_t* dstp =
-              dst + ((((std::size_t(oy + 1) * (W_sched + 2) + (ox + 1)) *
-                        cb + cblock) * B + b) * 32);
-          std::memcpy(dstp, srcp, 32 * sizeof(uint16_t));
-        }
-      }
-    }
-  }
-}
-
 // NPU GEMM output is [Y,X_sched,B,C]. Reorder only the real W columns into
 // compact channels-last PyTorch storage [B,H,W,C]. Both source and destination
 // have C contiguous, so this is a row of small contiguous C-channel copies,

@@ -77,9 +77,6 @@ extern "C" void xdna_yxbc_to_nchw_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
 extern "C" void xdna_yxbc_to_channels_last_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
-extern "C" void xdna_pack_conv3x3_halo_cat2_upsample2_channels_last_bf16(
-    const uint16_t*, int, const uint16_t*, int, uint16_t*,
-    int, int, int, int);
 extern "C" void xdna_yxbc_slice_to_channels_last_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int);
 extern "C" void xdna_pack_conv3x3_halo_padded_channels_last_stripe_bf16(
@@ -279,25 +276,6 @@ XdnaBoCache& bo_cache() {
   return *cache;
 }
 
-enum class XdnaVirtualKind : uint8_t {
-  CatChannels4D = 1,
-  UpsampleNearest2D = 2,
-};
-
-struct XdnaVirtualValue {
-  XdnaVirtualKind kind = XdnaVirtualKind::CatChannels4D;
-  std::vector<at::Tensor> sources;
-  int64_t dim = 0;
-  std::array<int64_t, 2> output_size = {0, 0};
-  std::optional<double> scales_h;
-  std::optional<double> scales_w;
-  // The tensor the value belongs to, so it can be materialized from the
-  // storage alone (storage growth).
-  std::vector<int64_t> sizes, strides;
-  int64_t storage_offset = 0;
-  caffe2::TypeMeta dtype;
-};
-
 struct XdnaAllocation {
   uint64_t magic = kXdnaAllocationMagic;
   ShimBo* bo = nullptr;
@@ -309,12 +287,6 @@ struct XdnaAllocation {
   // Consumers fence on this future only when the storage is actually read.
   std::mutex pending_mutex;
   std::shared_future<void> pending_host_write;
-
-  // Large producer values may remain logical until a consumer actually needs
-  // their bytes. The BO remains ordinary XDNA storage, so unsupported
-  // consumers can materialize into it without changing tensor semantics.
-  std::mutex virtual_mutex;
-  std::shared_ptr<XdnaVirtualValue> virtual_value;
 
   // conv3x3w: this tensor packed for the NPU, kept for its deferred dW
   // (Conv3x3wPacked).  The tag identifies the packed view and version.
@@ -360,83 +332,6 @@ at::Tensor cpu_alias_unchecked(const at::Tensor& t) {
       options);
 }
 
-std::shared_ptr<XdnaVirtualValue> virtual_value_of(const at::Tensor& tensor) {
-  if (!tensor.defined() || tensor.device().type() != kXdnaType)
-    return nullptr;
-  auto* allocation = allocation_from_tensor(tensor);
-  std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
-  return allocation->virtual_value;
-}
-
-void set_virtual_value(
-    const at::Tensor& tensor,
-    std::shared_ptr<XdnaVirtualValue> value) {
-  auto* allocation = allocation_from_tensor(tensor);
-  value->sizes.assign(tensor.sizes().begin(), tensor.sizes().end());
-  value->strides.assign(tensor.strides().begin(), tensor.strides().end());
-  value->storage_offset = tensor.storage_offset();
-  value->dtype = tensor.dtype();
-  std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
-  // Keep the coherency state: a recycled buffer may hold CPU-dirty lines, and
-  // if this value is dropped unread the buffer must return to the cache
-  // dirty.  materialize_virtual() marks it HostDirty when it writes.
-  allocation->virtual_value = std::move(value);
-}
-
-void clear_virtual_value(XdnaAllocation* allocation) {
-  std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
-  allocation->virtual_value.reset();
-}
-
-void ensure_host_current(const at::Tensor& tensor);
-
-void materialize_virtual(
-    const at::Tensor& tensor,
-    XdnaAllocation* allocation) {
-  std::unique_lock<std::mutex> guard(allocation->virtual_mutex);
-  auto value = allocation->virtual_value;
-  if (!value)
-    return;
-
-  // Write through the producer's own view (recorded in set_virtual_value):
-  // `tensor` may be any alias of the storage (permute, narrow, a flat
-  // as_strided view, a resize_ of another view), with other dimensions.
-  auto producer_impl = c10::make_intrusive<c10::TensorImpl>(
-      c10::TensorImpl::VIEW, c10::Storage(tensor.storage()),
-      c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), value->dtype);
-  producer_impl->set_sizes_and_strides(value->sizes, value->strides);
-  producer_impl->set_storage_offset(value->storage_offset);
-  auto out_cpu = cpu_alias_unchecked(at::Tensor(std::move(producer_impl)));
-  if (value->kind == XdnaVirtualKind::CatChannels4D) {
-    int64_t offset = 0;
-    for (const auto& src : value->sources) {
-      ensure_host_current(src);
-      auto src_cpu = cpu_alias_unchecked(src);
-      const int64_t length = src.size(value->dim);
-      out_cpu.narrow(value->dim, offset, length).copy_(src_cpu);
-      offset += length;
-    }
-  } else if (value->kind == XdnaVirtualKind::UpsampleNearest2D) {
-    TORCH_CHECK(
-        value->sources.size() == 1,
-        "virtual nearest upsample expects one source");
-    const auto& src = value->sources[0];
-    ensure_host_current(src);
-    auto src_cpu = cpu_alias_unchecked(src);
-    at::upsample_nearest2d_out(
-        out_cpu,
-        src_cpu,
-        value->output_size,
-        value->scales_h,
-        value->scales_w);
-  } else {
-    TORCH_CHECK(false, "unknown XDNA virtual value kind");
-  }
-
-  allocation->virtual_value.reset();
-  allocation->coherency = XdnaCoherency::HostDirty;
-}
-
 void wait_pending_host_write(XdnaAllocation* allocation) {
   std::shared_future<void> pending;
   {
@@ -470,7 +365,6 @@ void ensure_host_current(const at::Tensor& tensor) {
   }
   auto* allocation = allocation_from_tensor(tensor);
   wait_pending_host_write(allocation);
-  materialize_virtual(tensor, allocation);
   if (allocation->coherency == XdnaCoherency::DeviceDirty) {
     TORCH_CHECK(
         shim_bo_sync_from_device(allocation->bo) == 0,
@@ -486,7 +380,6 @@ void ensure_device_current(const at::Tensor& tensor) {
   }
   auto* allocation = allocation_from_tensor(tensor);
   wait_pending_host_write(allocation);
-  materialize_virtual(tensor, allocation);
   if (allocation->coherency == XdnaCoherency::HostDirty) {
     TORCH_CHECK(
         shim_bo_sync_to_device(allocation->bo) == 0,
@@ -506,7 +399,6 @@ void prepare_npu_output(const at::Tensor& tensor) {
 void mark_host_dirty(const at::Tensor& tensor) {
   if (tensor.defined() && tensor.device().type() == kXdnaType) {
     auto* allocation = allocation_from_tensor(tensor);
-    clear_virtual_value(allocation);
     allocation->coherency = XdnaCoherency::HostDirty;
   }
 }
@@ -514,7 +406,6 @@ void mark_host_dirty(const at::Tensor& tensor) {
 void mark_device_dirty(const at::Tensor& tensor) {
   if (tensor.defined() && tensor.device().type() == kXdnaType) {
     auto* allocation = allocation_from_tensor(tensor);
-    clear_virtual_value(allocation);
     allocation->coherency = XdnaCoherency::DeviceDirty;
   }
 }
@@ -805,21 +696,6 @@ void resize_xdna_storage(c10::StorageImpl* storage, size_t newsize) {
     auto* old = static_cast<XdnaAllocation*>(storage->data_ptr().get_context());
     if (storage->data_ptr().get_deleter() == &XdnaAllocator::deleter &&
         old != nullptr && old->magic == kXdnaAllocationMagic) {
-      // An unread lazy value (XDNA_LAZY_DECODER_VALUES) has no bytes yet:
-      // write it now, through a view with the metadata it was created with.
-      std::shared_ptr<XdnaVirtualValue> value;
-      {
-        std::lock_guard<std::mutex> guard(old->virtual_mutex);
-        value = old->virtual_value;
-      }
-      if (value) {
-        auto impl = c10::make_intrusive<c10::TensorImpl>(
-            c10::Storage(c10::intrusive_ptr<c10::StorageImpl>::reclaim_copy(storage)),
-            c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), value->dtype);
-        impl->set_sizes_and_strides(value->sizes, value->strides);
-        impl->set_storage_offset(value->storage_offset);
-        materialize_virtual(at::Tensor(std::move(impl)), old);
-      }
       wait_pending_host_write(old);
       if (old->coherency == XdnaCoherency::DeviceDirty) {
         TORCH_CHECK(
@@ -1027,7 +903,7 @@ at::Tensor& set_storage_xdna_(
       self.storage().device(), "\" to a storage on different device \"",
       source.device(), "\".  This is no longer allowed; the devices must match.");
   // CPU's set_ grows a too-small storage with its own raw copy, which would
-  // copy a pending (deferred dW), device-written or lazy allocation before it
+  // copy a pending (deferred dW) or device-written allocation before it
   // is finished.  Grow it here through the XDNA path first.  An omitted stride
   // means contiguous; a malformed one is left to CPU's set_ to reject.
   const auto size_i = c10::asIntArrayRefSlow(size, __FILE__, __LINE__);
@@ -3176,105 +3052,6 @@ struct XdnaFullFrameConvRuntime {
     return out;
   }
 
-  at::Tensor forward_cat2_upsample2(
-      const at::Tensor& src0,
-      const at::Tensor& src1,
-      const at::Tensor& weight,
-      XdnaFullFrameConvStream& stream) {
-    TORCH_CHECK(
-        src0.scalar_type() == at::ScalarType::BFloat16 &&
-        src1.scalar_type() == at::ScalarType::BFloat16 &&
-        weight.scalar_type() == at::ScalarType::BFloat16,
-        "fused XDNA cat+upsample Conv requires BF16");
-    TORCH_CHECK(
-        src0.dim() == 4 && src1.dim() == 4 &&
-        src0.size(0) == kBatch && src1.size(0) == kBatch &&
-        src0.size(2) == src1.size(2) && src0.size(3) == src1.size(3) &&
-        src0.size(2) * 2 == stream.h && src0.size(3) * 2 == stream.w &&
-        src0.size(1) + src1.size(1) == stream.cin &&
-        src0.size(1) % kCBlock == 0 && src1.size(1) % kCBlock == 0,
-        "fused XDNA cat+upsample Conv shape mismatch");
-    TORCH_CHECK(
-        src0.is_contiguous(at::MemoryFormat::ChannelsLast) &&
-        src1.is_contiguous(at::MemoryFormat::ChannelsLast) &&
-        weight.is_contiguous(),
-        "fused XDNA cat+upsample Conv requires channels-last sources and contiguous weight");
-    TORCH_CHECK(
-        weight.size(0) == kCout && weight.size(1) == stream.cin &&
-        weight.size(2) == 3 && weight.size(3) == 3,
-        "fused XDNA cat+upsample Conv weight mismatch");
-
-    ensure_host_current(src0);
-    ensure_host_current(src1);
-    ensure_host_current(weight);
-
-    at::Tensor raw;
-    {
-      std::lock_guard<std::mutex> guard(mutex);
-      xdna_pack_conv3x3_halo_cat2_upsample2_channels_last_bf16(
-          static_cast<const uint16_t*>(src0.const_data_ptr()),
-          static_cast<int>(src0.size(1)),
-          static_cast<const uint16_t*>(src1.const_data_ptr()),
-          static_cast<int>(src1.size(1)),
-          static_cast<uint16_t*>(stream.a_ptr),
-          static_cast<int>(kBatch),
-          static_cast<int>(src0.size(2)),
-          static_cast<int>(src0.size(3)),
-          static_cast<int>(stream.w_sched));
-      xdna_pack_conv3x3_weight_fwd_bf16(
-          static_cast<const uint16_t*>(weight.const_data_ptr()),
-          static_cast<uint16_t*>(stream.b_ptr),
-          static_cast<int>(kCout),
-          static_cast<int>(stream.cin));
-      TORCH_CHECK(
-          shim_bo_sync_to_device(stream.a) == 0 &&
-              shim_bo_sync_to_device(stream.b) == 0,
-          "failed to sync fused cat+upsample Conv operands: ",
-          shim_last_error());
-      raw = dispatch_raw(stream, at::ScalarType::BFloat16);
-    }
-
-    ensure_host_current(raw);
-    auto out = empty_memory_format(
-        {c10::SymInt(kBatch), c10::SymInt(kCout),
-         c10::SymInt(stream.h), c10::SymInt(stream.w)},
-        at::ScalarType::BFloat16,
-        at::Layout::Strided,
-        c10::Device(kXdnaType, 0),
-        false,
-        at::MemoryFormat::ChannelsLast);
-    xdna_yxbc_to_channels_last_bf16(
-        static_cast<const uint16_t*>(raw.const_data_ptr()),
-        static_cast<uint16_t*>(out.mutable_data_ptr()),
-        static_cast<int>(kBatch), static_cast<int>(kCout),
-        static_cast<int>(stream.h), static_cast<int>(stream.w),
-        static_cast<int>(stream.w_sched));
-    mark_host_dirty(out);
-    return out;
-  }
-
-  XdnaFullFrameConvStream* find_fused_cat2_upsample2(
-      const at::Tensor& src0,
-      const at::Tensor& src1,
-      const at::Tensor& weight) {
-    if (src0.dim() != 4 || src1.dim() != 4 || weight.dim() != 4 ||
-        src0.size(0) != kBatch || src1.size(0) != kBatch ||
-        src0.size(2) != src1.size(2) || src0.size(3) != src1.size(3) ||
-        weight.size(0) != kCout || weight.size(2) != 3 || weight.size(3) != 3) {
-      return nullptr;
-    }
-    for (auto& stream : forward_streams) {
-      if (stream.instr &&
-          stream.h == src0.size(2) * 2 &&
-          stream.w == src0.size(3) * 2 &&
-          stream.cin == src0.size(1) + src1.size(1) &&
-          weight.size(1) == stream.cin) {
-        return &stream;
-      }
-    }
-    return nullptr;
-  }
-
   at::Tensor input_grad(
       const at::Tensor& grad_output,
       const at::Tensor& weight,
@@ -3767,11 +3544,6 @@ at::Tensor& bmm_out_xdna(
   return out;
 }
 
-bool lazy_decoder_values_enabled() {
-  const char* raw = std::getenv("XDNA_LAZY_DECODER_VALUES");
-  return raw != nullptr && raw[0] != 0 && std::strcmp(raw, "0") != 0;
-}
-
 // Fast layout ops.  ATen's CPU cat / nearest-upsample kernels run far below
 // memory bandwidth on this mapped memory, so the common contiguous cases are
 // plain OpenMP copy loops.  Widths come from g_host_threads, never a global
@@ -3969,28 +3741,6 @@ at::Tensor cat_xdna(
             at::MemoryFormat::ChannelsLast)
       : xdna_empty_like_shape(out_shape, dtype);
 
-  bool lazy_cat = lazy_decoder_values_enabled() &&
-      dim == 1 && ndim == 4 &&
-      dtype == at::ScalarType::BFloat16 &&
-      tensors.size() == 2 && preserve_channels_last;
-  if (lazy_cat) {
-    auto value = std::make_shared<XdnaVirtualValue>();
-    value->kind = XdnaVirtualKind::CatChannels4D;
-    value->dim = dim;
-    for (const auto& tensor : tensors) {
-      if (!tensor.is_contiguous(at::MemoryFormat::ChannelsLast) ||
-          tensor.size(1) % 32 != 0) {
-        lazy_cat = false;
-        break;
-      }
-      value->sources.push_back(tensor);
-    }
-    if (lazy_cat) {
-      set_virtual_value(out, std::move(value));
-      return out;
-    }
-  }
-
   bool fast_cat = out.is_contiguous();
   for (const auto& tensor : tensors) {
     fast_cat = fast_cat && tensor.is_contiguous();
@@ -4063,27 +3813,6 @@ at::Tensor upsample_nearest2d_xdna(
       output_size[0].guard_int(__FILE__, __LINE__),
       output_size[1].guard_int(__FILE__, __LINE__),
   };
-
-  if (lazy_decoder_values_enabled() &&
-      self.scalar_type() == at::ScalarType::BFloat16 &&
-      self.is_contiguous(at::MemoryFormat::ChannelsLast) &&
-      output_size_i[0] == self.size(2) * 2 &&
-      output_size_i[1] == self.size(3) * 2) {
-    auto source_value = virtual_value_of(self);
-    if (source_value &&
-        source_value->kind == XdnaVirtualKind::CatChannels4D &&
-        source_value->dim == 1 &&
-        source_value->sources.size() == 2) {
-      auto value = std::make_shared<XdnaVirtualValue>();
-      value->kind = XdnaVirtualKind::UpsampleNearest2D;
-      value->sources = {self};
-      value->output_size = output_size_i;
-      value->scales_h = scales_h;
-      value->scales_w = scales_w;
-      set_virtual_value(out, std::move(value));
-      return out;
-    }
-  }
 
   ensure_host_current(self);
   auto in_cpu = cpu_alias(self);
@@ -4492,37 +4221,6 @@ at::Tensor convolution_overrideable_xdna(
     }
   }
   auto& full_conv_slot = fullframe_conv_runtime_slot();
-  if (full_conv_slot &&
-      (!bias.has_value() || !bias->defined()) &&
-      stride.size() == 2 && stride[0] == 1 && stride[1] == 1 &&
-      padding.size() == 2 && padding[0] == 1 && padding[1] == 1 &&
-      dilation.size() == 2 && dilation[0] == 1 && dilation[1] == 1 &&
-      !transposed &&
-      output_padding.size() == 2 &&
-      output_padding[0] == 0 && output_padding[1] == 0 &&
-      groups == 1) {
-    auto up_value = virtual_value_of(input);
-    if (up_value &&
-        up_value->kind == XdnaVirtualKind::UpsampleNearest2D &&
-        up_value->sources.size() == 1) {
-      const auto& cat_tensor = up_value->sources[0];
-      auto cat_value = virtual_value_of(cat_tensor);
-      if (cat_value &&
-          cat_value->kind == XdnaVirtualKind::CatChannels4D &&
-          cat_value->dim == 1 &&
-          cat_value->sources.size() == 2) {
-        auto* stream = full_conv_slot->find_fused_cat2_upsample2(
-            cat_value->sources[0], cat_value->sources[1], weight);
-        if (stream) {
-          return full_conv_slot->forward_cat2_upsample2(
-              cat_value->sources[0],
-              cat_value->sources[1],
-              weight,
-              *stream);
-        }
-      }
-    }
-  }
   auto& fast_full_slot = fast_dx584_runtime_slot();
   if (fast_full_slot) {
     if (auto* stream = fast_full_slot->find_forward(
@@ -4586,129 +4284,6 @@ at::Tensor convolution_overrideable_xdna(
         groups);
   }
   return adopt_or_copy(out_cpu);
-}
-
-bool lazy_decoder_dw_enabled() {
-  const char* raw = std::getenv("XDNA_LAZY_DECODER_DW");
-  return raw != nullptr && raw[0] != 0 && std::strcmp(raw, "0") != 0;
-}
-
-std::optional<std::array<at::Tensor, 2>>
-virtual_cat2_upsample2_sources(const at::Tensor& input) {
-  auto up = virtual_value_of(input);
-  if (!up || up->kind != XdnaVirtualKind::UpsampleNearest2D ||
-      up->sources.size() != 1)
-    return std::nullopt;
-  const auto& cat_tensor = up->sources[0];
-  auto cat = virtual_value_of(cat_tensor);
-  if (!cat || cat->kind != XdnaVirtualKind::CatChannels4D ||
-      cat->dim != 1 || cat->sources.size() != 2)
-    return std::nullopt;
-  return std::array<at::Tensor, 2>{cat->sources[0], cat->sources[1]};
-}
-
-at::Tensor virtual_cat2_upsample2_weight_grad_cpu(
-    const at::Tensor& src0,
-    const at::Tensor& src1,
-    const at::Tensor& grad_output,
-    at::IntArrayRef weight_shape) {
-  TORCH_CHECK(
-      src0.device().is_cpu() && src1.device().is_cpu() &&
-          grad_output.device().is_cpu(),
-      "virtual decoder dW expects CPU aliases");
-  TORCH_CHECK(
-      src0.scalar_type() == at::ScalarType::BFloat16 &&
-          src1.scalar_type() == at::ScalarType::BFloat16 &&
-          grad_output.scalar_type() == at::ScalarType::BFloat16,
-      "virtual decoder dW expects BF16");
-  TORCH_CHECK(
-      src0.dim() == 4 && src1.dim() == 4 && grad_output.dim() == 4 &&
-          src0.size(0) == src1.size(0) &&
-          src0.size(2) == src1.size(2) &&
-          src0.size(3) == src1.size(3),
-      "virtual decoder dW source shape mismatch");
-  TORCH_CHECK(
-      weight_shape.size() == 4 && weight_shape[2] == 3 &&
-          weight_shape[3] == 3,
-      "virtual decoder dW currently supports 3x3 weights");
-
-  const int64_t batch = src0.size(0);
-  const int64_t h = src0.size(2);
-  const int64_t w = src0.size(3);
-  const int64_t cout = grad_output.size(1);
-  const int64_t oh = grad_output.size(2);
-  const int64_t ow = grad_output.size(3);
-  TORCH_CHECK(
-      oh == h * 2 && ow == w * 2,
-      "virtual decoder dW requires exact nearest 2x geometry");
-  TORCH_CHECK(
-      weight_shape[0] == cout &&
-          weight_shape[1] == src0.size(1) + src1.size(1),
-      "virtual decoder dW weight/channel mismatch");
-
-  auto result = at::empty(weight_shape, grad_output.options());
-  auto dy_hwc = grad_output.permute({0, 2, 3, 1});
-  const int64_t reduce = batch * h * w;
-  std::array<at::Tensor, 2> xflat = {
-      src0.permute({0, 2, 3, 1}).reshape({reduce, src0.size(1)}),
-      src1.permute({0, 2, 3, 1}).reshape({reduce, src1.size(1)}),
-  };
-  const std::array<int64_t, 3> offsets = {
-      0, src0.size(1), src0.size(1) + src1.size(1)};
-
-  const auto ceil_div2 = [](int64_t value) {
-    return value >= 0 ? (value + 1) / 2 : value / 2;
-  };
-
-  for (int64_t ky = 0; ky < 3; ++ky) {
-    for (int64_t kx = 0; kx < 3; ++kx) {
-      auto reduced = at::zeros(
-          {batch, h, w, cout}, grad_output.options());
-
-      for (int64_t ry = 0; ry < 2; ++ry) {
-        const int64_t yoff = ry - ky + 1;
-        const int64_t sy0 = std::max<int64_t>(0, ceil_div2(-yoff));
-        const int64_t sy1 = std::min<int64_t>(
-            h, (oh - 1 - yoff) / 2 + 1);
-        if (sy1 <= sy0)
-          continue;
-        const int64_t y0 = 2 * sy0 + yoff;
-        const int64_t y1 = 2 * sy1 + yoff;
-
-        for (int64_t rx = 0; rx < 2; ++rx) {
-          const int64_t xoff = rx - kx + 1;
-          const int64_t sx0 = std::max<int64_t>(0, ceil_div2(-xoff));
-          const int64_t sx1 = std::min<int64_t>(
-              w, (ow - 1 - xoff) / 2 + 1);
-          if (sx1 <= sx0)
-            continue;
-          const int64_t x0 = 2 * sx0 + xoff;
-          const int64_t x1 = 2 * sx1 + xoff;
-
-          reduced
-              .slice(1, sy0, sy1)
-              .slice(2, sx0, sx1)
-              .add_(
-                  dy_hwc
-                      .slice(1, y0, y1, 2)
-                      .slice(2, x0, x1, 2));
-        }
-      }
-
-      auto gflat = reduced.reshape({reduce, cout});
-      for (size_t part = 0; part < xflat.size(); ++part) {
-        auto grad_part =
-            at::mm(xflat[part].transpose(0, 1), gflat)
-                .transpose(0, 1);
-        result
-            .slice(1, offsets[part], offsets[part + 1])
-            .select(2, ky)
-            .select(2, kx)
-            .copy_(grad_part);
-      }
-    }
-  }
-  return result;
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
@@ -4800,20 +4375,6 @@ convolution_backward_overrideable_xdna(
     return !(raw != nullptr && raw[0] != 0 && std::strcmp(raw, "0") != 0);
   }();
 
-  std::optional<std::array<at::Tensor, 2>> virtual_dw_sources;
-  if (lazy_decoder_dw_enabled() &&
-      have_npu_dx && output_mask[1] &&
-      stride.size() == 2 && stride[0] == 1 && stride[1] == 1 &&
-      padding.size() == 2 && padding[0] == 1 && padding[1] == 1 &&
-      dilation.size() == 2 && dilation[0] == 1 && dilation[1] == 1 &&
-      !transposed &&
-      output_padding.size() == 2 &&
-      output_padding[0] == 0 && output_padding[1] == 0 &&
-      groups == 1 &&
-      weight.dim() == 4 && weight.size(2) == 3 && weight.size(3) == 3) {
-    virtual_dw_sources = virtual_cat2_upsample2_sources(input);
-  }
-
   // General heterogeneous scheduling path: while NPU computes the
   // dependency-critical dX, let oneDNN compute the independent dW on CPU from
   // zero-copy aliases of the same host-visible XRT BOs. The weight gradient is
@@ -4831,22 +4392,20 @@ convolution_backward_overrideable_xdna(
     ensure_host_current(grad_output);
     ensure_host_current(weight);
     auto go_cpu = cpu_alias(grad_output);
-    at::Tensor input_cpu;
-    if (!virtual_dw_sources.has_value()) {
-      ensure_host_current(input);
-      input_cpu = cpu_alias(input);
-      if (input.dim() == 4) {
-        const bool input_cl =
-            input.is_contiguous(at::MemoryFormat::ChannelsLast);
-        const bool grad_cl =
-            grad_output.is_contiguous(at::MemoryFormat::ChannelsLast);
-        if (input_cl && !grad_cl) {
-          go_cpu = go_cpu.contiguous(at::MemoryFormat::ChannelsLast);
-        } else if (!input_cl && grad_cl && input.is_contiguous()) {
-          go_cpu = go_cpu.contiguous(at::MemoryFormat::Contiguous);
-        }
+    ensure_host_current(input);
+    auto input_cpu = cpu_alias(input);
+    if (input.dim() == 4) {
+      const bool input_cl =
+          input.is_contiguous(at::MemoryFormat::ChannelsLast);
+      const bool grad_cl =
+          grad_output.is_contiguous(at::MemoryFormat::ChannelsLast);
+      if (input_cl && !grad_cl) {
+        go_cpu = go_cpu.contiguous(at::MemoryFormat::ChannelsLast);
+      } else if (!input_cl && grad_cl && input.is_contiguous()) {
+        go_cpu = go_cpu.contiguous(at::MemoryFormat::Contiguous);
       }
     }
+
     auto input_cpu_keep = input_cpu;
     auto go_cpu_keep = go_cpu;
     auto weight_cpu_keep = cpu_alias(weight);
@@ -4857,99 +4416,75 @@ convolution_backward_overrideable_xdna(
         output_padding.begin(), output_padding.end());
     const c10::SymInt groups_v = groups;
 
-    if (virtual_dw_sources.has_value()) {
-      const auto src0_xdna = (*virtual_dw_sources)[0];
-      const auto src1_xdna = (*virtual_dw_sources)[1];
-      ensure_host_current(src0_xdna);
-      ensure_host_current(src1_xdna);
-      auto src0_cpu = cpu_alias(src0_xdna);
-      auto src1_cpu = cpu_alias(src1_xdna);
-      std::vector<int64_t> weight_shape(
-          weight.sizes().begin(), weight.sizes().end());
-      overlapped_dw = std::async(
-          std::launch::async,
-          [src0_cpu,
-           src1_cpu,
-           go_cpu_keep,
-           src0_xdna,
-           src1_xdna,
-           weight_shape = std::move(weight_shape)]() mutable {
-            sync_host_threads();
-            return virtual_cat2_upsample2_weight_grad_cpu(
-                src0_cpu, src1_cpu, go_cpu_keep, weight_shape);
-          });
-      has_overlapped_dw = true;
-    } else {
-      overlapped_dw = std::async(
-          std::launch::async,
-          [go_cpu_keep,
-           input_cpu_keep,
-           weight_cpu_keep,
-           stride_v = std::move(stride_v),
-           padding_v = std::move(padding_v),
-           dilation_v = std::move(dilation_v),
-           transposed,
-           output_padding_v = std::move(output_padding_v),
-           groups_v]() mutable {
-            sync_host_threads();
-            const std::array<bool, 3> dw_mask = {false, true, false};
+    overlapped_dw = std::async(
+        std::launch::async,
+        [go_cpu_keep,
+         input_cpu_keep,
+         weight_cpu_keep,
+         stride_v = std::move(stride_v),
+         padding_v = std::move(padding_v),
+         dilation_v = std::move(dilation_v),
+         transposed,
+         output_padding_v = std::move(output_padding_v),
+         groups_v]() mutable {
+          sync_host_threads();
+          const std::array<bool, 3> dw_mask = {false, true, false};
 
-            // The CPU and NPU share the same LPDDR/fabric while dW and dX
-            // overlap. For the validated batch-4 training path, reducing dW
-            // one sample at a time gives oneDNN a smaller working set and
-            // lowers instantaneous memory pressure enough to improve both the
-            // CPU dW and the concurrent NPU dX critical region. Keep this
-            // tunable: 0 disables, positive values select a batch chunk.
-            int64_t batch_chunk =
-                input_cpu_keep.dim() == 4 && input_cpu_keep.size(0) == 4 ? 1 : 0;
-            if (const char* raw = std::getenv("XDNA_CPU_DW_BATCH_CHUNK")) {
-              const long parsed = std::strtol(raw, nullptr, 10);
-              batch_chunk = parsed > 0 ? parsed : 0;
+          // The CPU and NPU share the same LPDDR/fabric while dW and dX
+          // overlap. For the validated batch-4 training path, reducing dW
+          // one sample at a time gives oneDNN a smaller working set and
+          // lowers instantaneous memory pressure enough to improve both the
+          // CPU dW and the concurrent NPU dX critical region. Keep this
+          // tunable: 0 disables, positive values select a batch chunk.
+          int64_t batch_chunk =
+              input_cpu_keep.dim() == 4 && input_cpu_keep.size(0) == 4 ? 1 : 0;
+          if (const char* raw = std::getenv("XDNA_CPU_DW_BATCH_CHUNK")) {
+            const long parsed = std::strtol(raw, nullptr, 10);
+            batch_chunk = parsed > 0 ? parsed : 0;
+          }
+          if (batch_chunk > 0 &&
+              input_cpu_keep.dim() == 4 &&
+              go_cpu_keep.dim() == 4 &&
+              input_cpu_keep.size(0) == go_cpu_keep.size(0) &&
+              input_cpu_keep.size(0) > batch_chunk) {
+            auto accum = at::zeros(
+                weight_cpu_keep.sizes(),
+                weight_cpu_keep.options().dtype(at::ScalarType::Float));
+            const int64_t batch = input_cpu_keep.size(0);
+            for (int64_t b0 = 0; b0 < batch; b0 += batch_chunk) {
+              const int64_t b1 = std::min<int64_t>(batch, b0 + batch_chunk);
+              auto grads = at::_ops::convolution_backward::call(
+                  go_cpu_keep.slice(0, b0, b1),
+                  input_cpu_keep.slice(0, b0, b1),
+                  weight_cpu_keep,
+                  std::nullopt,
+                  c10::SymIntArrayRef(stride_v),
+                  c10::SymIntArrayRef(padding_v),
+                  c10::SymIntArrayRef(dilation_v),
+                  transposed,
+                  c10::SymIntArrayRef(output_padding_v),
+                  groups_v,
+                  dw_mask);
+              accum.add_(std::get<1>(grads).to(at::ScalarType::Float));
             }
-            if (batch_chunk > 0 &&
-                input_cpu_keep.dim() == 4 &&
-                go_cpu_keep.dim() == 4 &&
-                input_cpu_keep.size(0) == go_cpu_keep.size(0) &&
-                input_cpu_keep.size(0) > batch_chunk) {
-              auto accum = at::zeros(
-                  weight_cpu_keep.sizes(),
-                  weight_cpu_keep.options().dtype(at::ScalarType::Float));
-              const int64_t batch = input_cpu_keep.size(0);
-              for (int64_t b0 = 0; b0 < batch; b0 += batch_chunk) {
-                const int64_t b1 = std::min<int64_t>(batch, b0 + batch_chunk);
-                auto grads = at::_ops::convolution_backward::call(
-                    go_cpu_keep.slice(0, b0, b1),
-                    input_cpu_keep.slice(0, b0, b1),
-                    weight_cpu_keep,
-                    std::nullopt,
-                    c10::SymIntArrayRef(stride_v),
-                    c10::SymIntArrayRef(padding_v),
-                    c10::SymIntArrayRef(dilation_v),
-                    transposed,
-                    c10::SymIntArrayRef(output_padding_v),
-                    groups_v,
-                    dw_mask);
-                accum.add_(std::get<1>(grads).to(at::ScalarType::Float));
-              }
-              return accum.to(weight_cpu_keep.scalar_type());
-            }
+            return accum.to(weight_cpu_keep.scalar_type());
+          }
 
-            auto grads = at::_ops::convolution_backward::call(
-                go_cpu_keep,
-                input_cpu_keep,
-                weight_cpu_keep,
-                std::nullopt,
-                c10::SymIntArrayRef(stride_v),
-                c10::SymIntArrayRef(padding_v),
-                c10::SymIntArrayRef(dilation_v),
-                transposed,
-                c10::SymIntArrayRef(output_padding_v),
-                groups_v,
-                dw_mask);
-            return std::get<1>(grads);
-          });
-      has_overlapped_dw = true;
-    }
+          auto grads = at::_ops::convolution_backward::call(
+              go_cpu_keep,
+              input_cpu_keep,
+              weight_cpu_keep,
+              std::nullopt,
+              c10::SymIntArrayRef(stride_v),
+              c10::SymIntArrayRef(padding_v),
+              c10::SymIntArrayRef(dilation_v),
+              transposed,
+              c10::SymIntArrayRef(output_padding_v),
+              groups_v,
+              dw_mask);
+          return std::get<1>(grads);
+        });
+    has_overlapped_dw = true;
     cpu_mask[1] = false;
   }
 
@@ -5590,19 +5125,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fast_dx584_configured", []() {
     return static_cast<bool>(fast_dx584_runtime_slot());
   });
-  m.def(
-      "fullframe_cat2_upsample2_forward",
-      [](const at::Tensor& src0,
-         const at::Tensor& src1,
-         const at::Tensor& weight) {
-        auto& slot = fullframe_conv_runtime_slot();
-        TORCH_CHECK(slot, "full-frame XDNA Conv family is not configured");
-        auto* stream = slot->find_fused_cat2_upsample2(src0, src1, weight);
-        TORCH_CHECK(
-            stream != nullptr,
-            "no compatible full-frame XDNA fused cat+upsample2 forward stream");
-        return slot->forward_cat2_upsample2(src0, src1, weight, *stream);
-      });
   m.def("reset_mapped_cpu_stats", []() {
     std::lock_guard<std::mutex> guard(mapped_cpu_stats_mutex());
     mapped_cpu_stats_map().clear();

@@ -163,14 +163,6 @@ XDNA_CPU_DW_BATCH_CHUNK=0 python ...   # disable
 XDNA_CPU_DW_BATCH_CHUNK=2 python ...   # alternate chunk size
 ```
 
-An optional virtual concat + nearest-upsample representation is available:
-
-```bash
-XDNA_LAZY_DECODER_VALUES=1 python ...
-```
-
-It avoids materializing large decoder intermediates when the following supported Conv can consume the virtual value. It is intentionally not the default yet because its end-to-end gain is smaller and more variable than the core path.
-
 ## Current measured checkpoint
 
 On the development Ryzen AI 9 365 / Strix machine, XRT 2.21.75, BF16, 16 CPU threads, performance power profile, the real full-frame DRIVE `MyNet(3,1,7)` training+validation loop has recently measured approximately:
