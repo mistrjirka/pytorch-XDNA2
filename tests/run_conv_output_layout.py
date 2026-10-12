@@ -18,9 +18,11 @@ for h in [18,36]:
  conv_x.to("xdna");bn_x.to("xdna")
  x=x_cpu.detach().to("xdna").requires_grad_(True)
  dyx=dy.to("xdna")
+ # XDNA_CONV_OUTPUT_NCHW only affects the older fixed-shape conv family; the
+ # conv3x3w family (preferred for these shapes) always returns NCHW.  Either
+ # way the raw-layout result must hold the same values.
  os.environ["XDNA_CONV_OUTPUT_NCHW"]="0"
  old=conv_x(x)
- assert not old.is_contiguous(), old.stride()
  os.environ["XDNA_CONV_OUTPUT_NCHW"]="1"
  result=conv_x(x)
  assert result.is_contiguous(),result.stride()
@@ -32,6 +34,9 @@ for h in [18,36]:
    ("conv_weight_gradient",conv_x.weight.grad.cpu(),conv_cpu.weight.grad),
    ("conv_input_gradient",x.grad.cpu(),x_cpu.grad),
  ]:
-  torch.testing.assert_close(actual,expected,rtol=.02,atol=.02)
-  print(f"PASS h={h} {key}; max_abs_diff={(actual.float()-expected.float()).abs().max().item():.6f}",flush=True)
+  # NPU convs use bfp16 operands (shared 8-value exponent), so compare like
+  # run_conv3x3w_torch.py: relative L2 error, not elementwise bf16 tolerance.
+  err=((actual.float()-expected.float()).norm()/expected.float().norm()).item()
+  assert err<0.02,(key,err)
+  print(f"PASS h={h} {key}; rel_err={err:.4f}",flush=True)
  print("PASS all h",h,flush=True)

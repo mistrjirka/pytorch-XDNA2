@@ -269,8 +269,11 @@ noise (`benchmarks/bfp16_training_gate.py`).
   `XDNA_CONV3X3W_MIN_MACS`, `XDNA_CONV3X3W_DW_MIN_MACS`,
   `XDNA_CONV3X3W_WEIGHT_CACHE=0`, `XDNA_CONV3X3W_SYNC_BUILD=1` (build before
   the first call, for tests).
-- Tests: `tests/run_conv3x3w_pack.py`, `tests/run_conv3x3w_torch.py`,
-  `tests/run_conv3x3w_hw.py`, `tests/run_conv3x3w_dw_hw.py`.
+- Tests: `tests/run_conv3x3w_pack.py`, `tests/run_conv3x3w_torch.py`
+  (includes the weight cache under every optimizer, fused ones too),
+  `tests/run_conv3x3w_hw.py`, `tests/run_conv3x3w_dw_hw.py`,
+  `tests/run_view_safety.py` (out-of-bounds `as_strided`, overlapping
+  `copy_`, `unfold` as a view).
 
 ### Never slower than the CPU: what the backend does for every model
 

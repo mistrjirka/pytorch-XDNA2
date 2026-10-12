@@ -2,7 +2,10 @@
 #include <ATen/EmptyTensor.h>
 #include <ATen/InferSize.h>
 #include <ATen/TensorUtils.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/native/CPUFallback.h>
+#include <ATen/native/Resize.h>
+#include <ATen/ops/unfold_native.h>
 #include <ATen/ops/convolution_ops.h>
 #include <ATen/ops/convolution_backward_ops.h>
 #include <ATen/ops/mm_ops.h>
@@ -1056,9 +1059,11 @@ at::Tensor make_alias(
       c10::Storage(self.storage()),
       self.key_set(),
       self.dtype());
-  impl->set_sizes_and_strides(size, stride);
-  impl->set_storage_offset(storage_offset.expect_int());
-  return at::Tensor(std::move(impl));
+  at::Tensor result(std::move(impl));
+  // Same checks as CPU as_strided: no negative offset or stride, and the view
+  // must stay inside the storage, so no view can reach past the allocation.
+  at::native::setStrided(result, size, stride, std::move(storage_offset));
+  return result;
 }
 
 at::Tensor as_strided_xdna(
@@ -1176,6 +1181,15 @@ at::Tensor copy_from(
     const at::Tensor& src,
     const at::Tensor& dst,
     bool) {
+  // Like CPU copy_: a partially overlapping source would be read after it was
+  // overwritten (and memcpy on overlap is undefined).  Copying onto itself is
+  // a no-op.
+  at::assert_no_partial_overlap(dst, src);
+  if (src.is_same(dst) ||
+      (at::get_overlap_status(dst, src) == at::MemOverlapStatus::Full &&
+       src.strides().equals(dst.strides()) && src.dtype() == dst.dtype())) {
+    return dst;
+  }
   host_storage_copy(src, dst);
   return dst;
 }
@@ -5415,6 +5429,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("as_strided", TORCH_FN(as_strided_xdna));
   m.impl("_reshape_alias", TORCH_FN(reshape_alias_xdna));
   m.impl("view", TORCH_FN(view_xdna));
+  m.impl("unfold", TORCH_FN(at::native::unfold));
   m.impl("resize_", TORCH_FN(resize_xdna_));
   m.impl("mm", TORCH_FN(mm_xdna));
   m.impl("leaky_relu", TORCH_FN(leaky_relu_xdna));

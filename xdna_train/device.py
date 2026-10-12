@@ -381,9 +381,13 @@ def register_xdna_device() -> None:
 
         cpu_islands.install()
     _start_npu_mode_selection()
-    if os.environ.get("XDNA_FUSED_OPTIMIZER", "1") == "1":
-        from torch.optim.optimizer import register_optimizer_step_pre_hook
+    from torch.optim.optimizer import (
+        register_optimizer_step_post_hook,
+        register_optimizer_step_pre_hook,
+    )
 
+    register_optimizer_step_post_hook(_bump_fused_param_versions)
+    if os.environ.get("XDNA_FUSED_OPTIMIZER", "1") == "1":
         register_optimizer_step_pre_hook(_prefer_fused_optimizer)
     _INITIALIZED = True
 
@@ -422,6 +426,22 @@ def _prefer_fused_optimizer(optimizer, args, kwargs) -> None:
             group["fused"] = True
 
 
+def _bump_fused_param_versions(optimizer, args, kwargs) -> None:
+    """Mark XDNA parameters updated by a fused optimizer step as modified.
+
+    The fused kernels (`_fused_adam_` and friends) write the parameters through
+    the CPU fallback without bumping their autograd version counters.  The NPU
+    convolution weight cache keys on that counter, so without this every NPU
+    conv kept using the weights it first saw while the optimizer moved on.
+    """
+    for group in optimizer.param_groups:
+        if not group.get("fused"):
+            continue
+        params = [p for p in group["params"] if p.device.type == "xdna"]
+        if params:
+            torch.autograd.graph.increment_version(params)
+
+
 # --------------------------------------------------------------------------
 # Step autotuner: which NPU paths pay off for this model.
 # --------------------------------------------------------------------------
@@ -456,11 +476,15 @@ class _StepAutotuner:
         self.timed = 0          # timed steps in this block
         self.samples: dict[int, list[float]] = {m: [] for m in (2, 1, 0)}
         self.result: dict | None = None
-        self.handle = None
+        self.active = True
 
     def __call__(self, optimizer, args, kwargs) -> None:
         import time
 
+        # The hook stays registered once done: removing it from inside a step
+        # mutates the post-hook dict PyTorch is iterating over.
+        if not self.active:
+            return
         if self.optimizer_id is None:
             self.optimizer_id = id(optimizer)
         if id(optimizer) != self.optimizer_id:
@@ -498,9 +522,7 @@ class _StepAutotuner:
             best = 0
         _C.set_npu_mode(best)
         self.result = {"mode": best, "step_ms": med, "samples": self.samples}
-        if self.handle is not None:
-            self.handle.remove()
-            self.handle = None
+        self.active = False
         if os.environ.get("XDNA_AUTOTUNE_VERBOSE", "0") == "1":
             times = ", ".join(f"{NPU_MODES[m]} {med[m]:.1f}" for m in (2, 1, 0))
             print(f"xdna: using {NPU_MODES[best]} (median step ms: {times})",
@@ -528,7 +550,7 @@ def _start_npu_mode_selection() -> None:
     )
     from torch.optim.optimizer import register_optimizer_step_post_hook
 
-    _AUTOTUNER.handle = register_optimizer_step_post_hook(_AUTOTUNER)
+    register_optimizer_step_post_hook(_AUTOTUNER)
 
 
 def autotune_result() -> dict | None:
@@ -541,9 +563,8 @@ def set_npu_mode(mode: int) -> None:
     """2: all NPU paths, 1: no NPU weight gradients, 0: CPU only.  Stops the
     step autotuner."""
     register_xdna_device()
-    if _AUTOTUNER is not None and _AUTOTUNER.handle is not None:
-        _AUTOTUNER.handle.remove()
-        _AUTOTUNER.handle = None
+    if _AUTOTUNER is not None:
+        _AUTOTUNER.active = False
     _C.set_npu_mode(int(mode))
 
 
