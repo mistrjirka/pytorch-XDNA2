@@ -1169,22 +1169,6 @@ std::unique_ptr<XdnaGemmRuntime>& gemm_runtime_slot() {
   return *slot;
 }
 
-struct XdnaConvStream {
-  std::string name;
-  int64_t cin = 0;
-  int64_t h = 0;
-  int64_t m_sched = 0;
-  int64_t k_gemm = 0;
-  ShimBo* instr = nullptr;
-  ShimBo* a = nullptr;
-  ShimBo* b = nullptr;
-  ShimBo* tmp = nullptr;
-  ShimBo* trace = nullptr;
-  void* a_ptr = nullptr;
-  void* b_ptr = nullptr;
-  size_t instr_words = 0;
-};
-
 struct MappedCpuStat {
   uint64_t calls = 0;
   uint64_t total_ns = 0;
@@ -1238,394 +1222,11 @@ class ScopedMappedCpu {
   std::chrono::steady_clock::time_point start_{};
 };
 
-struct XdnaConvRuntime {
-  static constexpr int64_t kBatch = 40;
-  static constexpr int64_t kCout = 128;
-  static constexpr int64_t kCBlock = 32;
-
-  ShimKernel* kernel = nullptr;
-  std::array<XdnaConvStream, 2> forward_streams;
-  std::array<XdnaConvStream, 2> dx_streams;
-  std::mutex mutex;
-
-  static void close_stream(XdnaConvStream& stream) {
-    for (auto* bo : {stream.instr, stream.a, stream.b, stream.tmp, stream.trace}) {
-      if (bo) shim_bo_free(bo);
-    }
-    stream = XdnaConvStream{};
-  }
-
-  ~XdnaConvRuntime() {
-    for (auto& stream : forward_streams) close_stream(stream);
-    for (auto& stream : dx_streams) close_stream(stream);
-    if (kernel) shim_kernel_close(kernel);
-  }
-
-  static std::vector<char> read_file(const std::string& path) {
-    return XdnaGemmRuntime::read_file(path);
-  }
-
-  static size_t a_elems(
-      int64_t cin, int64_t h, int64_t m_sched, int64_t k_gemm) {
-    const int64_t halo =
-        (h + 2) * (h + 2) * (cin / kCBlock) * kBatch * kCBlock;
-    const int64_t real_m = kBatch * h * h;
-    return static_cast<size_t>(
-        halo + std::max<int64_t>(0, m_sched - real_m) * k_gemm);
-  }
-
-  void open_stream(
-      XdnaConvStream& stream,
-      const std::string& name,
-      const std::string& path,
-      int64_t cin,
-      int64_t h,
-      int64_t m_sched,
-      int64_t k_gemm) {
-    auto blob = read_file(path);
-    TORCH_CHECK(blob.size() % 4 == 0, "Conv stream is not word aligned: ", path);
-    stream.name = name;
-    stream.cin = cin;
-    stream.h = h;
-    stream.m_sched = m_sched;
-    stream.k_gemm = k_gemm;
-    const int gid_instr = shim_kernel_group_id(kernel, 1);
-    const int gid_tmp = shim_kernel_group_id(kernel, 6);
-    const int gid_trace = shim_kernel_group_id(kernel, 7);
-    stream.instr = shim_bo_alloc(
-        xdna_device(), kernel, blob.size(), 1, gid_instr);
-    stream.a = shim_bo_alloc(
-        xdna_device(), kernel, a_elems(cin, h, m_sched, k_gemm) * 2, 2, 0);
-    stream.b = shim_bo_alloc(
-        xdna_device(), kernel, static_cast<size_t>(k_gemm * kCout * 2), 2, 0);
-    stream.tmp = shim_bo_alloc(xdna_device(), kernel, 1, 2, gid_tmp);
-    stream.trace = shim_bo_alloc(xdna_device(), kernel, 4, 2, gid_trace);
-    TORCH_CHECK(
-        stream.instr && stream.a && stream.b && stream.tmp && stream.trace,
-        "failed to allocate XDNA Conv buffers: ",
-        shim_last_error());
-    TORCH_CHECK(
-        shim_bo_write(stream.instr, blob.data(), blob.size(), 0) == 0,
-        "failed to write Conv instructions: ",
-        shim_last_error());
-    TORCH_CHECK(
-        shim_bo_sync_to_device(stream.instr) == 0,
-        "failed to sync Conv instructions: ",
-        shim_last_error());
-    stream.a_ptr = shim_bo_map(stream.a);
-    stream.b_ptr = shim_bo_map(stream.b);
-    TORCH_CHECK(
-        stream.a_ptr && stream.b_ptr,
-        "failed to map XDNA Conv staging buffers: ",
-        shim_last_error());
-    std::memset(
-        stream.a_ptr, 0, a_elems(cin, h, m_sched, k_gemm) * 2);
-    std::memset(
-        stream.b_ptr, 0, static_cast<size_t>(k_gemm * kCout * 2));
-    stream.instr_words = blob.size() / 4;
-  }
-
-  void open(
-      const std::string& xclbin,
-      const std::string& fwd18,
-      const std::string& dx18,
-      const std::string& fwd36,
-      const std::string& dx36,
-      int64_t m_sched18,
-      int64_t m_sched36) {
-    kernel = shim_kernel_load(
-        xdna_device(), xclbin.c_str(), nullptr, QOS_PRIORITY_NONE);
-    TORCH_CHECK(kernel != nullptr, "failed to load XDNA Conv family: ", shim_last_error());
-    int pack_threads = 12;
-    if (const char* raw = std::getenv("XDNA_CONV_PACK_THREADS")) {
-      const int parsed = std::atoi(raw);
-      if (parsed > 0) pack_threads = parsed;
-    }
-    xdna_conv_set_threads(pack_threads);
-    // Scheduled GEMM rows come from the artifact manifest: they depend on
-    // the tile height the streams were built with (padding to whole tiles).
-    open_stream(
-        forward_streams[0], "fwd18", fwd18, 256, 18, m_sched18, 2304);
-    open_stream(
-        dx_streams[0], "dx18", dx18, 128, 18, m_sched18, 1152);
-    open_stream(
-        forward_streams[1], "fwd36", fwd36, 256, 36, m_sched36, 2304);
-    open_stream(
-        dx_streams[1], "dx36", dx36, 128, 36, m_sched36, 1152);
-  }
-
-  XdnaConvStream* find_forward(
-      const at::Tensor& input,
-      const at::Tensor& weight,
-      c10::SymIntArrayRef stride,
-      c10::SymIntArrayRef padding,
-      c10::SymIntArrayRef dilation,
-      bool transposed,
-      c10::SymIntArrayRef output_padding,
-      c10::SymInt groups,
-      const std::optional<at::Tensor>& bias) {
-    if (bias.has_value() && bias->defined()) return nullptr;
-    if (input.scalar_type() != at::ScalarType::BFloat16 ||
-        weight.scalar_type() != at::ScalarType::BFloat16 ||
-        !input.is_contiguous() || !weight.is_contiguous() ||
-        input.dim() != 4 || weight.dim() != 4 ||
-        input.size(0) != kBatch || input.size(1) != 256 ||
-        weight.size(0) != kCout || weight.size(1) != 256 ||
-        weight.size(2) != 3 || weight.size(3) != 3 ||
-        input.size(2) != input.size(3) ||
-        stride.size() != 2 || stride[0] != 1 || stride[1] != 1 ||
-        padding.size() != 2 || padding[0] != 1 || padding[1] != 1 ||
-        dilation.size() != 2 || dilation[0] != 1 || dilation[1] != 1 ||
-        transposed ||
-        output_padding.size() != 2 ||
-        output_padding[0] != 0 || output_padding[1] != 0 ||
-        groups != 1) {
-      return nullptr;
-    }
-    const int64_t h = input.size(2);
-    for (auto& stream : forward_streams) {
-      if (stream.h == h) return &stream;
-    }
-    return nullptr;
-  }
-
-  XdnaConvStream* find_dx(
-      const at::Tensor& grad_output,
-      const at::Tensor& weight,
-      c10::SymIntArrayRef stride,
-      c10::SymIntArrayRef padding,
-      c10::SymIntArrayRef dilation,
-      bool transposed,
-      c10::SymIntArrayRef output_padding,
-      c10::SymInt groups) {
-    if (grad_output.scalar_type() != at::ScalarType::BFloat16 ||
-        weight.scalar_type() != at::ScalarType::BFloat16 ||
-        grad_output.dim() != 4 || weight.dim() != 4 ||
-        grad_output.size(0) != kBatch || grad_output.size(1) != kCout ||
-        weight.size(0) != kCout || weight.size(1) != 256 ||
-        weight.size(2) != 3 || weight.size(3) != 3 ||
-        grad_output.size(2) != grad_output.size(3) ||
-        !weight.is_contiguous() ||
-        stride.size() != 2 || stride[0] != 1 || stride[1] != 1 ||
-        padding.size() != 2 || padding[0] != 1 || padding[1] != 1 ||
-        dilation.size() != 2 || dilation[0] != 1 || dilation[1] != 1 ||
-        transposed ||
-        output_padding.size() != 2 ||
-        output_padding[0] != 0 || output_padding[1] != 0 ||
-        groups != 1) {
-      return nullptr;
-    }
-    const int64_t h = grad_output.size(2);
-    for (auto& stream : dx_streams) {
-      if (stream.h == h) return &stream;
-    }
-    return nullptr;
-  }
-
-  at::Tensor input_grad(
-      const at::Tensor& grad_output,
-      const at::Tensor& weight,
-      XdnaConvStream& stream) {
-    ensure_host_current(grad_output);
-    ensure_host_current(weight);
-    auto go_cpu = cpu_alias(grad_output);
-    if (!go_cpu.is_contiguous()) {
-      go_cpu = go_cpu.contiguous();
-    }
-    auto weight_cpu = cpu_alias(weight);
-    TORCH_CHECK(weight_cpu.is_contiguous(), "XDNA Conv weight must be contiguous");
-
-    const int64_t h = stream.h;
-    auto out = empty_memory_format(
-        {
-            c10::SymInt(kBatch),
-            c10::SymInt(256),
-            c10::SymInt(h),
-            c10::SymInt(h),
-        },
-        at::ScalarType::BFloat16,
-        at::Layout::Strided,
-        c10::Device(kXdnaType, 0),
-        false,
-        at::MemoryFormat::Contiguous);
-    auto out_cpu = cpu_alias(out);
-
-    std::lock_guard<std::mutex> guard(mutex);
-    xdna_pack_conv3x3_halo_bf16(
-        static_cast<const uint16_t*>(go_cpu.const_data_ptr()),
-        static_cast<uint16_t*>(stream.a_ptr),
-        static_cast<int>(kBatch),
-        static_cast<int>(kCout),
-        static_cast<int>(h),
-        static_cast<int>(h));
-    TORCH_CHECK(
-        shim_bo_sync_to_device(stream.a) == 0,
-        "failed to sync XDNA Conv dX activation: ",
-        shim_last_error());
-
-    for (int slice = 0; slice < 2; ++slice) {
-      const int start = slice * static_cast<int>(kCout);
-      xdna_pack_conv3x3_weight_dx_slice_bf16(
-          static_cast<const uint16_t*>(weight_cpu.const_data_ptr()),
-          static_cast<uint16_t*>(stream.b_ptr),
-          static_cast<int>(kCout),
-          256,
-          start,
-          static_cast<int>(kCout));
-      TORCH_CHECK(
-          shim_bo_sync_to_device(stream.b) == 0,
-          "failed to sync XDNA Conv dX weights: ",
-          shim_last_error());
-
-      auto raw = empty_memory_format(
-          {c10::SymInt(stream.m_sched), c10::SymInt(kCout)},
-          at::ScalarType::BFloat16,
-          at::Layout::Strided,
-          c10::Device(kXdnaType, 0),
-          false,
-          at::MemoryFormat::Contiguous);
-      prepare_npu_output(raw);
-      auto* raw_alloc = allocation_from_tensor(raw);
-      ScopedMappedCpu run_phase("npu_conv.dx.run");
-      TORCH_CHECK(
-          shim_run_matmul8(
-              kernel,
-              3,
-              stream.instr,
-              stream.instr_words,
-              stream.a,
-              stream.b,
-              raw_alloc->bo,
-              stream.tmp,
-              stream.trace) == 0,
-          "XDNA Conv dX dispatch failed: ",
-          shim_last_error());
-      mark_device_dirty(raw);
-      ensure_host_current(raw);
-
-      xdna_yxbc_to_nchw_bf16(
-          static_cast<const uint16_t*>(raw.const_data_ptr()),
-          static_cast<uint16_t*>(out_cpu.data_ptr()),
-          static_cast<int>(kBatch),
-          static_cast<int>(kCout),
-          static_cast<int>(h * h),
-          256,
-          start);
-    }
-
-    mark_host_dirty(out);
-    return out;
-  }
-
-  at::Tensor forward(
-      const at::Tensor& input,
-      const at::Tensor& weight,
-      XdnaConvStream& stream) {
-    ensure_host_current(input);
-    ensure_host_current(weight);
-    auto pack_phase = std::make_optional<ScopedMappedCpu>("npu_conv.fwd.pack+sync");
-    xdna_pack_conv3x3_halo_bf16(
-        static_cast<const uint16_t*>(input.const_data_ptr()),
-        static_cast<uint16_t*>(stream.a_ptr),
-        static_cast<int>(kBatch),
-        static_cast<int>(stream.cin),
-        static_cast<int>(stream.h),
-        static_cast<int>(stream.h));
-    xdna_pack_conv3x3_weight_fwd_bf16(
-        static_cast<const uint16_t*>(weight.const_data_ptr()),
-        static_cast<uint16_t*>(stream.b_ptr),
-        static_cast<int>(kCout),
-        static_cast<int>(stream.cin));
-    TORCH_CHECK(
-        shim_bo_sync_to_device(stream.a) == 0 &&
-            shim_bo_sync_to_device(stream.b) == 0,
-        "failed to sync XDNA Conv operands: ",
-        shim_last_error());
-    pack_phase.reset();
-
-    auto raw = empty_memory_format(
-        {c10::SymInt(stream.m_sched), c10::SymInt(kCout)},
-        at::ScalarType::BFloat16,
-        at::Layout::Strided,
-        c10::Device(kXdnaType, 0),
-        false,
-        at::MemoryFormat::Contiguous);
-    prepare_npu_output(raw);
-    auto* out = allocation_from_tensor(raw);
-    {
-      ScopedMappedCpu run_phase("npu_conv.fwd.run");
-      std::lock_guard<std::mutex> guard(mutex);
-      TORCH_CHECK(
-          shim_run_matmul8(
-              kernel,
-              3,
-              stream.instr,
-              stream.instr_words,
-              stream.a,
-              stream.b,
-              out->bo,
-              stream.tmp,
-              stream.trace) == 0,
-          "XDNA Conv dispatch failed: ",
-          shim_last_error());
-    }
-    mark_device_dirty(raw);
-
-    // Consumer-layout policy for small BF16 Conv family.
-    // The raw [Y,X,B,Cout] result is zero-copy, but CPU BatchNorm is up to
-    // 20x slower on those strides than on contiguous NCHW, and the blocked
-    // transpose costs ~2 ms at H36.  Transpose by default;
-    // XDNA_CONV_OUTPUT_NCHW=0 keeps the raw layout for NPU-to-NPU consumers.
-    if (const char* setting = std::getenv("XDNA_CONV_OUTPUT_NCHW");
-        setting == nullptr || std::strcmp(setting, "0") != 0) {
-      ScopedMappedCpu reorder_phase("npu_conv.fwd.sync_back+reorder");
-      ensure_host_current(raw);
-      const int64_t hh = stream.h;
-      auto reordered = empty_memory_format(
-          {c10::SymInt(kBatch), c10::SymInt(kCout),
-           c10::SymInt(hh), c10::SymInt(hh)},
-          at::ScalarType::BFloat16,
-          at::Layout::Strided,
-          c10::Device(kXdnaType, 0),
-          false,
-          at::MemoryFormat::Contiguous);
-      xdna_yxbc_to_nchw_bf16(
-          static_cast<const uint16_t*>(raw.const_data_ptr()),
-          static_cast<uint16_t*>(reordered.data_ptr()),
-          static_cast<int>(kBatch),
-          static_cast<int>(kCout),
-          static_cast<int>(hh * hh),
-          static_cast<int>(kCout),
-          0);
-      mark_host_dirty(reordered);
-      return reordered;
-    }
-
-    // GEMM rows are physically [Y,X,Batch,Cout]. Present them to PyTorch as
-    // logical NCHW through strides; no output transpose/copy is needed.
-    const int64_t h = stream.h;
-    std::vector<c10::SymInt> sizes = {
-        c10::SymInt(kBatch), c10::SymInt(kCout),
-        c10::SymInt(h), c10::SymInt(h)};
-    std::vector<c10::SymInt> strides = {
-        c10::SymInt(kCout),
-        c10::SymInt(1),
-        c10::SymInt(h * kBatch * kCout),
-        c10::SymInt(kBatch * kCout)};
-    return make_alias(raw, sizes, strides, c10::SymInt(0));
-  }
-};
-
-std::unique_ptr<XdnaConvRuntime>& conv_runtime_slot() {
-  static auto* slot = new std::unique_ptr<XdnaConvRuntime>();
-  return *slot;
-}
-
 // conv3x3w: 3x3 / stride 1 / pad 1 convolution on the whole array for any
 // batch, height, channel count and width <= 36 (xdna_train/_designs/conv3x3w.py).
 // One xclbin; an instruction stream per (groups, padded width, channel chunks),
 // compiled on first use by a background job and cached on disk.  Until a
-// stream exists the conv takes the next path (older NPU families or CPU), so
+// stream exists the conv takes the next path (full-frame families or CPU), so
 // a new shape never blocks training.  Arithmetic: bf16 activations x bfp16
 // weights with a bf16 running sum (~1.2% rel. RMS vs fp32; CPU bf16 ~0.2%).
 // Compiles IRON instruction streams in the background: one niced build at a
@@ -4205,21 +3806,6 @@ at::Tensor convolution_overrideable_xdna(
       return *out;
     }
   }
-  auto& conv_slot = conv_runtime_slot();
-  if (conv_slot) {
-    if (auto* stream = conv_slot->find_forward(
-            input,
-            weight,
-            stride,
-            padding,
-            dilation,
-            transposed,
-            output_padding,
-            groups,
-            bias)) {
-      return conv_slot->forward(input, weight, *stream);
-    }
-  }
   auto& full_conv_slot = fullframe_conv_runtime_slot();
   auto& fast_full_slot = fast_dx584_runtime_slot();
   if (fast_full_slot) {
@@ -4307,7 +3893,6 @@ convolution_backward_overrideable_xdna(
   // NPU dX instead of serializing the heterogeneous engines.
   Conv3x3wStream* w3_dx = nullptr;
   std::optional<Conv3x3wPlan> w3_dx_plan;
-  XdnaConvStream* small_dx = nullptr;
   XdnaFullFrameConvStream* full_dx = nullptr;
   XdnaFullFrameConvRuntime* full_dx_owner = nullptr;
   const int npu_mode = g_npu_mode.load(std::memory_order_relaxed);
@@ -4318,41 +3903,29 @@ convolution_backward_overrideable_xdna(
         output_padding, groups);
     if (w3_dx_plan) w3_dx = w3_slot->stream(*w3_dx_plan);
   }
-  auto& conv_slot = conv_runtime_slot();
   auto& full_conv_slot = fullframe_conv_runtime_slot();
   auto& fast_dx584_slot = fast_dx584_runtime_slot();
   auto& fast_conv11_slot = fast_conv11_runtime_slot();
-  if (output_mask[0] && npu_mode > 0 && !w3_dx && conv_slot) {
-    small_dx = conv_slot->find_dx(
-        grad_output,
-        weight,
-        stride,
-        padding,
-        dilation,
-        transposed,
-        output_padding,
-        groups);
-  }
-  if (output_mask[0] && npu_mode > 0 && !small_dx && fast_conv11_slot) {
+  if (output_mask[0] && npu_mode > 0 && !w3_dx && fast_conv11_slot) {
     full_dx = fast_conv11_slot->find_dx(
         grad_output, weight, stride, padding, dilation,
         transposed, output_padding, groups);
     if (full_dx) full_dx_owner = fast_conv11_slot.get();
   }
-  if (output_mask[0] && npu_mode > 0 && !small_dx && !full_dx && fast_dx584_slot) {
+  if (output_mask[0] && npu_mode > 0 && !w3_dx && !full_dx && fast_dx584_slot) {
     full_dx = fast_dx584_slot->find_dx(
         grad_output, weight, stride, padding, dilation,
         transposed, output_padding, groups);
     if (full_dx) full_dx_owner = fast_dx584_slot.get();
   }
-  if (output_mask[0] && npu_mode > 0 && !small_dx && !full_dx && full_conv_slot) {
+  if (output_mask[0] && npu_mode > 0 && !w3_dx && !full_dx && full_conv_slot) {
     full_dx = full_conv_slot->find_dx(
         grad_output, weight, stride, padding, dilation,
         transposed, output_padding, groups);
     if (full_dx) full_dx_owner = full_conv_slot.get();
   }
   const bool have_npu_dx =
-      w3_dx != nullptr || small_dx != nullptr || full_dx != nullptr;
+      w3_dx != nullptr || full_dx != nullptr;
 
   // Large 3x3 dWs go to the NPU, deferred (see XdnaConv3x3wDwRuntime); small
   // ones stay on the CPU, overlapped with the NPU dX below.
@@ -4494,9 +4067,6 @@ convolution_backward_overrideable_xdna(
     // The dX packed dY exactly as dW needs it (same chunks: dX's input
     // channels are dW's output channels).
     if (w3_dw_job) w3_dw_job->d_buf = std::move(w3_dy_packed);
-    cpu_mask[0] = false;
-  } else if (small_dx) {
-    gi = conv_slot->input_grad(grad_output, weight, *small_dx);
     cpu_mask[0] = false;
   } else if (full_dx) {
     TORCH_CHECK(full_dx_owner != nullptr, "full-frame dX runtime owner missing");
@@ -5015,21 +4585,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     return static_cast<bool>(gemm_runtime_slot());
   });
   m.def(
-      "configure_conv_family",
-      [](const std::string& xclbin,
-         const std::string& fwd18,
-         const std::string& dx18,
-         const std::string& fwd36,
-         const std::string& dx36,
-         int64_t m_sched18,
-         int64_t m_sched36) {
-        auto runtime = std::make_unique<XdnaConvRuntime>();
-        runtime->open(xclbin, fwd18, dx18, fwd36, dx36, m_sched18, m_sched36);
-        conv_runtime_slot() = std::move(runtime);
-      },
-      py::arg("xclbin"), py::arg("fwd18"), py::arg("dx18"), py::arg("fwd36"),
-      py::arg("dx36"), py::arg("m_sched18") = 12960, py::arg("m_sched36") = 51840);
-  m.def(
       "configure_conv3x3w",
       [](const std::string& dir,
          const std::string& build_cmd,
@@ -5074,9 +4629,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("npu_mode", []() { return g_npu_mode.load(); });
   m.def("conv3x3w_configured", []() {
     return static_cast<bool>(conv3x3w_runtime_slot());
-  });
-  m.def("conv_family_configured", []() {
-    return static_cast<bool>(conv_runtime_slot());
   });
   m.def(
       "configure_fullframe_conv_family",

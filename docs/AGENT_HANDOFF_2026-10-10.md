@@ -1,4 +1,6 @@
 # XDNA2 PyTorch Training Backend — Agent Handoff
+
+> **Note (modes cleanup):** the patch-conv family, `XDNA_CONV_OUTPUT_NCHW` and `XDNA_ENABLE_PATCH_CONV` described below were removed; see `docs/MODES_AUDIT.md`.
 **Verified 2026-10-10, Europe/Prague.** This is the working-state handoff for the next ChatGPT/Pi/Codex agent. Reverify the repository status and measurements before treating them as current.
 
 ## 0. Mission and definition of success

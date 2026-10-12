@@ -1,4 +1,4 @@
-"""Numerical and layout regression tests for opt-in patch Conv NCHW output."""
+"""Numerical and layout regression tests for the NPU Conv NCHW output."""
 from __future__ import annotations
 
 import os
@@ -14,9 +14,7 @@ pytestmark=pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("height",[18,36])
-def test_nchw_output_conv_bn_matches_cpu_and_original_geometry(
-    monkeypatch: pytest.MonkeyPatch,height:int
-) -> None:
+def test_nchw_output_conv_bn_matches_cpu(height:int) -> None:
     torch.manual_seed(927)
     torch.set_num_threads(10)
     batch,cin,cout=40,256,128
@@ -39,16 +37,9 @@ def test_nchw_output_conv_bn_matches_cpu_and_original_geometry(
     x=x_cpu.detach().to("xdna").requires_grad_(True)
     dy=dy_cpu.to("xdna")
 
-    # Compare the exact same physical NPU conv with and without the transpose.
-    monkeypatch.setenv("XDNA_CONV_OUTPUT_NCHW","0")
-    raw=conv(x)
-    assert raw.shape==(batch,cout,height,height)
-    assert not raw.is_contiguous()
-    monkeypatch.setenv("XDNA_CONV_OUTPUT_NCHW","1")
     converted=conv(x)
-    assert converted.shape==raw.shape
+    assert converted.shape==(batch,cout,height,height)
     assert converted.is_contiguous()
-    torch.testing.assert_close(converted.cpu(),raw.cpu(),rtol=0,atol=0)
 
     out=bn(converted)
     out.backward(dy)

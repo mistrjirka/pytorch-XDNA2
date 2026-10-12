@@ -209,54 +209,15 @@ See:
 - `docs/xdna-device-architecture.md`
 - `docs/fullframe-conv-backward-plan.md`
 
-## Experimental patch-40 Conv output layout
+## Conv output layout
 
-The B40 256→128 Conv family emits a native `[Y,X,B,C]` layout. Its default
-zero-copy, strided PyTorch view is efficient for some producers, but **CPU
-BatchNorm forward/backward can be substantially slower** on these unusual
-strides. This is not an XRT transfer issue; zero-copy does not imply cheap CPU
-execution. The backend therefore converts to contiguous NCHW by default;
-to keep the raw layout for an NPU-to-NPU consumer:
-
-```bash
-XDNA_CONV_OUTPUT_NCHW=0 python training.py
-```
-
-The conversion reorders each matching NPU Conv output exactly once inside
-XDNA mapped storage; the data remain on the logical `xdna` device.
-Consumer/layout-aware graph partitioning should eventually replace this
-global switch.
-
-On Ryzen AI 9 365, the **real NIS RGB style-transfer** training loop (MyNet
-3→3, 7 residual blocks, 36×36 patches, B40, VGG perceptual loss, Adam)
-measured **598.3 → 510.1 ms per training step** for `XDNA_CONV_OUTPUT_NCHW=0 → 1`
-in two reversed-order runs at 10 Torch threads and 4 packing threads.
-The CPU BF16 comparison was 243.2 ms/step. This experiment used actual
-training images but only the first validation image, avoiding the original
-script's unnecessary preload of 546 complete test frames. Results are located
-in `torch-xdna-train/results/maintained-fork-layout-ab-20261010` on the
-development machine. These numbers are workload-specific and *not* a general
-NPU speedup claim.
-
-Physical tests showed that the Conv outputs are bitwise identical across
-layouts and that NCHW BatchNorm results and input/weight gradients are
-considerably closer to the CPU BF16 reference. Run the hardware smoke test
-with `python tests/run_conv_output_layout.py`, or with `pytest` installed,
+NPU convolutions return contiguous NCHW tensors. An earlier fixed-shape family
+returned the kernel's native `[Y,X,B,C]` layout as a strided view; **CPU BatchNorm
+forward/backward was substantially slower** on those strides (zero-copy does not imply
+cheap CPU execution), and one producer-side conversion to NCHW took the real NIS
+style-transfer step from 598.3 to 510.1 ms (10 Torch threads, B40, 36x36, before conv3x3w). Run the hardware smoke test with
+`python tests/run_conv_output_layout.py`, or with `pytest` installed,
 `XDNA_TRAIN_PHYSICAL=1 pytest tests/test_conv_output_layout.py`.
-
-A second real-script ABBA compared conversion at the CPU BatchNorm consumer
-instead of the NPU Conv producer. It measured 611.2 ms/step with no
-conversion, 526.3 ms/step with conversion inside BN, and **496.3 ms/step
-with a single producer-side conversion**. Consumer-side repacking therefore
-remains experimental, not part of this backend's default dispatch. Results:
-`torch-xdna-train/results/bn-consumer-layout-ab-20261010`.
-
-For *diagnostics only*, `XDNA_ENABLE_PATCH_CONV=0` disables registration of
-the small-patch resident Conv family (default `1`). With NPU Conv enabled,
-the same real script ran at 517.6 ms/step versus 710.7 ms when its supported
-Conv operations were forced to mapped-CPU fallback, confirming that the NPU
-kernels are still beneficial. See
-`torch-xdna-train/results/maintained-fork-conv-gate-ab-20261010`.
 
 ## conv3x3w: general 3x3 convolution family
 
@@ -270,7 +231,7 @@ noise (`benchmarks/bfp16_training_gate.py`).
 - One xclbin per family; instruction streams per (groups, padded width,
   channel chunks[, pass]) are compiled on first use in a niced background
   process (~7 s each) and cached under `~/.cache/torch-xdna2/<family>/<source
-  hash>/`. Until a stream exists the convolution takes the previous path.
+  hash>/`. Until a stream exists the convolution runs on the CPU.
   `XDNA_IRON_PYTHON` names the mlir-aie (IRON) Python used for builds.
 - dW lives in a second xclbin; a hardware-context switch costs ~2.6 ms, so NPU
   dWs are deferred to the gradient's first reader (normally the optimizer)

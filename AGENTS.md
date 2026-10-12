@@ -14,9 +14,9 @@ Make a general-purpose **PyTorch XDNA2 training backend** faster than native CPU
 
 ## Verified 2026-10-10
 - With real training patches (B40, 36×36, VGG loss), CPU BF16 ~233 ms/step (4.29 it/s); optimized XDNA BF16 ~519 ms/step (1.93 it/s).
-- XDNA_CONV_OUTPUT_NCHW (small-patch Conv output as NCHW) improved XDNA training ~15% on paired runs and is now the default; set 0 for the raw layout.
+- Returning small-patch Conv output as contiguous NCHW (instead of the kernel's raw [Y,X,B,C] layout) improved XDNA training ~15% on paired runs; all NPU convs now do (the raw-layout switch was removed).
 - Later on 2026-10-10: the conv3x3w forward/dX/dW families (README) brought the NIS script to 147.7 ms/step vs CPU BF16 171.4 (1.16x).
-- XDNA_CONV_PACK_THREADS=4 and XDNA_BO_CACHE_MB=1024 were the tested settings, not universal defaults.
+- XDNA_CONV_PACK_THREADS=4 and XDNA_BO_CACHE_MB=1024 were the tested settings, not universal defaults. docs/MODES_AUDIT.md lists every environment variable and what was removed.
 - Physical Conv→BatchNorm output/gradient tests passed on H18/H36. Wider kernel coverage and backward/fallback scheduling remain unsolved.
 
 **Do not erase or reset existing uncommitted changes, modify the NIS coursework to massage timings, or edit site-packages during experimentation.** Keep optimized behavior opt-in until correctness and representative end-to-end performance are proven. See the full handoff for commands and detailed evidence.

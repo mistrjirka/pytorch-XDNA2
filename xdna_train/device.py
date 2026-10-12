@@ -198,24 +198,6 @@ def register_xdna_device() -> None:
             str(gemm / "dw.bin"),
         )
 
-    conv = Path(
-        os.environ.get("XDNA_PATCH_CONV_ARTIFACT_DIR")
-        or str(_ROOT / "_artifacts" / "conv3x3_patch40_128")
-    )
-    # Diagnostic cost-policy gate: leave resident patch Conv disabled when its
-    # complete fwd+dX+CPU dW costs more than the mapped CPU fallback.
-    if conv.is_dir() and os.environ.get("XDNA_ENABLE_PATCH_CONV", "1") == "1":
-        shapes = _manifest(conv)
-        _C.configure_conv_family(
-            str(conv / "final.xclbin"),
-            str(conv / "fwd18.bin"),
-            str(conv / "dx18.bin"),
-            str(conv / "fwd36.bin"),
-            str(conv / "dx36.bin"),
-            int(shapes.get("fwd18_shape", "12960x").split("x")[0]),
-            int(shapes.get("fwd36_shape", "51840x").split("x")[0]),
-        )
-
     # General 3x3 conv family (BFP16 weights); XDNA_CONV3X3W=0 disables it.
     # Below ~20 MMAC host packing and dispatch cost more than the CPU conv; on
     # top of that floor, plan() runs a padded-work cost model (RGB input convs

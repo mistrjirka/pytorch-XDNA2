@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Hardware-only smoke test for XDNA Conv output layout, no pytest dependency."""
-import os,torch,xdna_train
+"""Hardware-only smoke test: NPU Conv output is contiguous NCHW and feeds CPU BatchNorm
+forward/backward correctly, no pytest dependency."""
+import torch,xdna_train
 torch.manual_seed(927)
 torch.set_num_threads(10)
 for h in [18,36]:
@@ -18,15 +19,8 @@ for h in [18,36]:
  conv_x.to("xdna");bn_x.to("xdna")
  x=x_cpu.detach().to("xdna").requires_grad_(True)
  dyx=dy.to("xdna")
- # XDNA_CONV_OUTPUT_NCHW only affects the older fixed-shape conv family; the
- # conv3x3w family (preferred for these shapes) always returns NCHW.  Either
- # way the raw-layout result must hold the same values.
- os.environ["XDNA_CONV_OUTPUT_NCHW"]="0"
- old=conv_x(x)
- os.environ["XDNA_CONV_OUTPUT_NCHW"]="1"
  result=conv_x(x)
  assert result.is_contiguous(),result.stride()
- torch.testing.assert_close(result.cpu(),old.cpu(),rtol=0,atol=0)
  out=bn_x(result)
  out.backward(dyx)
  for key,actual,expected in [

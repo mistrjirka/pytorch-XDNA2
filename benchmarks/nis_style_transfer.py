@@ -194,7 +194,7 @@ def main() -> None:
     ap.add_argument("--quick", action="store_true",
                     help="fast A/B: preheat 45 s, 60 iterations (10 warmup), 1 round, 5 frames")
     ap.add_argument("--define", action="append", default=[],
-                    help="extra config NAME=BASE:K=V,K=V (e.g. nonpu=xdna-bf16-repo:XDNA_ENABLE_PATCH_CONV=0)")
+                    help="extra config NAME=BASE:K=V,K=V (e.g. nonpu=xdna-bf16-repo:XDNA_NPU_MODE=0)")
     ap.add_argument("--out", default=str(REPO / "benchmarks" / "results" / "nis_style_transfer.json"))
     args = ap.parse_args()
     if args.quick:
