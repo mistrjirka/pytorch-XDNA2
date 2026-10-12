@@ -122,12 +122,11 @@ def weight_cache_test(dev):
         r0 = uncached(conv)
         res = same(r, r0)
         if name == "data.add_":
-            # .data has its own version counter: not tracked, reported only
+            # .data has its own version counter, which does not move: the
+            # write epoch must still invalidate the cache
             print(f"weight cache w.data.add_: version bumped={conv.weight._version != v0} "
-                  f"stale={'no' if res else 'YES (known limitation)'}", flush=True)
-            fwd_dx(conv, x, dy)
-            with torch.no_grad():
-                conv.weight.add_(0.0)  # counter bump recovers
+                  f"{'OK' if res else 'FAIL'}", flush=True)
+            good &= res
             continue
         print(f"weight cache {name}: version {v0}->{conv.weight._version} {'OK' if res else 'FAIL'}", flush=True)
         good &= res and conv.weight._version != v0
