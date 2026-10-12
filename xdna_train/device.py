@@ -343,22 +343,6 @@ def register_xdna_device() -> None:
             128,
         )
 
-    full_dw = Path(
-        os.environ.get(
-            "XDNA_FULLFRAME_DW_ARTIFACT_DIR",
-            str(_ROOT / "_artifacts" / "fullframe_dw_unbundled"),
-        )
-    )
-    if (
-        os.environ.get("XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_DW") == "1"
-        and (full_dw / "final.xclbin").is_file()
-        and (full_dw / "insts.txt").is_file()
-    ):
-        _C.configure_fullframe_dw584(
-            str(full_dw / "final.xclbin"),
-            str(full_dw / "insts.txt"),
-        )
-
     if not hasattr(torch, "xdna"):
         torch._register_device_module("xdna", _XdnaDeviceModule)
 

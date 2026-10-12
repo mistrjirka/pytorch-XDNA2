@@ -3608,206 +3608,6 @@ struct XdnaFullFrameConvRuntime {
 
 };
 
-struct XdnaFullFrameDwRuntime {
-  static constexpr int64_t kBatch = 4;
-  static constexpr int64_t kCin = 256;
-  static constexpr int64_t kCout = 128;
-  static constexpr int64_t kH = 584;
-  static constexpr int64_t kW = 564;
-  static constexpr int64_t kM = 9 * kCin;
-  static constexpr int64_t kK = kBatch * kH * kW;
-
-  ShimKernel* kernel = nullptr;
-  ShimBo* instr = nullptr;
-  ShimBo* a = nullptr;
-  ShimBo* b = nullptr;
-  ShimBo* tmp = nullptr;
-  ShimBo* trace = nullptr;
-  void* a_ptr = nullptr;
-  void* b_ptr = nullptr;
-  size_t instr_words = 0;
-  std::mutex mutex;
-
-  ~XdnaFullFrameDwRuntime() {
-    for (auto* bo : {instr, a, b, tmp, trace}) {
-      if (bo) shim_bo_free(bo);
-    }
-    if (kernel) shim_kernel_close(kernel);
-  }
-
-  void open(const std::string& xclbin, const std::string& insts) {
-    auto blob = XdnaGemmRuntime::read_file(insts);
-    TORCH_CHECK(
-        blob.size() % 4 == 0,
-        "full-frame dW instruction stream is not word aligned: ",
-        insts);
-    kernel = shim_kernel_load(
-        xdna_device(), xclbin.c_str(), nullptr, QOS_PRIORITY_NONE);
-    TORCH_CHECK(
-        kernel != nullptr,
-        "failed to load full-frame dW XDNA program: ",
-        shim_last_error());
-
-    int pack_threads = 12;
-    if (const char* raw = std::getenv("XDNA_CONV_PACK_THREADS")) {
-      const int parsed = std::atoi(raw);
-      if (parsed > 0) pack_threads = parsed;
-    }
-    xdna_conv_set_threads(pack_threads);
-
-    const int gid_instr = shim_kernel_group_id(kernel, 1);
-    const int gid_tmp = shim_kernel_group_id(kernel, 6);
-    const int gid_trace = shim_kernel_group_id(kernel, 7);
-    const size_t halo_elems =
-        static_cast<size_t>(kH + 2) * (kW + 2) * kCin * kBatch;
-    const size_t dy_elems = static_cast<size_t>(kK) * kCout;
-
-    instr = shim_bo_alloc(
-        xdna_device(), kernel, blob.size(), 1, gid_instr);
-    a = shim_bo_alloc(
-        xdna_device(), kernel, halo_elems * sizeof(uint16_t), 2, 0);
-    b = shim_bo_alloc(
-        xdna_device(), kernel, dy_elems * sizeof(uint16_t), 2, 0);
-    tmp = shim_bo_alloc(xdna_device(), kernel, 1, 2, gid_tmp);
-    trace = shim_bo_alloc(xdna_device(), kernel, 4, 2, gid_trace);
-    TORCH_CHECK(
-        instr && a && b && tmp && trace,
-        "failed to allocate full-frame dW XDNA buffers: ",
-        shim_last_error());
-    TORCH_CHECK(
-        shim_bo_write(instr, blob.data(), blob.size(), 0) == 0 &&
-            shim_bo_sync_to_device(instr) == 0,
-        "failed to initialize full-frame dW instruction stream: ",
-        shim_last_error());
-    a_ptr = shim_bo_map(a);
-    b_ptr = shim_bo_map(b);
-    TORCH_CHECK(
-        a_ptr && b_ptr,
-        "failed to map full-frame dW staging buffers: ",
-        shim_last_error());
-    instr_words = blob.size() / 4;
-  }
-
-  bool supports(
-      const at::Tensor& input,
-      const at::Tensor& grad_output,
-      const at::Tensor& weight,
-      c10::SymIntArrayRef stride,
-      c10::SymIntArrayRef padding,
-      c10::SymIntArrayRef dilation,
-      bool transposed,
-      c10::SymIntArrayRef output_padding,
-      c10::SymInt groups) const {
-    return input.scalar_type() == at::ScalarType::BFloat16 &&
-        grad_output.scalar_type() == at::ScalarType::BFloat16 &&
-        weight.scalar_type() == at::ScalarType::BFloat16 &&
-        input.dim() == 4 && grad_output.dim() == 4 && weight.dim() == 4 &&
-        input.size(0) == kBatch && input.size(1) == kCin &&
-        input.size(2) == kH && input.size(3) == kW &&
-        grad_output.size(0) == kBatch &&
-        grad_output.size(1) == kCout &&
-        grad_output.size(2) == kH && grad_output.size(3) == kW &&
-        weight.size(0) == kCout && weight.size(1) == kCin &&
-        weight.size(2) == 3 && weight.size(3) == 3 &&
-        stride.size() == 2 && stride[0] == 1 && stride[1] == 1 &&
-        padding.size() == 2 && padding[0] == 1 && padding[1] == 1 &&
-        dilation.size() == 2 && dilation[0] == 1 && dilation[1] == 1 &&
-        !transposed &&
-        output_padding.size() == 2 &&
-        output_padding[0] == 0 && output_padding[1] == 0 &&
-        groups == 1;
-  }
-
-  at::Tensor weight_grad(
-      const at::Tensor& input,
-      const at::Tensor& grad_output,
-      const at::Tensor& weight) {
-    ensure_host_current(input);
-    ensure_host_current(grad_output);
-
-    at::Tensor input_cl;
-    const uint16_t* input_ptr = nullptr;
-    if (input.is_contiguous(at::MemoryFormat::ChannelsLast)) {
-      input_ptr = static_cast<const uint16_t*>(input.const_data_ptr());
-    } else {
-      auto input_cpu = cpu_alias(input);
-      input_cl = input_cpu.contiguous(at::MemoryFormat::ChannelsLast);
-      input_ptr = static_cast<const uint16_t*>(input_cl.const_data_ptr());
-    }
-
-    at::Tensor go_cl;
-    const uint16_t* go_ptr = nullptr;
-    if (grad_output.is_contiguous(at::MemoryFormat::ChannelsLast)) {
-      go_ptr = static_cast<const uint16_t*>(grad_output.const_data_ptr());
-    } else {
-      auto go_cpu = cpu_alias(grad_output);
-      go_cl = go_cpu.contiguous(at::MemoryFormat::ChannelsLast);
-      go_ptr = static_cast<const uint16_t*>(go_cl.const_data_ptr());
-    }
-
-    std::lock_guard<std::mutex> guard(mutex);
-    xdna_pack_conv3x3_halo_padded_channels_last_bf16(
-        input_ptr,
-        static_cast<uint16_t*>(a_ptr),
-        static_cast<int>(kBatch),
-        static_cast<int>(kCin),
-        static_cast<int>(kH),
-        static_cast<int>(kW),
-        static_cast<int>(kW));
-    xdna_pack_conv3x3_dy_channels_last_bf16(
-        go_ptr,
-        static_cast<uint16_t*>(b_ptr),
-        static_cast<int>(kBatch),
-        static_cast<int>(kCout),
-        static_cast<int>(kH),
-        static_cast<int>(kW));
-    TORCH_CHECK(
-        shim_bo_sync_to_device(a) == 0 &&
-            shim_bo_sync_to_device(b) == 0,
-        "failed to sync full-frame dW operands: ",
-        shim_last_error());
-
-    auto raw = empty_memory_format(
-        {c10::SymInt(kM), c10::SymInt(kCout)},
-        at::ScalarType::Float,
-        at::Layout::Strided,
-        c10::Device(kXdnaType, 0),
-        false,
-        at::MemoryFormat::Contiguous);
-    prepare_npu_output(raw);
-    auto* raw_alloc = allocation_from_tensor(raw);
-    TORCH_CHECK(
-        shim_run_matmul8(
-            kernel, 3, instr, instr_words,
-            a, b, raw_alloc->bo, tmp, trace) == 0,
-        "full-frame dW XDNA dispatch failed: ",
-        shim_last_error());
-    mark_device_dirty(raw);
-    ensure_host_current(raw);
-
-    auto gw = empty_memory_format(
-        weight.sym_sizes(),
-        weight.scalar_type(),
-        at::Layout::Strided,
-        c10::Device(kXdnaType, 0),
-        false,
-        at::MemoryFormat::Contiguous);
-    auto raw_cpu = cpu_alias(raw);
-    auto gw_cpu = cpu_alias(gw);
-    auto logical = raw_cpu
-        .view({3, 3, kCin, kCout})
-        .permute({3, 2, 0, 1});
-    gw_cpu.copy_(logical);
-    mark_host_dirty(gw);
-    return gw;
-  }
-};
-
-std::unique_ptr<XdnaFullFrameDwRuntime>& fullframe_dw_runtime_slot() {
-  static auto* slot = new std::unique_ptr<XdnaFullFrameDwRuntime>();
-  return *slot;
-}
-
 std::unique_ptr<XdnaFullFrameConvRuntime>& fullframe_conv_runtime_slot() {
   static auto* slot = new std::unique_ptr<XdnaFullFrameConvRuntime>();
   return *slot;
@@ -5184,27 +4984,13 @@ convolution_backward_overrideable_xdna(
   const bool have_npu_dx =
       w3_dx != nullptr || small_dx != nullptr || full_dx != nullptr;
 
-  auto& full_dw_slot = fullframe_dw_runtime_slot();
-  const bool have_npu_dw =
-      output_mask[1] && npu_mode > 1 && full_dw_slot &&
-      full_dw_slot->supports(
-          input,
-          grad_output,
-          weight,
-          stride,
-          padding,
-          dilation,
-          transposed,
-          output_padding,
-          groups);
-
   // Large 3x3 dWs go to the NPU, deferred (see XdnaConv3x3wDwRuntime); small
   // ones stay on the CPU, overlapped with the NPU dX below.
   std::optional<Conv3x3wDwPlan> w3_dw_plan;
   std::shared_ptr<Conv3x3wPacked> w3_dy_packed;
   std::shared_ptr<Conv3x3wDwJob> w3_dw_job;
   auto& w3_dw_slot = conv3x3w_dw_runtime_slot();
-  if (output_mask[1] && npu_mode > 1 && w3_dw_slot && !have_npu_dw) {
+  if (output_mask[1] && npu_mode > 1 && w3_dw_slot) {
     w3_dw_plan = w3_dw_slot->plan(
         input, grad_output, weight, stride, padding, dilation, transposed,
         output_padding, groups);
@@ -5225,7 +5011,7 @@ convolution_backward_overrideable_xdna(
 
   std::optional<std::array<at::Tensor, 2>> virtual_dw_sources;
   if (lazy_decoder_dw_enabled() && !defer_cpu_dw &&
-      have_npu_dx && output_mask[1] && !have_npu_dw &&
+      have_npu_dx && output_mask[1] &&
       stride.size() == 2 && stride[0] == 1 && stride[1] == 1 &&
       padding.size() == 2 && padding[0] == 1 && padding[1] == 1 &&
       dilation.size() == 2 && dilation[0] == 1 && dilation[1] == 1 &&
@@ -5250,7 +5036,7 @@ convolution_backward_overrideable_xdna(
     w3_dw_job = std::make_shared<Conv3x3wDwJob>();
     w3_dw_job->x_buf = take_packed(input, w3_dw_plan->chunks);
     cpu_mask[1] = false;
-  } else if (overlap_cpu_dw && have_npu_dx && output_mask[1] && !have_npu_dw) {
+  } else if (overlap_cpu_dw && have_npu_dx && output_mask[1]) {
     ensure_host_current(grad_output);
     ensure_host_current(weight);
     auto go_cpu = cpu_alias(grad_output);
@@ -5461,11 +5247,6 @@ convolution_backward_overrideable_xdna(
                      *job = Conv3x3wDwJob();
                    }).share();
     set_pending_host_write(gw, std::move(pending));
-  }
-
-  if (have_npu_dw) {
-    gw = full_dw_slot->weight_grad(input, grad_output, weight);
-    cpu_mask[1] = false;
   }
 
   if (cpu_mask[0] || cpu_mask[1] || cpu_mask[2]) {
@@ -6086,16 +5867,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "no compatible full-frame XDNA fused cat+upsample2 forward stream");
         return slot->forward_cat2_upsample2(src0, src1, weight, *stream);
       });
-  m.def(
-      "configure_fullframe_dw584",
-      [](const std::string& xclbin, const std::string& insts) {
-        auto runtime = std::make_unique<XdnaFullFrameDwRuntime>();
-        runtime->open(xclbin, insts);
-        fullframe_dw_runtime_slot() = std::move(runtime);
-      });
-  m.def("fullframe_dw584_configured", []() {
-    return static_cast<bool>(fullframe_dw_runtime_slot());
-  });
   m.def("reset_mapped_cpu_stats", []() {
     std::lock_guard<std::mutex> guard(mapped_cpu_stats_mutex());
     mapped_cpu_stats_map().clear();
