@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import sys
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -173,10 +174,31 @@ def _load_native():
     _C = build_native()
     return _C
 
+# Env vars whose features were removed (docs/MODES_AUDIT.md, verdict REMOVE).
+# They are no longer read, so setting one silently does nothing; warn once.
+_REMOVED_ENV_VARS = (
+    "XDNA_ENABLE_FAST_DX584", "XDNA_FAST_DX584_ARTIFACT_DIR",
+    "XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_DW", "XDNA_FULLFRAME_DW_ARTIFACT_DIR",
+    "XDNA_DEFER_CPU_DW", "XDNA_DEFER_CPU_DW_WINDOW", "XDNA_HOLD_CPU_DW",
+    "XDNA_BO_ARENA_MB", "XDNA_TENSOR_BO_FLAG", "XDNA_LAZY_DECODER_VALUES",
+    "XDNA_LAZY_DECODER_DW", "XDNA_ENABLE_PATCH_CONV", "XDNA_PATCH_CONV_ARTIFACT_DIR",
+    "XDNA_CONV_OUTPUT_NCHW", "XDNA_FULLFRAME_TM",
+)
+
+
 def register_xdna_device() -> None:
     global _INITIALIZED
     if _INITIALIZED:
         return
+
+    removed = [name for name in _REMOVED_ENV_VARS if name in os.environ]
+    if removed:
+        warnings.warn(
+            f"{', '.join(removed)} no longer has an effect; "
+            "see docs/MODES_AUDIT.md",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     _configure_default_allocator_budget()
 
@@ -337,9 +359,6 @@ def _install_scoped_param_swap() -> None:
     module.xdna = scoped(module.xdna, lambda *a, **k: True)
 
 
-_FUSED_CHECKED: set[int] = set()
-
-
 def _prefer_fused_optimizer(optimizer, args, kwargs) -> None:
     """Default XDNA optimizers to PyTorch's fused CPU kernels.
 
@@ -352,9 +371,9 @@ def _prefer_fused_optimizer(optimizer, args, kwargs) -> None:
     yet are changed, so it happens before the first step or not at all.
     XDNA_FUSED_OPTIMIZER=0 disables it.
     """
-    if id(optimizer) in _FUSED_CHECKED:
+    if getattr(optimizer, "_xdna_fused_checked", False):
         return
-    _FUSED_CHECKED.add(id(optimizer))
+    optimizer._xdna_fused_checked = True
     for group in optimizer.param_groups:
         if (
             "fused" not in group
