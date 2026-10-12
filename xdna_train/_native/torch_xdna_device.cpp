@@ -2761,16 +2761,13 @@ struct XdnaConv3x3wDwRuntime {
     c = alloc(static_cast<size_t>(kCols * kRows * kAcc * 4), &c_ptr);
   }
 
-  // gw [cout][cin][3][3] bf16 (host memory) = dW of the conv.  x_buf / d_buf
-  // are X and dY already packed by the forward and dX runs, else null.
-  void compute(const at::Tensor& input, const at::Tensor& grad_output,
-               uint16_t* gw, const Conv3x3wDwPlan& p,
-               std::shared_ptr<Conv3x3wPacked> x_buf,
-               std::shared_ptr<Conv3x3wPacked> d_buf) {
-    {
-      std::lock_guard<std::mutex> guard(mutex);
-      load_kernel();
-    }
+  // X and dY packed for the kernel, snapshots taken while backward runs: the
+  // deferred dW then reads neither tensor, so later writes to them (in-place
+  // ops, dY reuse) cannot change the gradient.  x_buf / d_buf are the copies
+  // the forward and dX runs already packed, else null and packed here.
+  void pack_operands(const at::Tensor& input, const at::Tensor& grad_output,
+                     const Conv3x3wDwPlan& p, std::shared_ptr<Conv3x3wPacked>& x_buf,
+                     std::shared_ptr<Conv3x3wPacked>& d_buf) {
     xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
     // Tiled dY needs zero halo columns, which the dX run's packed copy (real
     // neighbours) does not have: repack it.
@@ -2787,7 +2784,18 @@ struct XdnaConv3x3wDwRuntime {
     };
     pack(x_buf, input, p.chunks, false);
     pack(d_buf, grad_output, p.cochunks, true);
+  }
 
+  // gw [cout][cin][3][3] bf16 (host memory) = dW of the conv, from the packed
+  // operands of pack_operands().
+  void compute(uint16_t* gw, const Conv3x3wDwPlan& p,
+               const std::shared_ptr<Conv3x3wPacked>& x_buf,
+               const std::shared_ptr<Conv3x3wPacked>& d_buf) {
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      load_kernel();
+    }
+    xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
     std::lock_guard<std::mutex> guard(mutex);
     const int64_t co_passes = ceil_div(p.cochunks, 2);
     for (size_t i = 0; i < p.passes.size(); ++i) {
@@ -2856,10 +2864,9 @@ std::unique_ptr<XdnaConv3x3wDwRuntime>& conv3x3w_dw_runtime_slot() {
   return *slot;
 }
 
-// A deferred NPU dW: inputs (and their packed copies, when the forward / dX
-// runs left them) held until the gradient's first reader runs it.
+// A deferred NPU dW: the packed X and dY, held until the gradient's first
+// reader runs it.  No tensors: the operands are snapshotted when backward runs.
 struct Conv3x3wDwJob {
-  at::Tensor input, grad_output;
   std::shared_ptr<Conv3x3wPacked> x_buf, d_buf;
 };
 
@@ -5122,24 +5129,11 @@ convolution_backward_overrideable_xdna(
   // storage after joining is negligible and keeps the implementation simple.
   if (w3_dw_plan) {
     gw = xdna_empty_like_shape(weight.sym_sizes(), weight.scalar_type());
-    // The job must not hold gw itself (gw's allocation owns this future: a
-    // cycle); gw's deleter also waits on it.  d_buf is filled in by the dX
-    // run below.
-    auto job = std::make_shared<Conv3x3wDwJob>();
-    job->input = input;
-    job->grad_output = grad_output;
-    job->x_buf = take_packed(input, w3_dw_plan->chunks);
-    w3_dw_job = job;
-    auto* gw_ptr = static_cast<uint16_t*>(cpu_alias(gw).data_ptr());
-    auto* rt = w3_dw_slot.get();
-    std::shared_future<void> pending =
-        std::async(std::launch::deferred, [job, gw_ptr, rt, plan = *w3_dw_plan]() {
-          release_held_cpu_dw();
-          rt->compute(job->input, job->grad_output, gw_ptr, plan,
-                      std::move(job->x_buf), std::move(job->d_buf));
-          *job = Conv3x3wDwJob();
-        }).share();
-    set_pending_host_write(gw, std::move(pending));
+    // The job must not hold gw itself (gw's allocation owns the dW future queued
+    // below: a cycle); gw's deleter also waits on it.  d_buf is filled in by the
+    // dX run.
+    w3_dw_job = std::make_shared<Conv3x3wDwJob>();
+    w3_dw_job->x_buf = take_packed(input, w3_dw_plan->chunks);
     cpu_mask[1] = false;
   } else if (overlap_cpu_dw && have_npu_dx && output_mask[1] && !have_npu_dw) {
     ensure_host_current(grad_output);
@@ -5178,11 +5172,19 @@ convolution_backward_overrideable_xdna(
       // ensure_host_current()/ensure_device_current().
       gw = xdna_empty_like_shape(weight.sym_sizes(), weight.scalar_type());
       auto gw_cpu_keep = cpu_alias(gw);
+      // The task runs after backward returned: it must not read X / dY live,
+      // since they may be written in between (in-place ops, dY reuse).  Copy
+      // the operands that still alias XDNA storage (a layout conversion above
+      // already made its own copy).
+      if (go_cpu_keep.data_ptr() == grad_output.data_ptr()) {
+        go_cpu_keep = go_cpu_keep.clone();
+      }
+      if (input_cpu_keep.data_ptr() == input.data_ptr()) {
+        input_cpu_keep = input_cpu_keep.clone();
+      }
       // CPU aliases are intentionally non-owning. Retain the XDNA tensors
       // themselves so their BOs cannot return to the cache while queued dW
       // still reads/writes the mapped addresses.
-      auto go_xdna_keep = grad_output;
-      auto input_xdna_keep = input;
       auto weight_xdna_keep = weight;
       auto gw_xdna_keep = gw;
       auto dw_task =
@@ -5190,8 +5192,6 @@ convolution_backward_overrideable_xdna(
            input_cpu_keep,
            weight_cpu_keep,
            gw_cpu_keep,
-           go_xdna_keep,
-           input_xdna_keep,
            weight_xdna_keep,
            gw_xdna_keep,
            stride_v = std::move(stride_v),
@@ -5329,6 +5329,23 @@ convolution_backward_overrideable_xdna(
     TORCH_CHECK(full_dx_owner != nullptr, "full-frame dX runtime owner missing");
     gi = full_dx_owner->input_grad(grad_output, weight, *full_dx);
     cpu_mask[0] = false;
+  }
+
+  if (w3_dw_job) {
+    // Snapshot X and dY now; only the NPU dispatch is deferred to the gradient's
+    // first reader.
+    w3_dw_slot->pack_operands(input, grad_output, *w3_dw_plan, w3_dw_job->x_buf,
+                              w3_dw_job->d_buf);
+    auto* gw_ptr = static_cast<uint16_t*>(cpu_alias(gw).data_ptr());
+    auto* rt = w3_dw_slot.get();
+    std::shared_future<void> pending =
+        std::async(std::launch::deferred,
+                   [job = w3_dw_job, gw_ptr, rt, plan = *w3_dw_plan]() {
+                     release_held_cpu_dw();
+                     rt->compute(gw_ptr, plan, job->x_buf, job->d_buf);
+                     *job = Conv3x3wDwJob();
+                   }).share();
+    set_pending_host_write(gw, std::move(pending));
   }
 
   if (have_npu_dw) {
