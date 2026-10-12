@@ -199,13 +199,29 @@ def part_lifetime():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def main():
+def run_part(part):
+    """Runs one in-process part in a child so this process never holds the NPU:
+    quick_check already holds it, and a third process exhausts hardware contexts."""
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "--part", part],
+                       capture_output=True, text=True)
+    print(r.stdout, end="", flush=True)
+    if r.returncode != 0:
+        print(r.stderr[-1500:], flush=True)
+        failures.append(f"part {part} (exit {r.returncode})")
+
+
+def part_main(part):
     import xdna_train  # noqa: F401  (registers the device; compiles on first import)
 
     xdna_train.register_xdna_device()
     xdna_train.set_npu_mode(2)
-    part_grad_writes()
-    part_data_writes()
+    {"grad": part_grad_writes, "data": part_data_writes}[part]()
+    sys.exit(0 if not failures else 1)
+
+
+def main():
+    run_part("grad")   # also builds the dW stream the lifetime scenarios copy
+    run_part("data")
     part_lifetime()
     print("ALL OK" if not failures else f"FAILED: {failures}", flush=True)
     sys.exit(0 if not failures else 1)
@@ -214,5 +230,7 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--child":
         child(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "--part":
+        part_main(sys.argv[2])
     else:
         main()
