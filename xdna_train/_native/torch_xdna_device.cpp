@@ -5,6 +5,7 @@
 #include <ATen/MemoryOverlap.h>
 #include <ATen/native/CPUFallback.h>
 #include <ATen/native/Resize.h>
+#include <ATen/ops/set_native.h>
 #include <ATen/ops/unfold_native.h>
 #include <ATen/ops/convolution_ops.h>
 #include <ATen/ops/convolution_backward_ops.h>
@@ -1136,18 +1137,58 @@ const at::Tensor& resize_xdna_(
       "XDNA resize_ currently supports contiguous storage only");
 
   auto* impl = self.unsafeGetTensorImpl();
-  impl->generic_set_sizes_contiguous(size);
-  const auto nbytes_sym = at::detail::computeStorageNbytesContiguous(
-      size,
-      c10::SymInt(static_cast<int64_t>(self.element_size())),
-      self.sym_storage_offset());
-  const auto nbytes = static_cast<size_t>(
-      nbytes_sym.guard_int(__FILE__, __LINE__));
-  auto storage = self.storage();
-  if (nbytes > storage.nbytes()) {
-    resize_xdna_storage(storage.unsafeGetStorageImpl(), nbytes);
+  // Like at::native::resize_impl_cpu_: an unchanged size keeps the strides
+  // (and the storage); only an explicit contiguous format restrides.
+  if (!self.sym_sizes().equals(size)) {
+    impl->generic_set_sizes_contiguous(size);
+    const auto nbytes_sym = at::detail::computeStorageNbytesContiguous(
+        size,
+        c10::SymInt(static_cast<int64_t>(self.element_size())),
+        self.sym_storage_offset());
+    const auto nbytes = static_cast<size_t>(
+        nbytes_sym.guard_int(__FILE__, __LINE__));
+    auto storage = self.storage();
+    if (nbytes > storage.nbytes()) {
+      resize_xdna_storage(storage.unsafeGetStorageImpl(), nbytes);
+    }
+  }
+  if (memory_format == at::MemoryFormat::Contiguous) {
+    impl->empty_tensor_restride(at::MemoryFormat::Contiguous);
   }
   return self;
+}
+
+// set_(source, offset, size, stride): CPU's implementation works on any
+// storage whose allocator can resize it, which the XDNA allocator can.
+at::Tensor& set_storage_xdna_(
+    at::Tensor& self,
+    at::Storage source,
+    c10::SymInt storage_offset,
+    c10::SymIntArrayRef size,
+    c10::SymIntArrayRef stride) {
+  return at::native::set_storage_cpu_(
+      self,
+      std::move(source),
+      storage_offset.guard_int(__FILE__, __LINE__),
+      c10::asIntArrayRefSlow(size, __FILE__, __LINE__),
+      c10::asIntArrayRefSlow(stride, __FILE__, __LINE__));
+}
+
+at::Tensor& set_source_storage_xdna_(at::Tensor& self, at::Storage source) {
+  return at::native::set_(self, std::move(source));
+}
+
+at::Tensor& set_source_tensor_xdna_(
+    at::Tensor& self,
+    const at::Tensor& source) {
+  return at::native::set_tensor_(self, source);
+}
+
+// set_(): CPU's version installs an empty CPU storage, which XDNA must refuse.
+at::Tensor& set_empty_xdna_(at::Tensor& self) {
+  c10::Storage storage(
+      c10::Storage::use_byte_size_t(), 0, &g_xdna_allocator, true);
+  return self.set_(std::move(storage), 0, {0}, {});
 }
 
 at::Tensor cpu_alias(const at::Tensor& t) {
@@ -1191,7 +1232,7 @@ at::Tensor copy_from_and_resize(
     const at::Tensor& src,
     const at::Tensor& dst) {
   if (dst.device().type() == kXdnaType) {
-    resize_xdna_(dst, src.sym_sizes(), at::MemoryFormat::Contiguous);
+    resize_xdna_(dst, src.sym_sizes(), std::nullopt);
   } else {
     dst.resize_(src.sizes());
   }
@@ -3797,12 +3838,36 @@ at::Tensor add_tensor_xdna(
 }
 
 
+// Shared prologue of the custom out= kernels, in the order of CPU's
+// TensorIterator: resize `out` itself (with the usual deprecation warning for
+// a nonempty one) to the broadcast shape, then reject overlap on the ORIGINAL
+// tensors, before CPU aliases hide that they share storage.  Full overlap
+// (in-place, out == input) stays legal.
+void prepare_out_xdna(
+    at::Tensor& out,
+    std::initializer_list<const at::Tensor*> inputs) {
+  c10::DimVector shape((*inputs.begin())->sizes());
+  for (const at::Tensor* t : inputs) {
+    if (!t->sizes().equals(shape)) {
+      shape = at::infer_size_dimvector(shape, t->sizes());
+    }
+  }
+  if (!out.sizes().equals(shape)) {
+    at::native::resize_output(out, shape);
+  }
+  at::assert_no_internal_overlap(out);
+  for (const at::Tensor* t : inputs) {
+    at::assert_no_partial_overlap(out, *t);
+  }
+}
+
 at::Tensor& add_out_xdna(
     const at::Tensor& self,
     const at::Tensor& other,
     const at::Scalar& alpha,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::add.out");
+  prepare_out_xdna(out, {&self, &other});
   ensure_host_current(self);
   ensure_host_current(other);
   auto self_cpu = cpu_alias(self);
@@ -3819,6 +3884,7 @@ at::Tensor& mul_out_xdna(
     const at::Tensor& other,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::mul.out");
+  prepare_out_xdna(out, {&self, &other});
   ensure_host_current(self);
   ensure_host_current(other);
   auto self_cpu = cpu_alias(self);
@@ -3834,6 +3900,7 @@ at::Tensor& div_out_xdna(
     const at::Tensor& other,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::div.out");
+  prepare_out_xdna(out, {&self, &other});
   ensure_host_current(self);
   ensure_host_current(other);
   auto self_cpu = cpu_alias(self);
@@ -3848,6 +3915,7 @@ at::Tensor& sqrt_out_xdna(
     const at::Tensor& self,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::sqrt.out");
+  prepare_out_xdna(out, {&self});
   ensure_host_current(self);
   auto self_cpu = cpu_alias(self);
   auto out_cpu = cpu_alias(out);
@@ -3863,6 +3931,7 @@ at::Tensor& addcmul_out_xdna(
     const at::Scalar& value,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::addcmul.out");
+  prepare_out_xdna(out, {&self, &tensor1, &tensor2});
   ensure_host_current(self);
   ensure_host_current(tensor1);
   ensure_host_current(tensor2);
@@ -3883,6 +3952,7 @@ at::Tensor& addcdiv_out_xdna(
     const at::Scalar& value,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::addcdiv.out");
+  prepare_out_xdna(out, {&self, &tensor1, &tensor2});
   ensure_host_current(self);
   ensure_host_current(tensor1);
   ensure_host_current(tensor2);
@@ -3902,6 +3972,7 @@ at::Tensor& lerp_scalar_out_xdna(
     const at::Scalar& weight,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::lerp.Scalar_out");
+  prepare_out_xdna(out, {&self, &end});
   ensure_host_current(self);
   ensure_host_current(end);
   auto self_cpu = cpu_alias(self);
@@ -3916,6 +3987,7 @@ at::Tensor& sigmoid_out_xdna(
     const at::Tensor& self,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::sigmoid.out");
+  prepare_out_xdna(out, {&self});
   ensure_host_current(self);
   auto self_cpu = cpu_alias(self);
   auto out_cpu = cpu_alias(out);
@@ -3930,6 +4002,7 @@ at::Tensor& sub_out_xdna(
     const at::Scalar& alpha,
     at::Tensor& out) {
   ScopedMappedCpu mapped_phase("aten::sub.out");
+  prepare_out_xdna(out, {&self, &other});
   ensure_host_current(self);
   ensure_host_current(other);
   auto self_cpu = cpu_alias(self);
@@ -5467,6 +5540,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("view", TORCH_FN(view_xdna));
   m.impl("unfold", TORCH_FN(at::native::unfold));
   m.impl("resize_", TORCH_FN(resize_xdna_));
+  m.impl("set_.source_Storage", TORCH_FN(set_source_storage_xdna_));
+  m.impl(
+      "set_.source_Storage_storage_offset", TORCH_FN(set_storage_xdna_));
+  m.impl("set_.source_Tensor", TORCH_FN(set_source_tensor_xdna_));
+  m.impl("set_", TORCH_FN(set_empty_xdna_));
   m.impl("mm", TORCH_FN(mm_xdna));
   m.impl("leaky_relu", TORCH_FN(leaky_relu_xdna));
   m.impl("leaky_relu_backward", TORCH_FN(leaky_relu_backward_xdna));
@@ -5625,7 +5703,21 @@ bool zero_copy_cpu_fallback(
     return false;
   }
 
-  for (const auto& [cpu, xdna] : written) mark_host_dirty(xdna);
+  for (const auto& [cpu, xdna] : written) {
+    // The kernel saw a non-owning alias, so metadata changes landed there.
+    // Shape changes inside the same bytes (out= shrinking) belong to the
+    // XDNA tensor; moving to other storage or offset cannot be mirrored.
+    TORCH_CHECK(
+        cpu.const_data_ptr() == xdna.const_data_ptr(),
+        "XDNA CPU fallback: an in-place operation changed the storage or "
+        "storage offset of a tensor, which is not supported");
+    if (!cpu.sizes().equals(xdna.sizes()) ||
+        !cpu.strides().equals(xdna.strides())) {
+      xdna.unsafeGetTensorImpl()->set_sizes_and_strides(
+          cpu.sizes(), cpu.strides());
+    }
+    mark_host_dirty(xdna);
+  }
 
   const size_t r = rets.size();
   TORCH_INTERNAL_ASSERT(stack->size() >= r);
