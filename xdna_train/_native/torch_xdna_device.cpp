@@ -491,7 +491,15 @@ void materialize_virtual(
   if (!value)
     return;
 
-  auto out_cpu = cpu_alias_unchecked(tensor);
+  // Write through the producer's own view (recorded in set_virtual_value):
+  // `tensor` may be any alias of the storage (permute, narrow, a flat
+  // as_strided view, a resize_ of another view), with other dimensions.
+  auto producer_impl = c10::make_intrusive<c10::TensorImpl>(
+      c10::TensorImpl::VIEW, c10::Storage(tensor.storage()),
+      c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), value->dtype);
+  producer_impl->set_sizes_and_strides(value->sizes, value->strides);
+  producer_impl->set_storage_offset(value->storage_offset);
+  auto out_cpu = cpu_alias_unchecked(at::Tensor(std::move(producer_impl)));
   if (value->kind == XdnaVirtualKind::CatChannels4D) {
     int64_t offset = 0;
     for (const auto& src : value->sources) {
