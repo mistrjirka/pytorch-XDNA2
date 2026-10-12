@@ -48,7 +48,7 @@ Evidence column: file in `benchmarks/results/`, test in `tests/`, or a debug fla
 | More host threads for pack/unpack | Rejected | `XDNA_HOST_THREADS=20`: 288 ms/step; 6 ≈ 10 |
 | `xrt::runlist` batching | Deferred | Open reliability reports (research note); dispatch overhead is ~0.15 ms |
 | 10 resnet 9x9 convs: dedicated handling | Break-even only | Trace: 0.49 ms total per op, 0.32 ms NPU wait, ~0.15 ms compute; CPU 0.48 ms |
-| `XDNA_DEFER_CPU_DW=1` as default (CPU dW held until NPU dW starts) | **Unproven, opt-in** | Phase timing: bwd 63 -> 56 ms but fwd +3 and opt +1.5 ms, net 0-3 ms, within noise. Results identical (`gradchk`: loss 149.0, grad sum equal). Needs a 2-round AC ABBA |
+| `XDNA_DEFER_CPU_DW=1` (CPU dW queued on a worker, held until NPU dW starts) | **Removed** (see `MODES_AUDIT.md`): full-frame ABBA 0.1117 vs 0.1377 it/s, +50 % step time on `lab02_seg_full`; NIS phase timing was bwd 63 -> 56 ms but fwd +3 and opt +1.5 ms, net 0-3 ms, within noise |
 
 ## Hang / correctness root causes (do not repeat)
 
@@ -67,7 +67,6 @@ upsample, mul) ~25-30 ms. Profile is flat; remaining wins are each 1-3 %.
 
 ## Open items
 
-- Re-run the A/B for `XDNA_DEFER_CPU_DW=1` on AC power (>= 2 ABBA rounds).
 - Older NPU conv families still write outputs into recycled allocator memory (same coherency bug risk).
 - `w.data.add_` does not bump the version counter (weight cache may go stale; optimizers are fine).
 - Global `set_swap_module_params_on_conversion(True)` breaks LSTM `load_state_dict`; LSTM cell unoptimized (0.29x in model zoo).

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""A conv weight gradient is deferred (NPU dW: run at the optimizer; CPU dW:
-queued to a worker), so it must not read X / dY after backward returned:
-mutating either afterwards must not change the returned gradient.
+"""An NPU conv weight gradient is deferred (run at the optimizer), so it must
+not read X / dY after backward returned: mutating either afterwards must not
+change the returned gradient.
 
 Run with the NIS venv python and PYTHONPATH=<repo>.
 """
@@ -82,13 +82,6 @@ check("audit repro: dY zeroed after autograd.grad",
 case("npu dW", BIG, "npu_conv3x3w.dw.run")
 case("npu dW + dX", BIG, "npu_conv3x3w.dw.run", with_dx=True)
 case("npu dW, tiled width", WIDE, "npu_conv3x3w.dw.run", with_dx=True)
-
-# CPU dW on the worker queue (opt-in), overlapping an NPU dX (mode 1: no NPU dW).
-os.environ["XDNA_DEFER_CPU_DW"] = "1"
-xdna_train.set_npu_mode(1)
-dw_runs = calls("npu_conv3x3w.dw.run")
-case("cpu dW queue", BIG, "npu_conv3x3w.dx.run", with_dx=True)
-check("cpu dW queue: dW stayed on the CPU", calls("npu_conv3x3w.dw.run") == dw_runs)
 
 print("ALL OK" if not failures else f"FAILED: {failures}")
 sys.exit(1 if failures else 0)

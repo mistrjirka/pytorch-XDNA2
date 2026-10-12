@@ -530,8 +530,6 @@ void materialize_virtual(
   allocation->coherency = XdnaCoherency::HostDirty;
 }
 
-void release_held_cpu_dw();
-
 void wait_pending_host_write(XdnaAllocation* allocation) {
   std::shared_future<void> pending;
   {
@@ -539,8 +537,6 @@ void wait_pending_host_write(XdnaAllocation* allocation) {
     pending = allocation->pending_host_write;
   }
   if (pending.valid()) {
-    // A held CPU dW only starts on release; never wait on one that has not.
-    release_held_cpu_dw();
     pending.get();
   }
 }
@@ -560,110 +556,6 @@ void set_pending_host_write(
   // fence; a device consumer additionally performs the normal sync-to-device.
   allocation->coherency = XdnaCoherency::HostDirty;
 }
-
-class AsyncHostWorkQueue {
- public:
-  AsyncHostWorkQueue()
-      : max_outstanding_([]() {
-          const char* raw = std::getenv("XDNA_DEFER_CPU_DW_WINDOW");
-          if (raw != nullptr && raw[0] != 0) {
-            const int parsed = std::atoi(raw);
-            if (parsed > 0) return static_cast<size_t>(parsed);
-          }
-          return size_t(2);
-        }()),
-        worker_([this]() { run(); }) {}
-
-  // With XDNA_HOLD_CPU_DW (default on), submitted tasks wait until release():
-  // the CPU dWs then run while the CPU would otherwise idle on the deferred
-  // NPU dW, not competing with the backward chain for cores and bandwidth.
-  static bool hold_enabled() {
-    static const bool v = [] {
-      const char* raw = std::getenv("XDNA_HOLD_CPU_DW");
-      return raw == nullptr || raw[0] == 0 || std::strcmp(raw, "0") != 0;
-    }();
-    return v;
-  }
-
-  std::shared_future<void> submit_held(std::function<void()> fn) {
-    std::packaged_task<void()> task(std::move(fn));
-    auto future = task.get_future().share();
-    std::lock_guard<std::mutex> lock(mutex_);
-    held_.emplace_back(std::move(task));
-    return future;
-  }
-
-  void release() {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (held_.empty()) return;
-      for (auto& t : held_) {
-        ++outstanding_;
-        tasks_.emplace_back(std::move(t));
-      }
-      held_.clear();
-    }
-    work_cv_.notify_one();
-  }
-
-  std::shared_future<void> submit(std::function<void()> fn) {
-    std::packaged_task<void()> task(std::move(fn));
-    auto future = task.get_future().share();
-    {
-      std::unique_lock<std::mutex> lock(mutex_);
-      space_cv_.wait(lock, [this]() {
-        return outstanding_ < max_outstanding_;
-      });
-      ++outstanding_;
-      tasks_.emplace_back(std::move(task));
-    }
-    work_cv_.notify_one();
-    return future;
-  }
-
-  void drain() {
-    release();
-    submit([]() {}).get();
-  }
-
- private:
-  void run() {
-    for (;;) {
-      std::packaged_task<void()> task;
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        work_cv_.wait(lock, [this]() { return !tasks_.empty(); });
-        task = std::move(tasks_.front());
-        tasks_.pop_front();
-      }
-      sync_host_threads();
-      task();
-      {
-        std::lock_guard<std::mutex> guard(mutex_);
-        --outstanding_;
-      }
-      space_cv_.notify_all();
-    }
-  }
-
-  const size_t max_outstanding_;
-  size_t outstanding_ = 0;
-  std::mutex mutex_;
-  std::condition_variable work_cv_;
-  std::condition_variable space_cv_;
-  std::deque<std::packaged_task<void()>> tasks_;
-  std::deque<std::packaged_task<void()>> held_;
-  std::thread worker_;
-};
-
-AsyncHostWorkQueue& cpu_dw_queue() {
-  // Process lifetime by design.  This avoids shutdown-order hazards between
-  // queued ATen work, PyTorch globals and XRT-backed gradient storage.
-  static auto* queue = new AsyncHostWorkQueue();
-  return *queue;
-}
-
-void release_held_cpu_dw() { cpu_dw_queue().release(); }
 
 void ensure_host_current(const at::Tensor& tensor) {
   if (!tensor.defined() || tensor.device().type() != kXdnaType) {
@@ -988,12 +880,8 @@ struct XdnaGuardImpl final : c10::impl::DeviceGuardImplInterface {
     return true;
   }
 
-  void synchronizeStream(const c10::Stream&) const override {
-    cpu_dw_queue().drain();
-  }
-  void synchronizeDevice(const c10::DeviceIndex) const override {
-    cpu_dw_queue().drain();
-  }
+  void synchronizeStream(const c10::Stream&) const override {}
+  void synchronizeDevice(const c10::DeviceIndex) const override {}
 };
 
 void resize_xdna_storage(c10::StorageImpl* storage, size_t newsize) {
@@ -5004,13 +4892,9 @@ convolution_backward_overrideable_xdna(
     const char* raw = std::getenv("XDNA_DISABLE_CPU_DW_OVERLAP");
     return !(raw != nullptr && raw[0] != 0 && std::strcmp(raw, "0") != 0);
   }();
-  const bool defer_cpu_dw = []() {
-    const char* raw = std::getenv("XDNA_DEFER_CPU_DW");
-    return raw != nullptr && raw[0] != 0 && std::strcmp(raw, "0") != 0;
-  }();
 
   std::optional<std::array<at::Tensor, 2>> virtual_dw_sources;
-  if (lazy_decoder_dw_enabled() && !defer_cpu_dw &&
+  if (lazy_decoder_dw_enabled() &&
       have_npu_dx && output_mask[1] &&
       stride.size() == 2 && stride[0] == 1 && stride[1] == 1 &&
       padding.size() == 2 && padding[0] == 1 && padding[1] == 1 &&
@@ -5066,61 +4950,7 @@ convolution_backward_overrideable_xdna(
         output_padding.begin(), output_padding.end());
     const c10::SymInt groups_v = groups;
 
-    if (defer_cpu_dw) {
-      // Return the gradient storage immediately.  A single bounded worker
-      // computes CPU dWs in dependency-independent order while autograd keeps
-      // advancing the NPU dX chain.  Any actual consumer of gw fences through
-      // ensure_host_current()/ensure_device_current().
-      gw = xdna_empty_like_shape(weight.sym_sizes(), weight.scalar_type());
-      auto gw_cpu_keep = cpu_alias(gw);
-      // The task runs after backward returned: it must not read X / dY live,
-      // since they may be written in between (in-place ops, dY reuse).  Copy
-      // the operands that still alias XDNA storage (a layout conversion above
-      // already made its own copy).
-      if (go_cpu_keep.data_ptr() == grad_output.data_ptr()) {
-        go_cpu_keep = go_cpu_keep.clone();
-      }
-      if (input_cpu_keep.data_ptr() == input.data_ptr()) {
-        input_cpu_keep = input_cpu_keep.clone();
-      }
-      // CPU aliases are intentionally non-owning. Retain the XDNA tensors
-      // themselves so their BOs cannot return to the cache while queued dW
-      // still reads/writes the mapped addresses.
-      auto weight_xdna_keep = weight;
-      auto gw_xdna_keep = gw;
-      auto dw_task =
-          [go_cpu_keep,
-           input_cpu_keep,
-           weight_cpu_keep,
-           gw_cpu_keep,
-           weight_xdna_keep,
-           gw_xdna_keep,
-           stride_v = std::move(stride_v),
-           padding_v = std::move(padding_v),
-           dilation_v = std::move(dilation_v),
-           transposed,
-           output_padding_v = std::move(output_padding_v),
-           groups_v]() mutable {
-            const std::array<bool, 3> dw_mask = {false, true, false};
-            auto grads = at::_ops::convolution_backward::call(
-                go_cpu_keep,
-                input_cpu_keep,
-                weight_cpu_keep,
-                std::nullopt,
-                c10::SymIntArrayRef(stride_v),
-                c10::SymIntArrayRef(padding_v),
-                c10::SymIntArrayRef(dilation_v),
-                transposed,
-                c10::SymIntArrayRef(output_padding_v),
-                groups_v,
-                dw_mask);
-            gw_cpu_keep.copy_(std::get<1>(grads), false);
-          };
-      auto pending = AsyncHostWorkQueue::hold_enabled()
-          ? cpu_dw_queue().submit_held(std::move(dw_task))
-          : cpu_dw_queue().submit(std::move(dw_task));
-      set_pending_host_write(gw, std::move(pending));
-    } else if (virtual_dw_sources.has_value()) {
+    if (virtual_dw_sources.has_value()) {
       const auto src0_xdna = (*virtual_dw_sources)[0];
       const auto src1_xdna = (*virtual_dw_sources)[1];
       ensure_host_current(src0_xdna);
@@ -5242,7 +5072,6 @@ convolution_backward_overrideable_xdna(
     std::shared_future<void> pending =
         std::async(std::launch::deferred,
                    [job = w3_dw_job, gw_ptr, rt, plan = *w3_dw_plan]() {
-                     release_held_cpu_dw();
                      rt->compute(gw_ptr, plan, job->x_buf, job->d_buf);
                      *job = Conv3x3wDwJob();
                    }).share();
@@ -5726,7 +5555,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     TORCH_CHECK(index == 0, "only xdna:0 is currently supported");
     g_current_device = 0;
   });
-  m.def("synchronize", []() { cpu_dw_queue().drain(); });
+  m.def("synchronize", []() {});
   m.def("is_available", []() { return true; });
   m.def("alignment", []() { return kPageAlignment; });
   m.def("cpu_mm", &cpu_mm_xdna);

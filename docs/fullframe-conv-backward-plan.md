@@ -142,8 +142,8 @@ the dX critical path.
 A second scheduling experiment returned an XDNA gradient immediately, queued CPU
 dW on a bounded worker, and allowed autograd to advance the NPU dX chain before
 joining the weight gradients. This was intentionally gated by
-`XDNA_DEFER_CPU_DW=1`; the normal immediate `NPU dX || CPU dW` scheduler
-remains the default.
+`XDNA_DEFER_CPU_DW=1` (since removed); the normal immediate
+`NPU dX || CPU dW` scheduler remains the default.
 
 Two correctness/lifetime issues had to be exposed before the experiment was
 valid:
