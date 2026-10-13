@@ -30,6 +30,7 @@ def build_native():
         _NATIVE / "torch_xdna_device.cpp",
         _NATIVE / "train_xrt_shim.cpp",
         _NATIVE / "conv_pack.cpp",
+        _NATIVE / "region_kernels.cpp",
     ]
     hash_inputs = sources + [_SHIM / "xrt_shim.cpp", _SHIM / "xrt_shim.h", Path(__file__)]
     xrt_include, xrt_lib = find_xrt_paths()

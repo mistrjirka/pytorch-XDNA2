@@ -69,6 +69,17 @@
 extern "C" void* shim_bo_map(ShimBo*);
 extern "C" size_t shim_bo_size(ShimBo*);
 extern "C" void xdna_conv_set_threads(int);
+extern "C" double xdna_region_sqdiff_sum_bf16(const uint16_t*, const uint16_t*, int64_t, int);
+extern "C" void xdna_region_relu_bf16(const uint16_t*, uint16_t*, int64_t, int);
+extern "C" void xdna_region_relu_maxpool2_bf16(
+    const uint16_t*, uint16_t*, uint16_t*, int64_t, int64_t, int64_t, int);
+extern "C" void xdna_region_addtap_bf16(
+    const uint16_t*, const uint16_t*, const uint16_t*, uint16_t*, int64_t, float, int);
+extern "C" void xdna_region_relu_bwd_bf16(
+    const uint16_t*, const uint16_t*, const uint16_t*, const uint16_t*, uint16_t*, int64_t,
+    float, int);
+extern "C" void xdna_region_maxpool2_bwd_bf16(
+    const uint16_t*, const uint16_t*, uint16_t*, int64_t, int64_t, int64_t, int);
 extern "C" void xdna_pack_conv3x3_halo_padded_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int);
 extern "C" void xdna_pack_conv3x3_halo_padded_channels_last_bf16(
@@ -4921,6 +4932,112 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // CPU result.
   m.def("cpu_alias", [](const at::Tensor& t) { return cpu_alias(t); });
   m.def("from_cpu", [](const at::Tensor& t) { return adopt_or_copy(t); });
+
+  // Fused host kernels of xdna_train/regions.py.  Tensors are contiguous bf16
+  // XDNA tensors; outputs are marked host-dirty so the NPU side re-syncs them.
+  {
+    auto bf16_host = [](const at::Tensor& t, const char* what) {
+      TORCH_CHECK(t.device().type() == kXdnaType && t.scalar_type() == at::kBFloat16 &&
+                      t.is_contiguous(),
+                  what, " must be a contiguous bf16 XDNA tensor");
+      ensure_host_current(t);
+      return reinterpret_cast<const uint16_t*>(t.const_data_ptr());
+    };
+    auto bf16_out = [](const at::Tensor& t, const char* what) {
+      TORCH_CHECK(t.device().type() == kXdnaType && t.scalar_type() == at::kBFloat16 &&
+                      t.is_contiguous(),
+                  what, " must be a contiguous bf16 XDNA tensor");
+      ensure_host_current(t);
+      return reinterpret_cast<uint16_t*>(t.mutable_data_ptr());
+    };
+    auto nthreads = []() { sync_host_threads(); return at::get_num_threads(); };
+    m.def("region_sqdiff_sum", [=](const at::Tensor& a, const at::Tensor& b) {
+      TORCH_CHECK(a.numel() == b.numel(), "region_sqdiff_sum: size mismatch");
+      const auto* pa = bf16_host(a, "a");
+      const auto* pb = bf16_host(b, "b");
+      const int t = nthreads();
+      py::gil_scoped_release release;
+      return xdna_region_sqdiff_sum_bf16(pa, pb, a.numel(), t);
+    });
+    m.def("region_relu", [=](const at::Tensor& a, const at::Tensor& r) {
+      TORCH_CHECK(a.numel() == r.numel(), "region_relu: size mismatch");
+      const auto* pa = bf16_host(a, "a");
+      auto* pr = bf16_out(r, "r");
+      const int t = nthreads();
+      {
+        py::gil_scoped_release release;
+        xdna_region_relu_bf16(pa, pr, a.numel(), t);
+      }
+      mark_host_dirty(r);
+    });
+    m.def("region_relu_maxpool2", [=](const at::Tensor& a, const at::Tensor& r, const at::Tensor& p) {
+      TORCH_CHECK(a.dim() == 4 && a.sizes().equals(r.sizes()) && p.dim() == 4 &&
+                      p.size(2) == a.size(2) / 2 && p.size(3) == a.size(3) / 2 &&
+                      p.size(0) == a.size(0) && p.size(1) == a.size(1),
+                  "region_relu_maxpool2: shape mismatch");
+      const auto* pa = bf16_host(a, "a");
+      auto* pr = bf16_out(r, "r");
+      auto* pp = bf16_out(p, "p");
+      const int t = nthreads();
+      {
+        py::gil_scoped_release release;
+        xdna_region_relu_maxpool2_bf16(pa, pr, pp, a.size(0) * a.size(1), a.size(2), a.size(3), t);
+      }
+      mark_host_dirty(r);
+      mark_host_dirty(p);
+    });
+    // out = base + scale * (a - b); base may be None.
+    m.def("region_addtap", [=](const std::optional<at::Tensor>& base, const at::Tensor& a,
+                               const at::Tensor& b, const at::Tensor& out, double scale) {
+      TORCH_CHECK(a.numel() == b.numel() && a.numel() == out.numel(), "region_addtap: size mismatch");
+      const uint16_t* pbase = base ? bf16_host(*base, "base") : nullptr;
+      TORCH_CHECK(!base || base->numel() == a.numel(), "region_addtap: base size mismatch");
+      const auto* pa = bf16_host(a, "a");
+      const auto* pb = bf16_host(b, "b");
+      auto* po = bf16_out(out, "out");
+      const int t = nthreads();
+      {
+        py::gil_scoped_release release;
+        xdna_region_addtap_bf16(pbase, pa, pb, po, a.numel(), float(scale), t);
+      }
+      mark_host_dirty(out);
+    });
+    // out = (r <= 0) ? 0 : base + scale * (a - b); base, a, b optional (a and b together).
+    m.def("region_relu_bwd", [=](const at::Tensor& r, const std::optional<at::Tensor>& base,
+                                 const std::optional<at::Tensor>& a, const std::optional<at::Tensor>& b,
+                                 const at::Tensor& out, double scale) {
+      TORCH_CHECK(a.has_value() == b.has_value(), "region_relu_bwd: a and b go together");
+      TORCH_CHECK(r.numel() == out.numel(), "region_relu_bwd: size mismatch");
+      const auto* pr = bf16_host(r, "r");
+      const uint16_t* pbase = base ? bf16_host(*base, "base") : nullptr;
+      const uint16_t* pa = a ? bf16_host(*a, "a") : nullptr;
+      const uint16_t* pb = b ? bf16_host(*b, "b") : nullptr;
+      TORCH_CHECK((!base || base->numel() == r.numel()) && (!a || (a->numel() == r.numel() && b->numel() == r.numel())),
+                  "region_relu_bwd: operand size mismatch");
+      auto* po = bf16_out(out, "out");
+      const int t = nthreads();
+      {
+        py::gil_scoped_release release;
+        xdna_region_relu_bwd_bf16(pr, pbase, pa, pb, po, r.numel(), float(scale), t);
+      }
+      mark_host_dirty(out);
+    });
+    m.def("region_maxpool2_bwd", [=](const at::Tensor& x, const at::Tensor& g, const at::Tensor& out) {
+      TORCH_CHECK(x.dim() == 4 && out.sizes().equals(x.sizes()) && g.dim() == 4 &&
+                      g.size(2) == x.size(2) / 2 && g.size(3) == x.size(3) / 2 &&
+                      g.size(0) == x.size(0) && g.size(1) == x.size(1),
+                  "region_maxpool2_bwd: shape mismatch");
+      const auto* px = bf16_host(x, "x");
+      const auto* pg = bf16_host(g, "g");
+      auto* po = bf16_out(out, "out");
+      const int t = nthreads();
+      {
+        py::gil_scoped_release release;
+        xdna_region_maxpool2_bwd_bf16(px, pg, po, x.size(0) * x.size(1), x.size(2), x.size(3), t);
+      }
+      mark_host_dirty(out);
+    });
+  }
   m.def("set_npu_mode", [](int mode) { g_npu_mode.store(mode); });
   m.def("iron_builds_pending", []() {
     int n = 0;
