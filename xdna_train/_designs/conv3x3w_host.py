@@ -86,7 +86,10 @@ def bfp16_encode(x):
     u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32).reshape(-1, 8)
     max_exp = ((u >> 23) & 0xFF).astype(np.int64).max(axis=1, keepdims=True)
     lsb = np.ldexp(1.0, max_exp - 127 - 6)
-    q = np.clip(np.rint(x.reshape(-1, 8).astype(np.float64) / lsb), -128, 127).astype(np.int64)
+    # Non-finite values have no encoding: Inf saturates, NaN becomes 0.
+    q = np.nan_to_num(np.rint(x.reshape(-1, 8).astype(np.float64) / lsb), nan=0.0,
+                      posinf=127.0, neginf=-128.0)
+    q = np.clip(q, -128, 127).astype(np.int64)
     out = np.empty((u.shape[0], 9), np.uint8)
     out[:, 0] = max_exp[:, 0].astype(np.uint8)
     out[:, 1:] = (q & 0xFF).astype(np.uint8)

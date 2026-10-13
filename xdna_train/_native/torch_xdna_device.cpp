@@ -1551,6 +1551,16 @@ struct Conv3x3wPacked {
   size_t bytes = 0;
   std::array<int64_t, 5> shape{};  // B, C, H, W, chunks of the last pack
   std::map<std::pair<size_t, size_t>, ShimBo*> subs;  // (offset, size)
+  // Written by the CPU but not yet synced to the device: whoever dispatches
+  // with it next must call sync_if_pending() first.
+  bool sync_pending = false;
+
+  void sync_if_pending() {
+    if (!sync_pending) return;
+    TORCH_CHECK(shim_bo_sync_to_device(bo) == 0, "failed to sync conv3x3w input: ",
+                shim_last_error());
+    sync_pending = false;
+  }
 
   // A device-side window of this buffer (cached).
   ShimBo* sub(size_t offset, size_t size) {
@@ -1684,6 +1694,7 @@ void pack_conv3x3w_input(Conv3x3wPacked& buf, const at::Tensor& x_cpu, int64_t c
       halo_zero ? 1 : 0, int(chunks), 0, int(groups));
   TORCH_CHECK(shim_bo_sync_to_device(buf.bo) == 0,
               "failed to sync conv3x3w input: ", shim_last_error());
+  buf.sync_pending = false;
 }
 
 std::array<int64_t, 12> packed_tag_of(const at::Tensor& t, int64_t chunks) {
@@ -2198,11 +2209,9 @@ struct XdnaConv3x3wRuntime {
       if (j + 1 < tasks.size()) start(tasks[j + 1], cur);
       unpack(tasks[j]);
     }
-    if (x16) {
-      ScopedMappedCpu sync_phase("npu_conv3x3w.dw_copy_sync");
-      TORCH_CHECK(shim_bo_sync_to_device(x16->bo) == 0,
-                  "failed to sync conv3x3w input copy: ", shim_last_error());
-    }
+    // Synced by the dW when it runs (often on the async helper thread), off
+    // this conv's critical path.
+    if (x16) x16->sync_pending = true;
     if (bias.has_value() && bias->defined()) {
       ensure_host_current(*bias);
       out_cpu.add_(cpu_alias(*bias).view({1, -1, 1, 1}));
@@ -2434,6 +2443,11 @@ struct XdnaConv3x3wDwRuntime {
       {
         ScopedMappedCpu run_phase("npu_conv3x3w.dw.run");
         const auto t0 = std::chrono::steady_clock::now();
+        if (i == 0) {
+          ScopedMappedCpu sync_phase("npu_conv3x3w.dw.copy_sync");
+          x_buf->sync_if_pending();
+          d_buf->sync_if_pending();
+        }
         ShimBo* data[3] = {x_buf->bo, d_buf->bo, c};
         TORCH_CHECK(shim_run_kernel(kernel, 3, it->second.first, it->second.second, data, 3) == 0,
                     "conv3x3w_dw dispatch failed: ", shim_last_error());

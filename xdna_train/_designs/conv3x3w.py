@@ -107,7 +107,8 @@ def conv3x3w(
 
     A_l2_ty = np.ndarray[(ROWS * WIN_ROWS * RW,), np.dtype[np.int32]]
     A_l1_ty = np.ndarray[(WIN_ROWS * RW,), np.dtype[np.int32]]
-    S_l1_ty = np.ndarray[(WIN_ROWS * RW + 16,), np.dtype[np.int32]]
+    # shifted copy of the window: up to 79 bytes of placement offset (kernel)
+    S_l1_ty = np.ndarray[(WIN_ROWS * RW + 32,), np.dtype[np.int32]]
     B_ty_l = np.ndarray[(k, N // 8), np.dtype[v8bfp16ebs8]]
     C_l2_ty = np.ndarray[(ROWS * M_CORE, N), np.dtype[bfloat16]]
     C_l1_ty = np.ndarray[(M_CORE, N), np.dtype[bfloat16]]

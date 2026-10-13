@@ -61,3 +61,24 @@ rest of the step is CPU work (VGG loss, BN, activations, CPU convs).
    memtile instead of re-reading them per group, would cut DRAM traffic ~40%.
 4. `prep_window` costs ~0.16 ms per pass; the memtile could deliver the shifted
    copy instead.
+
+## Follow-up after the external audit (docs/research/bfp-input-notes, 2026-10-13)
+
+Applied:
+- Non-finite inputs: the scalar, AVX-512 and numpy encoders now agree (Inf
+  saturates to 127/-128, NaN encodes as 0). Before, scalar and AVX-512 produced
+  different bytes. A NaN or Inf therefore does not propagate through an NPU conv.
+- The shifted window copy is placed from each buffer's own address
+  (`shift_base`), instead of a pointer difference between two buffers that
+  assumed equal placement modulo 64. The row-pair addresses are computed once
+  per row pair, outside the output-channel loop.
+- The dW copy of the input is written with streaming stores (full aligned rows)
+  and synced when the dW runs (`Conv3x3wPacked::sync_pending`), not at the end
+  of the forward/dX call.
+
+Measured (NIS step, ABBA x4): old 108.2, new 109.4 (one 117 ms outlier, median
+107.5), new with `XDNA_CONV3X3W_NPU_GMACS=10` 104.9 ms. Rate 10 won every round
+there. But in the model zoo (XDNA only, 2 rounds each) it made `nis_mynet`
+(MyNet without the VGG loss) ~12% slower (76.1/79.4 -> 85.6/89.0 ms), and other
+rows were mixed or noise. So the default stays 5.5. The cost model needs per-shape
+NPU times (small 9x9 convs are overhead bound), not one higher rate.

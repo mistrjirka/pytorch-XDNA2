@@ -263,6 +263,8 @@ def bfp_case(B, C, H, W):
             x[0, :, 0, 0] = 0.0                      # an all-zero block
             if C > 9:
                 x[-1, 1:9, -1, -1] *= 1e-30          # tiny values next to normal ones
+            if C > 20 and H > 2:                     # non-finite: Inf saturates, NaN -> 0
+                x[0, 16, 1, 1], x[0, 17, 1, 2], x[0, 18, 2, 1] = np.inf, -np.inf, np.nan
             xb = np.ascontiguousarray(ref.bf16_bits(x))
             expect = ref.pack_input_strips_bfp(x, chunks, bool(halo_zero))
             expect16 = ref.pack_input_strips(x, chunks, bool(halo_zero))

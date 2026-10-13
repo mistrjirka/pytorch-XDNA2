@@ -722,7 +722,9 @@ inline void encode_bfp_block(const uint16_t* v, uint8_t* out) {
     const uint32_t bits = uint32_t(v[i]) << 16;
     float f;
     std::memcpy(&f, &bits, sizeof(f));
-    double q = __builtin_nearbyint(double(f) * scale);
+    // Non-finite values have no bfp16 encoding: Inf saturates, NaN becomes 0
+    // (the AVX-512 path hands blocks holding them to this one).
+    double q = f != f ? 0.0 : __builtin_nearbyint(double(f) * scale);
     q = q < -128.0 ? -128.0 : (q > 127.0 ? 127.0 : q);
     out[1 + i] = uint8_t(int8_t(int(q)));
   }
@@ -732,11 +734,13 @@ inline void encode_bfp_block(const uint16_t* v, uint8_t* out) {
 // integers: a normal bf16 value is (128 + m) * 2^(e - 134), so its mantissa
 // is (128 + m) >> (mx - e + 1) rounded to nearest even (subnormals: m >> mx).
 // Bit-identical to encode_bfp_block.
+// Returns false, writing nothing, when a value is Inf or NaN.
 __attribute__((target("avx512f,avx512bw")))
-void encode_bfp_blocks4_avx512(const uint16_t* v, uint8_t exps[4], uint8_t mant[32]) {
+bool encode_bfp_blocks4_avx512(const uint16_t* v, uint8_t exps[4], uint8_t mant[32]) {
   const __m512i x = _mm512_loadu_si512(v);
   const __m512i ff = _mm512_set1_epi16(0xFF), one = _mm512_set1_epi16(1);
   const __m512i e = _mm512_and_si512(_mm512_srli_epi16(x, 7), ff);
+  if (_mm512_cmpeq_epi16_mask(e, ff)) return false;
   // block max: each 128-bit lane is one block of 8 values
   __m512i m = _mm512_max_epu16(e, _mm512_rol_epi32(e, 16));
   m = _mm512_max_epu16(m, _mm512_shuffle_epi32(m, _MM_PERM_CDAB));
@@ -759,6 +763,7 @@ void encode_bfp_blocks4_avx512(const uint16_t* v, uint8_t exps[4], uint8_t mant[
   alignas(64) uint16_t mm[32];
   _mm512_store_si512(mm, m);
   for (int k = 0; k < 4; ++k) exps[k] = uint8_t(mm[8 * k]);
+  return true;
 }
 
 bool have_avx512bw() {
@@ -771,7 +776,10 @@ inline void encode_pixel_bfp(const uint16_t* px, int nblk, uint8_t (*enc)[9]) {
   if (have_avx512bw()) {
     for (int k0 = 0; k0 < nblk; k0 += 4) {
       uint8_t exps[4], mant[32];
-      encode_bfp_blocks4_avx512(px + 8 * k0, exps, mant);
+      if (!encode_bfp_blocks4_avx512(px + 8 * k0, exps, mant)) {
+        for (int k = k0; k < nblk && k < k0 + 4; ++k) encode_bfp_block(px + 8 * k, enc[k]);
+        continue;
+      }
       for (int k = k0; k < nblk && k < k0 + 4; ++k) {
         enc[k][0] = exps[k - k0];
         std::memcpy(&enc[k][1], mant + 8 * (k - k0), 8);
@@ -780,6 +788,21 @@ inline void encode_pixel_bfp(const uint16_t* px, int nblk, uint8_t (*enc)[9]) {
     return;
   }
   for (int k = 0; k < nblk; ++k) encode_bfp_block(px + 8 * k, enc[k]);
+}
+
+__attribute__((target("avx512f,avx512bw")))
+void stream_row64_avx512(uint16_t* d, const uint16_t* s) {
+  _mm512_stream_si512((__m512i*)d, _mm512_loadu_si512(s));
+  _mm512_stream_si512((__m512i*)(d + 32), _mm512_loadu_si512(s + 32));
+}
+
+// One pixel's channels of the dW copy, streamed when it is a full aligned row.
+inline void copy_dw_row(uint16_t* d, const uint16_t* s, int channels) {
+  if (channels == kKStep && (reinterpret_cast<uintptr_t>(d) & 63) == 0 && have_avx512bw()) {
+    stream_row64_avx512(d, s);
+    return;
+  }
+  std::memcpy(d, s, std::size_t(channels) * sizeof(uint16_t));
 }
 }  // namespace
 
@@ -792,6 +815,8 @@ extern "C" {
 // per shape (zero bytes are a valid zero block).  dst16, if not null, also
 // receives xdna_conv3x3w_pack_input_strips_range_bf16's result for the same
 // groups (the layout of the deferred weight gradient), from the same read.
+// The CPU never reads that copy, so full rows go out as streaming stores: they
+// skip the cache and leave nothing for the later device sync to flush.
 void xdna_conv3x3w_pack_input_strips_range_bfp16(
     const uint16_t* src,
     uint8_t* dst,
@@ -817,7 +842,9 @@ void xdna_conv3x3w_pack_input_strips_range_bfp16(
   const int v1 = int((phi - 1) / img) + 1 < Bv ? int((phi - 1) / img) + 1 : Bv;
   if (v1 <= v0) return;
   const std::size_t plane = std::size_t(kGroupRowsBfp) * 9;  // one channel block
-#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
+#pragma omp parallel num_threads(g_pack_threads)
+  {
+#pragma omp for collapse(3) schedule(static) nowait
   for (int vb = v0; vb < v1; ++vb) {
     for (int chunk = 0; chunk < chunks; ++chunk) {
       for (int y = 0; y < H; ++y) {
@@ -851,15 +878,13 @@ void xdna_conv3x3w_pack_input_strips_range_bfp16(
             const std::size_t r = p % kGroupOutRows;
             if (dst16) {
               if (g >= std::size_t(g0) && g < std::size_t(g0 + ng))
-                std::memcpy(
-                    dst16 + (((g - g0) * chunks + chunk) * kGroupRows + r) * kKStep,
-                    tile[xi], std::size_t(cc) * sizeof(uint16_t));
+                copy_dw_row(dst16 + (((g - g0) * chunks + chunk) * kGroupRows + r) * kKStep,
+                            tile[xi], cc);
               if (g > std::size_t(g0) && g <= std::size_t(g0 + ng) &&
                   r + kGroupOutRows < std::size_t(kGroupRows))
-                std::memcpy(
-                    dst16 + (((g - 1 - g0) * chunks + chunk) * kGroupRows + r +
-                             kGroupOutRows) * kKStep,
-                    tile[xi], std::size_t(cc) * sizeof(uint16_t));
+                copy_dw_row(dst16 + (((g - 1 - g0) * chunks + chunk) * kGroupRows + r +
+                                     kGroupOutRows) * kKStep,
+                            tile[xi], cc);
             }
             if (g >= std::size_t(g0) && g < std::size_t(g0 + ng)) {
               uint8_t* d = dst + ((g - g0) * chunks + chunk) * 8 * plane + r * 9;
@@ -875,6 +900,8 @@ void xdna_conv3x3w_pack_input_strips_range_bfp16(
         }
       }
     }
+  }
+  _mm_sfence();  // this worker's streaming stores are done before the sync
   }
 }
 

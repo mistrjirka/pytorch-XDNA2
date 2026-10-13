@@ -33,21 +33,37 @@ void zero_vectorized(T *__restrict c) {
 // contiguous bytes at any byte offset.  Rows z and z+1 are consecutive, so one
 // load stream pops both.
 //
-// Hardware rule: the load stream fills 64-byte lines and holds two of them, so
-// a pair of 72-byte pops is exact only when it starts at most 48 bytes into
-// its line (a 56..63 start loses the last block).  The caller keeps a second
-// copy of the window shifted by 16 bytes (prep_window); `shift_off` is its
-// distance, and a pair that starts late in its line is read from the copy,
-// where it starts 16 bytes later modulo 64, i.e. within the first 15 bytes.
+// Hardware rule (found on the device, not documented): the load stream fills
+// 64-byte lines and holds two of them, so a pair of 72-byte pops is exact only
+// when it starts at most 48 bytes into its line (a later start loses the last
+// block).  The caller keeps a second copy of the window (prep_window) at
+// pShift, which is congruent to pWin + 16 modulo 64; a pair that starts late in
+// its line is read from the copy, where it starts within the first 15 bytes.
+//
+// Where prep_window puts the copy, as an offset into the scratch buffer: from
+// the two buffers' own addresses, so it holds for any placement.  Needs both
+// buffers 16-byte aligned and 80 bytes of slack in the scratch.
+inline unsigned shift_base(const uint8_t *pWin, const uint8_t *pS) {
+  return 16 + (unsigned)(((uintptr_t)pWin - (uintptr_t)pS) & 63);
+}
+
 template <unsigned rowA, unsigned colA, unsigned colB, unsigned winb>
-void matmul_window_bfp(const uint8_t *__restrict pWin, const bfp16ebs8 *__restrict pB,
-                       bfloat16 *__restrict pC, int tap_rows, int shift_off) {
+void matmul_window_bfp(const uint8_t *__restrict pWin, const uint8_t *__restrict pShift,
+                       const bfp16ebs8 *__restrict pB, bfloat16 *__restrict pC,
+                       int tap_rows) {
   constexpr unsigned sizeC = 64;
   using BS = aie::block_vector_input_buffer_stream<bfp16ebs8, 64>;
   for (unsigned z = 0; z < rowA; z += 2) {
     bfloat16 *__restrict pC1 = pC + (z * colB) * sizeC;
     bfloat16 *__restrict pC2 = pC + ((z + 1) * colB) * sizeC;
-    const uint8_t *pAz = pWin + (tap_rows + z * 8) * 9;
+    // Start of the row pair in each channel block, from whichever copy
+    // places it early enough in its line (independent of j).
+    const uint8_t *pA[colA];
+#pragma unroll
+    for (unsigned i = 0; i < colA; ++i) {
+      const unsigned off = (tap_rows + z * 8 + i * winb) * 9;
+      pA[i] = (((uintptr_t)(pWin + off)) & 63) > 48 ? pShift + off : pWin + off;
+    }
     AIE_PREPARE_FOR_PIPELINING
     for (unsigned j = 0; j < colB; j += 2) {
       BS bs(pB);
@@ -58,9 +74,7 @@ void matmul_window_bfp(const uint8_t *__restrict pWin, const bfp16ebs8 *__restri
       aie::accum<accfloat, sizeC> c11(aie::load_v<sizeC>(pC2 + sizeC));
 #pragma unroll
       for (unsigned i = 0; i < colA; ++i) {
-        const uint8_t *pa = pAz + i * winb * 9;
-        if ((((uintptr_t)pa) & 63) > 48) pa += shift_off;
-        BS as((const bfp16ebs8 *)pa);
+        BS as((const bfp16ebs8 *)pA[i]);
         const auto A0 = as.pop();
         const auto A1 = as.pop();
         const auto B0 = bs.pop();
@@ -91,18 +105,20 @@ void matmul_window(const uint8_t *__restrict pWin, const uint8_t *__restrict pS,
   const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   static_assert(DIM_M % 16 == 0 && DIM_K == 64 && DIM_N % 16 == 0);
   matmul_window_bfp<DIM_M / 8, DIM_K / 8, DIM_N / 8, WINB>(
-      pWin, pB, pC, tap_rows, (int)(pS + 16 - pWin));
+      pWin, pS + shift_base(pWin, pS), pB, pC, tap_rows);
   aie::set_rounding(saved_rounding);
 }
 #endif
 
 #ifdef PREP_ONLY
-// pS[16 ..] = the window (16-byte vectors keep both sides aligned).
+// The shifted copy of the window: pS + shift_base(pWin, pS) (16-byte vectors
+// keep both sides aligned, since the offset is a multiple of 16).
 void prep_window(const uint8_t *__restrict pWin, uint8_t *__restrict pS) {
   constexpr unsigned n = WINB * 72 / 16;
+  uint8_t *__restrict d = pS + shift_base(pWin, pS);
   AIE_PREPARE_FOR_PIPELINING
   for (unsigned k = 0; k < n; ++k)
-    aie::store_v(pS + 16 + 16 * k, aie::load_v<16>(pWin + 16 * k));
+    aie::store_v(d + 16 * k, aie::load_v<16>(pWin + 16 * k));
 }
 #endif
 
