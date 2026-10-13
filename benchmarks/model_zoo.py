@@ -9,6 +9,7 @@ this whole matrix, not on one network.
 
     PYTHONPATH=/path/to/torch-xdna2 python benchmarks/model_zoo.py
     python benchmarks/model_zoo.py --models resnet18,lstm --steps 10
+    python benchmarks/model_zoo.py --xdna-only --rounds 2   # A/B of an XDNA setting
 
 The nis_mynet model needs the NIS coursework code: set NIS_ROOT to the NIS
 lab02_cnn directory.  Without NIS_ROOT it is left out of the default model
@@ -269,6 +270,10 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=torch.get_num_threads())
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--json", default="")
+    # Comparing two XDNA settings (an environment switch, a code change) does not
+    # need the CPU side again: it is the same processes and about half the time.
+    ap.add_argument("--xdna-only", action="store_true",
+                    help="skip the CPU runs (no speedup column); for A/B of backend settings")
     ap.add_argument("--_worker", nargs=2)
     args = ap.parse_args()
 
@@ -293,7 +298,17 @@ def main() -> None:
         runs = {"cpu": [], "xdna": []}
         for r in range(args.rounds):
             for dev in (("cpu", "xdna") if r % 2 == 0 else ("xdna", "cpu")):
+                if dev == "cpu" and args.xdna_only:
+                    continue
                 runs[dev].append(_run_worker(name, dev, args))
+        if args.xdna_only:
+            npu = _combine(runs["xdna"])
+            row = {"model": name, "xdna": npu}
+            status = "ERROR: " + npu["error"] if "error" in npu else "ok"
+            print(f"{name:18s} {'-':>9s} {npu.get('median_ms', float('nan')):9.1f} {'-':>8s}  "
+                  f"{'':34s} {status}")
+            rows.append(row)
+            continue
         cpu, npu = (_combine(runs[d]) for d in ("cpu", "xdna"))
         row = {"model": name, "cpu": cpu, "xdna": npu}
         if "error" in cpu or "error" in npu:
