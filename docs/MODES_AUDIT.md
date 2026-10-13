@@ -57,7 +57,7 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 | `XDNA_CONV_PACK_THREADS` | 12 | OpenMP width of full-frame pack/unpack (read 4x) | cpp:1669,3093,3151,3652 | tuning | AGENTS.md (4 under load) | MERGE/SIMPLIFY (one helper) | merged |
 | `XDNA_IRON_PYTHON` | auto-detect | python of the mlir-aie env; empty disables on-demand builds | device.py:113 | core config | README | KEEP | kept |
 | `XDNA_CONV3X3W_DIR`, `XDNA_CONV3X3W_DW_DIR` (name built as `XDNA_{NAME}_DIR`) | cache dir | directory with xclbin + streams | device.py:152 | debug | used when testing other builds | KEEP-BUT-DOCUMENT | kept |
-| `XDNA_CONV3X3W_MIN_MACS`, `XDNA_CONV3X3W_DW_MIN_MACS` (built as `XDNA_{NAME}_MIN_MACS`) | 20e6 / 1e9 | size floor | device.py:153 | tuning | README; tests set 0 | KEEP | kept |
+| `XDNA_CONV3X3W_MIN_MACS`, `XDNA_CONV3X3W_DW_MIN_MACS` (built as `XDNA_{NAME}_MIN_MACS`) | 20e6 / 3e9 | size floor | device.py:153 | tuning | README; tests set 0 | KEEP | kept |
 | `XDNA_CONV3X3W_SYNC_BUILD` | 0 | build streams before the first call | device.py:153 | debug | README, tests | KEEP | kept |
 | `XDNA_CONV3X3W` | 1 | `0` disables the family | device.py:219 | debug | README, `quick_check`, sweep | KEEP | kept |
 | `XDNA_CONV3X3W_DW` | 1 | `0` keeps every dW on the CPU | device.py:228 | debug | README | KEEP | kept |

@@ -292,6 +292,14 @@ noise (`benchmarks/bfp16_training_gate.py`).
   (`XDNA_FUSED_OPTIMIZER=0` disables this). Fused kernels do not bump the
   parameters' version counters, so a post-step hook does, or NPU convs
   would keep using cached old weights.
+- **Deferred weight gradients.** An NPU dW is not run when the backward pass
+  ends: it runs on the first read of the gradient (normally the optimizer
+  step) and is dropped if the gradient is freed unread. So
+  `torch.xdna.synchronize()` does **not** flush it, and a benchmark that
+  times `backward()` plus `synchronize()` leaves the dW out. Time through
+  `optimizer.step()` or read a gradient (`.cpu()`, `.item()`).
+  Weight gradients below 3 GMAC (`XDNA_CONV3X3W_DW_MIN_MACS`) stay on the
+  CPU: below that the NPU dW's program switch costs more than it saves.
 
 NIS style transfer (MyNet(3,3,5), B40, 36x36, VGG loss, Adam), Ryzen AI 9 365
 on AC, quick-mode ABBA (`benchmarks/nis_style_transfer.py`): CPU BF16 171.4

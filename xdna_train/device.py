@@ -240,9 +240,12 @@ def register_xdna_device() -> None:
         _configure_iron_family("conv3x3w", _C.configure_conv3x3w, 20_000_000)
         # Its weight gradient (BFP16 operands, fp32 sums), deferred to the
         # optimizer.  Smaller dWs stay on the CPU, where they overlap the NPU dX
-        # chain for free; XDNA_CONV3X3W_DW=0 keeps every dW on the CPU.
+        # chain for free; XDNA_CONV3X3W_DW=0 keeps every dW on the CPU.  The 3e9
+        # floor is where the NPU dW starts to win (it pays a program switch):
+        # a 1e9 floor made B31 128->128 16x16, B7 128->128 36x36 and similar
+        # 20-45 % slower per step; B40 128->128 36x36 and B40 192->128 36x36 win.
         if os.environ.get("XDNA_CONV3X3W_DW", "1") == "1":
-            _configure_iron_family("conv3x3w_dw", _C.configure_conv3x3w_dw, 1_000_000_000)
+            _configure_iron_family("conv3x3w_dw", _C.configure_conv3x3w_dw, 3_000_000_000)
 
     # Full-frame (B4, 584x564) families.  Each has a kill switch for A/B runs and
     # an artifact-directory override.  Weights stay resident in the "fast" q4
