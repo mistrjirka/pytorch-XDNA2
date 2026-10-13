@@ -71,6 +71,7 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 | `XDNA_CONV3X3W_SYNC_BUILD` | 0 | build streams before the first call | device.py:153 | debug | README, tests | KEEP | kept |
 | `XDNA_CONV3X3W` | 1 | `0` disables the family | device.py:219 | debug | README, `quick_check`, sweep | KEEP | kept |
 | `XDNA_CONV3X3W_DW` | 1 | `0` keeps every dW on the CPU | device.py:228 | debug | README | KEEP | kept |
+| `XDNA_ASYNC_DW` | 1 | `0` starts deferred NPU dW only at the first reader; `1` starts them on a helper thread after the K-th dX call once two steps agree on K (`xdna_train.async_dw_stats()`) | -- | core | NIS step 122.6 -> 110.5 ms (ABBA, AC, 2026-10-13); tests/run_async_dw.py | KEEP | new |
 | `XDNA_CONV3X3W_FORCE` | 0 | bypass the cost model | device.py:222; cpp:2309 | debug | tests | KEEP | kept |
 | `XDNA_CONV3X3W_NPU_OVERHEAD_MS`, `_NPU_GMACS`, `_HOST_GBS`, `_CPU_GMACS`, `_MARGIN` | 0.5, 5.5, 20, 0.9, 0.8 | cost-model constants | cpp:2313-2326 | tuning | log (cost model rows), `run_conv3x3w_costmodel.py` | KEEP | kept |
 | `XDNA_CONV3X3W_PIECES` | auto (1/2/4) | pipelined piece count | cpp:2484 | tuning | log: pipelined dispatch 147 -> 129 ms | KEEP-BUT-DOCUMENT | kept |
