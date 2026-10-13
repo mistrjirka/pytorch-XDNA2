@@ -9,6 +9,10 @@ this whole matrix, not on one network.
 
     PYTHONPATH=/path/to/torch-xdna2 python benchmarks/model_zoo.py
     python benchmarks/model_zoo.py --models resnet18,lstm --steps 10
+
+The nis_mynet model needs the NIS coursework code: set NIS_ROOT to the NIS
+lab02_cnn directory.  Without NIS_ROOT it is left out of the default model
+list and skipped if named explicitly with --models.
 """
 from __future__ import annotations
 
@@ -158,8 +162,16 @@ def _embedding():
                                    torch.randint(0, 20, (128,), generator=g)), F.cross_entropy
 
 
+NIS_ROOT = os.environ.get("NIS_ROOT", "")
+NIS_SKIP_MSG = "nis_mynet skipped: set NIS_ROOT to the NIS lab02_cnn directory"
+
+
+def _nis_available() -> bool:
+    return bool(NIS_ROOT) and os.path.isdir(NIS_ROOT)
+
+
 def _nis_mynet():
-    sys.path.insert(0, "/home/jirka/programovani/magistr/nis/lab02_cnn")
+    sys.path.insert(0, NIS_ROOT)
     from models import MyNet
     return MyNet(3, 3, 5), lambda g: (torch.randn(40, 3, 36, 36, generator=g),
                                       torch.rand(40, 3, 36, 36, generator=g)), F.l1_loss
@@ -243,7 +255,9 @@ def _combine(results: list[dict]) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", default=",".join(MODELS))
+    ap.add_argument("--models", default=None,
+                    help="comma-separated model names (default: all, except nis_mynet "
+                         "unless NIS_ROOT is set)")
     ap.add_argument("--steps", type=int, default=10)
     # 24 warmup steps on both devices: the XDNA step autotuner (device.py) needs
     # ~21 steps to pick its NPU mode, like cudnn.benchmark.
@@ -263,9 +277,19 @@ def main() -> None:
         print("ZOO_RESULT=" + json.dumps(res), flush=True)
         return
 
+    nis_ok = _nis_available()
+    if args.models is None:
+        names = [m for m in MODELS if m != "nis_mynet" or nis_ok]
+        if not nis_ok:
+            print(NIS_SKIP_MSG, flush=True)
+    else:
+        names = args.models.split(",")
     rows = []
     print(f"{'model':18s} {'cpu ms':>9s} {'xdna ms':>9s} {'speedup':>8s}  {'loss cpu→xdna (first / last)':34s} status")
-    for name in args.models.split(","):
+    for name in names:
+        if name == "nis_mynet" and not nis_ok:
+            print(NIS_SKIP_MSG, flush=True)
+            continue
         runs = {"cpu": [], "xdna": []}
         for r in range(args.rounds):
             for dev in (("cpu", "xdna") if r % 2 == 0 else ("xdna", "cpu")):

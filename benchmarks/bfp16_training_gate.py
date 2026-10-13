@@ -13,7 +13,10 @@ Forward and input gradient (dX) use the emulation; dW stays exact (--dw exact)
 or uses single-pass BFP16 with fp32 sums (--dw bfp1).  Prints both loss
 curves and their relative gap.
 
-    python benchmarks/bfp16_training_gate.py --steps 300
+    NIS_ROOT=/path/to/nis/lab02_cnn python benchmarks/bfp16_training_gate.py --steps 300
+
+NIS_ROOT must be set to the NIS lab02_cnn directory (the script exits with a
+message otherwise).  The dataset is read from data/ under NIS_ROOT.
 """
 import argparse
 import os
@@ -23,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-NIS = "/home/jirka/programovani/magistr/nis/lab02_cnn"
+NIS = os.environ.get("NIS_ROOT", "")
 
 
 def bfp_quant(x: torch.Tensor, dim: int) -> torch.Tensor:
@@ -151,6 +154,8 @@ def main():
     ap.add_argument("--dw", choices=["exact", "bfp1"], default="exact",
                     help="dW arithmetic in the emulated run (exact = CPU)")
     args = ap.parse_args()
+    if not NIS or not os.path.isdir(NIS):
+        sys.exit("nis_mynet skipped: set NIS_ROOT to the NIS lab02_cnn directory")
     global DW_MODE
     DW_MODE = args.dw
     base = run(False, args.steps, args.seed)

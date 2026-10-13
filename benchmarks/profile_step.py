@@ -7,6 +7,9 @@ prints self-time per op for each device side by side.  Ops whose XDNA self
 time exceeds CPU point at dispatch, allocation, copy or layout overhead.
 
     PYTHONPATH=/path/to/torch-xdna2 python benchmarks/profile_step.py
+
+The default model nis_full needs the NIS coursework code: set NIS_ROOT to the
+NIS lab02_cnn directory.  The script exits with a message if it is not set.
 """
 from __future__ import annotations
 
@@ -24,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def _nis_full():
     """NIS MyNet(3,3,5) + the script's ImageGenLoss (VGG19 perceptual + L1)."""
-    sys.path.insert(0, "/home/jirka/programovani/magistr/nis/lab02_cnn")
+    sys.path.insert(0, os.environ["NIS_ROOT"])
     from models import MyNet
     from train import ImageGenLoss
 
@@ -83,6 +86,11 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=30)
     ap.add_argument("--_worker", nargs=2)
     args = ap.parse_args()
+    model_name = args._worker[0] if args._worker else args.model
+    if model_name == "nis_full":
+        nis_root = os.environ.get("NIS_ROOT", "")
+        if not nis_root or not os.path.isdir(nis_root):
+            sys.exit("nis_mynet skipped: set NIS_ROOT to the NIS lab02_cnn directory")
     if args._worker:
         print("PROFILE=" + json.dumps(worker(args._worker[0], args._worker[1], args.steps)))
         return
