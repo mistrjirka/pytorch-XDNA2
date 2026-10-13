@@ -141,6 +141,28 @@ report("placer settles (convs the NPU can run are decided)",
        str({f"{k[1]}{k[0]}": {1: "npu", 2: "cpu", 0: "cost"}[c] for k, c in choices.items() if c is not None}))
 report("results stay consistent across placements", all(rel(g, grads[0]) < 0.02 for g in grads[1:]))
 
+# saved tensors go through save_for_backward: modifying one in place before backward raises
+featsm = nn.Sequential(*[__import__("copy").deepcopy(l) for l in feats32]).to("xdna", torch.bfloat16)
+chm = regions.FrozenFeatureChain.from_sequential(featsm, (0, 3, 5))
+xm = torch.randn(2, 3, 16, 16).bfloat16().to("xdna").requires_grad_()
+lm = regions.frozen_feature_mse(chm, xm, torch.rand(2, 3, 16, 16).bfloat16().to("xdna"))
+with torch.no_grad():
+    xm.mul_(2)  # x is saved for backward
+try:
+    lm.backward()
+    detected = False
+except RuntimeError as e:
+    detected = "modified by an inplace operation" in str(e)
+report("in-place change of a saved tensor is detected", detected)
+
+# the placer decides per input shape, not per op alone
+chs = regions.FrozenFeatureChain.from_sequential(featsm, (0, 3, 5))
+for shp in ((2, 3, 16, 16), (3, 3, 20, 20)):
+    xs_ = torch.randn(*shp).bfloat16().to("xdna").requires_grad_()
+    regions.frozen_feature_mse(chs, xs_, torch.rand(*shp).bfloat16().to("xdna")).backward()
+shapes = {k[2] for k in chs.placer.state}
+report("placer keys include the input shape", any(sh[0] == 2 for sh in shapes) and any(sh[0] == 3 for sh in shapes))
+
 # kernel-level checks against torch
 torch.manual_seed(3)
 a = (torch.randn(3, 5, 12, 10) * 2).bfloat16()

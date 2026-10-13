@@ -69,6 +69,7 @@ class _Placer:
     """
 
     WARM, TIMED, GIVE_UP = 2, 4, 48
+    MAX_KEYS = 64  # (op, direction, input shape) entries kept
 
     def __init__(self):
         self.mode = os.environ.get("XDNA_REGION_PLACEMENT", "measure")
@@ -81,7 +82,11 @@ class _Placer:
             return fn()
         if self.mode in ("npu", "cpu"):
             return self._run(C, 1 if self.mode == "npu" else 2, fn)[0]
-        st = self.state.setdefault(key, {"cpu": [], "npu": [], "calls": 0, "choice": None})
+        st = self.state.get(key)
+        if st is None:
+            if len(self.state) >= self.MAX_KEYS:  # bounded: forget the oldest shape
+                self.state.pop(next(iter(self.state)))
+            st = self.state[key] = {"cpu": [], "npu": [], "calls": 0, "choice": None}
         if st["choice"] is not None:
             return self._run(C, st["choice"], fn)[0]
         place = 2 if st["calls"] % 2 == 0 else 1  # CPU first, then NPU, alternating
@@ -97,12 +102,12 @@ class _Placer:
             npu = statistics.median(st["npu"][self.WARM:])
             st["choice"] = 1 if npu < 0.95 * cpu else 2
             if self.verbose:
-                print(f"[regions] {key[1]} op{key[0]}: cpu {cpu:.2f} ms, npu {npu:.2f} ms -> "
+                print(f"[regions] {key[1]} op{key[0]} {key[2]}: cpu {cpu:.2f} ms, npu {npu:.2f} ms -> "
                       f"{'npu' if st['choice'] == 1 else 'cpu'}")
         elif st["calls"] >= self.GIVE_UP:
             st["choice"] = 0  # the NPU never ran this shape: leave it to the cost model
             if self.verbose:
-                print(f"[regions] {key[1]} op{key[0]}: NPU did not run; cost model decides")
+                print(f"[regions] {key[1]} op{key[0]} {key[2]}: NPU did not run; cost model decides")
         return out
 
     @staticmethod
@@ -194,7 +199,7 @@ def _forward_pass(chain: FrozenFeatureChain, x: torch.Tensor, keep_all: bool):
     while i < n:
         op = chain.ops[i]
         if op.kind == "conv":
-            cur = chain.placer.call((i, "fwd"), lambda cur=cur, op=op: F.conv2d(
+            cur = chain.placer.call((i, "fwd", tuple(cur.shape)), lambda cur=cur, op=op: F.conv2d(
                 cur, op.weight, op.bias, op.stride, op.padding, op.dilation, op.groups))
             if not cur.is_contiguous():
                 cur = cur.contiguous()
@@ -239,15 +244,31 @@ class _FrozenFeatureMSE(torch.autograd.Function):
             for k in chain.taps:
                 total += g_outs[k].numel()
                 sq += C.region_sqdiff_sum(g_outs[k], t_outs[k])
-        ctx.chain, ctx.x, ctx.g_outs, ctx.t_outs, ctx.total = chain, x, g_outs, t_outs, total
+        # Everything backward reads goes through save_for_backward, so PyTorch's
+        # saved-tensor version checks and hooks apply (in-place changes raise).
+        gi = [i for i, t in enumerate(g_outs) if t is not None]
+        ti = [i for i, t in enumerate(t_outs) if t is not None]
+        weights = [op.weight for op in chain.ops if op.kind == "conv"]
+        ctx.save_for_backward(x, *[g_outs[i] for i in gi], *[t_outs[i] for i in ti], *weights)
+        ctx.meta = (chain, gi, ti, total)
         return torch.full((), sq / total, dtype=torch.bfloat16, device=x.device)
 
     @staticmethod
     @once_differentiable
     def backward(ctx, go):
         C = _native()
-        chain, g_outs, t_outs = ctx.chain, ctx.g_outs, ctx.t_outs
-        scale = 2.0 * float(go) / ctx.total
+        chain, gi, ti, total = ctx.meta
+        saved = ctx.saved_tensors  # raises if a saved tensor was modified in place
+        x = saved[0]
+        g_outs = [None] * len(chain.ops)
+        t_outs = [None] * len(chain.ops)
+        for n, i in enumerate(gi):
+            g_outs[i] = saved[1 + n]
+        for n, i in enumerate(ti):
+            t_outs[i] = saved[1 + len(gi) + n]
+        weights = iter(saved[1 + len(gi) + len(ti):])
+        w_of = {k: next(weights) for k, o in enumerate(chain.ops) if o.kind == "conv"}
+        scale = 2.0 * float(go) / total
         G = None  # gradient wrt the output of the op being processed (from above)
         last = chain.taps[-1]
         for k in range(last, -1, -1):
@@ -267,17 +288,17 @@ class _FrozenFeatureMSE(torch.autograd.Function):
                 C.region_addtap(G, out_k, t_outs[k], new, scale)
                 G = new
             if op.kind == "maxpool2":
-                src = g_outs[k - 1] if k > 0 else ctx.x
+                src = g_outs[k - 1] if k > 0 else x
                 new = torch.empty_like(src)
                 C.region_maxpool2_bwd(src, G, new)
                 G = new
             else:  # conv: dX only
-                src = g_outs[k - 1] if k > 0 else ctx.x
+                src = g_outs[k - 1] if k > 0 else x
                 if not G.is_contiguous():
                     G = G.contiguous()
-                G = chain.placer.call((k, "dx"), lambda G=G, src=src, op=op:
+                G = chain.placer.call((k, "dx", tuple(src.shape)), lambda G=G, src=src, op=op:
                                       torch.ops.aten.convolution_backward(
-                                          G, src, op.weight, None, list(op.stride), list(op.padding),
+                                          G, src, w_of[k], None, list(op.stride), list(op.padding),
                                           list(op.dilation), False, [0, 0], op.groups,
                                           [True, False, False])[0])
         return None, G, None
