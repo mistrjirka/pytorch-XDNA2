@@ -84,9 +84,15 @@ export XDNA_IRON_PYTHON=/path/to/mlir-aie-env/bin/python
 ```
 
 An explicit value takes precedence over automatic setup, and an empty value
-disables compilation and setup. Without an explicit override, an existing managed
-compiler is preferred, followed by the legacy `~/mlir-aie-env` / `~/ironenv`
-environments and the source-tree sibling `mlir-aie-env`.
+disables compilation and setup. Without an explicit override, the backend uses the
+first of these that exists:
+
+1. the managed compiler prepared by `torch-xdna2-setup`
+2. `mlir-aie-env` in the parent directory of the repository checkout
+3. `~/mlir-aie-env/bin/python`
+4. `~/ironenv/bin/python`
+
+If none exists, automatic setup runs unless `XDNA_AUTO_SETUP=0` or offline mode is set.
 
 A new convolution shape can still require another instruction stream. Those
 streams compile on demand and are cached separately; while they build, the
