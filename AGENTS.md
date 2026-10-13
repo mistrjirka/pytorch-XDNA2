@@ -7,10 +7,10 @@ Make a general-purpose **PyTorch XDNA2 training backend** faster than native CPU
 
 ## Key locations
 - **Maintained source**: this repository, particularly xdna_train/_native/torch_xdna_device.cpp and xdna_train/device.py.
-- **Experiment and benchmark workspace**: /home/jirka/programy/torch-xdna-train; real script benchmark in scripts/benchmark_original_style.py.
-- **Real application**: /home/jirka/programovani/magistr/nis/lab02_cnn/style_transfer_test.py.
-- **Pi skills**: /home/jirka/.pi/agent/skills (symlinks to the wiki-generated SKILL.md files); particularly diagnosing-bug, running-real-data-smoke-tests, review-final-diff, impl-check and investigate-feasibility.
-- **Python**: /home/jirka/programovani/magistr/nis/.venv/bin/python; its installed xdna_train may be older than this checkout. Set PYTHONPATH to this repository and verify xdna_train.__file__ and native_library_path().
+- **Experiment and benchmark workspace**: <rd-workspace>; real script benchmark in scripts/benchmark_original_style.py.
+- **Real application**: <nis-root>/style_transfer_test.py.
+- **Pi skills**: ~/.pi/agent/skills (symlinks to the wiki-generated SKILL.md files); particularly diagnosing-bug, running-real-data-smoke-tests, review-final-diff, impl-check and investigate-feasibility.
+- **Python**: <venv>/bin/python; its installed xdna_train may be older than this checkout. Set PYTHONPATH to this repository and verify xdna_train.__file__ and native_library_path().
 
 ## Verified 2026-10-10
 - With real training patches (B40, 36×36, VGG loss), CPU BF16 ~233 ms/step (4.29 it/s); optimized XDNA BF16 ~519 ms/step (1.93 it/s).
