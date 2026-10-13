@@ -55,7 +55,7 @@ PYTHONPATH=. python tests/run_conv3x3w_torch.py
 Other [test scripts](../tests/) cover hardware kernels, weight-gradient dispatch,
 output layouts and cost policy. Some force specific paths and compile new programs.
 
-With pytest installed:
+With pytest installed (pytest is not installed with the package; run `pip install pytest`):
 
 ```bash
 PYTHONPATH=. python -m pytest
