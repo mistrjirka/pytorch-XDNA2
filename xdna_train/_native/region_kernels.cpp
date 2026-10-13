@@ -305,3 +305,149 @@ void xdna_region_maxpool2_bwd_bf16(const uint16_t* x, const uint16_t* g, uint16_
 }
 
 }  // extern "C"
+
+// ---------------------------------------------------------------------------
+// Training BatchNorm2d + LeakyReLU on contiguous NCHW bf16.
+//
+// Statistics: each (n, c) plane is reduced in fp32 (mean, then sum of squared
+// deviations; the plane is cache resident, so the second pass is cheap) and the
+// N planes of a channel are merged in double with Chan's formula, so the result
+// does not depend on a sum/sumsq cancellation.  Padding is not an issue here: the
+// tensor is plain NCHW, every element is valid.  The fused forward rounds the
+// activation once (after BN and LeakyReLU); eager rounds the BN output to bf16
+// first.  Backward uses y > 0 as the LeakyReLU mask (slope > 0, so y > 0 iff the
+// pre-activation is > 0; a pre-activation of exactly 0 takes the slope branch
+// like PyTorch's leaky_relu_backward).
+// ---------------------------------------------------------------------------
+
+extern "C++" {
+inline void plane_mean_m2(const uint16_t* x, int64_t hw, float& mean, float& m2) {
+  float s = 0.0f;
+#pragma omp simd reduction(+ : s)
+  for (int64_t i = 0; i < hw; ++i) s += bf2f(x[i]);
+  const float m = s / float(hw);
+  float q = 0.0f;
+#pragma omp simd reduction(+ : q)
+  for (int64_t i = 0; i < hw; ++i) {
+    const float d = bf2f(x[i]) - m;
+    q += d * d;
+  }
+  mean = m;
+  m2 = q;
+}
+}  // extern "C++"
+
+extern "C" {
+
+// Forward.  w and b may be null (affine=False).  If update != 0 the running
+// statistics (bf16) move by `factor` towards the batch mean and the unbiased
+// batch variance.  mean_out / invstd_out are fp32 [C] for the backward pass.
+void xdna_region_bn_fwd_bf16(const uint16_t* x, const uint16_t* w, const uint16_t* b,
+                             uint16_t* rm, uint16_t* rv, uint16_t* y, float* mean_out,
+                             float* invstd_out, int64_t N, int64_t C, int64_t HW, float eps,
+                             float slope, float factor, int update, int threads) {
+  float* pm = new float[size_t(N * C) * 2];
+  float* pq = pm + N * C;
+#pragma omp parallel for num_threads(threads) schedule(static)
+  for (int64_t pl = 0; pl < N * C; ++pl) plane_mean_m2(x + pl * HW, HW, pm[pl], pq[pl]);
+  const double M = double(N) * double(HW);
+#pragma omp parallel for num_threads(threads) schedule(static)
+  for (int64_t c = 0; c < C; ++c) {
+    double n_acc = 0.0, mean = 0.0, m2 = 0.0;
+    for (int64_t n = 0; n < N; ++n) {
+      const double nb = double(HW), pmean = double(pm[n * C + c]);
+      const double tot = n_acc + nb, delta = pmean - mean;
+      mean += delta * nb / tot;
+      m2 += double(pq[n * C + c]) + delta * delta * n_acc * nb / tot;
+      n_acc = tot;
+    }
+    const double var = m2 / M;
+    mean_out[c] = float(mean);
+    invstd_out[c] = float(1.0 / std::sqrt(var + double(eps)));
+    if (update) {
+      const double unbiased = M > 1.0 ? var * M / (M - 1.0) : var;
+      rm[c] = f2bf(float((1.0 - double(factor)) * double(bf2f(rm[c])) + double(factor) * mean));
+      rv[c] = f2bf(float((1.0 - double(factor)) * double(bf2f(rv[c])) + double(factor) * unbiased));
+    }
+  }
+  delete[] pm;
+#pragma omp parallel for num_threads(threads) schedule(static)
+  for (int64_t pl = 0; pl < N * C; ++pl) {
+    const int64_t c = pl % C;
+    const float scale = (w ? bf2f(w[c]) : 1.0f) * invstd_out[c];
+    const float shift = (b ? bf2f(b[c]) : 0.0f) - mean_out[c] * scale;
+    const uint16_t* xp = x + pl * HW;
+    uint16_t* yp = y + pl * HW;
+#pragma omp simd
+    for (int64_t i = 0; i < HW; ++i) {
+      const float z = bf2f(xp[i]) * scale + shift;
+      yp[i] = f2bf(z > 0.0f ? z : z * slope);
+    }
+  }
+}
+
+// Backward of BN + LeakyReLU.  dw_out / db_out (bf16 [C]) get sum(dz * xhat) and
+// sum(dz); dx (bf16, may be null when not needed) gets the input gradient.
+void xdna_region_bn_bwd_bf16(const uint16_t* dy, const uint16_t* y, const uint16_t* x,
+                             const uint16_t* w, const float* mean, const float* invstd,
+                             uint16_t* dx, uint16_t* dw_out, uint16_t* db_out, int64_t N,
+                             int64_t C, int64_t HW, float slope, int threads) {
+  float* ps = new float[size_t(N * C) * 2];
+  float* pt = ps + N * C;
+#pragma omp parallel for num_threads(threads) schedule(static)
+  for (int64_t pl = 0; pl < N * C; ++pl) {
+    const int64_t c = pl % C;
+    const float mc = mean[c], is = invstd[c];
+    const uint16_t* dyp = dy + pl * HW;
+    const uint16_t* yp = y + pl * HW;
+    const uint16_t* xp = x + pl * HW;
+    float s1 = 0.0f, s2 = 0.0f;
+#pragma omp simd reduction(+ : s1, s2)
+    for (int64_t i = 0; i < HW; ++i) {
+      const float g = bf2f(dyp[i]);
+      const float dz = bf2f(yp[i]) > 0.0f ? g : g * slope;
+      s1 += dz;
+      s2 += dz * ((bf2f(xp[i]) - mc) * is);
+    }
+    ps[pl] = s1;
+    pt[pl] = s2;
+  }
+  const double M = double(N) * double(HW);
+  float* k = new float[size_t(C) * 2];
+#pragma omp parallel for num_threads(threads) schedule(static)
+  for (int64_t c = 0; c < C; ++c) {
+    double a = 0.0, bsum = 0.0;
+    for (int64_t n = 0; n < N; ++n) {
+      a += double(ps[n * C + c]);
+      bsum += double(pt[n * C + c]);
+    }
+    if (db_out) db_out[c] = f2bf(float(a));
+    if (dw_out) dw_out[c] = f2bf(float(bsum));
+    k[c] = float(a / M);
+    k[C + c] = float(bsum / M);
+  }
+  delete[] ps;
+  if (dx) {
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (int64_t pl = 0; pl < N * C; ++pl) {
+      const int64_t c = pl % C;
+      const float mc = mean[c], is = invstd[c];
+      const float ws = (w ? bf2f(w[c]) : 1.0f) * is;
+      const float k1 = k[c], k2 = k[C + c];
+      const uint16_t* dyp = dy + pl * HW;
+      const uint16_t* yp = y + pl * HW;
+      const uint16_t* xp = x + pl * HW;
+      uint16_t* dxp = dx + pl * HW;
+#pragma omp simd
+      for (int64_t i = 0; i < HW; ++i) {
+        const float g = bf2f(dyp[i]);
+        const float dz = bf2f(yp[i]) > 0.0f ? g : g * slope;
+        const float xhat = (bf2f(xp[i]) - mc) * is;
+        dxp[i] = f2bf(ws * (dz - k1 - xhat * k2));
+      }
+    }
+  }
+  delete[] k;
+}
+
+}  // extern "C"

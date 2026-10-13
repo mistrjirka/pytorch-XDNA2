@@ -78,6 +78,12 @@ extern "C" void xdna_region_addtap_bf16(
 extern "C" void xdna_region_relu_bwd_bf16(
     const uint16_t*, const uint16_t*, const uint16_t*, const uint16_t*, uint16_t*, int64_t,
     float, int);
+extern "C" void xdna_region_bn_fwd_bf16(
+    const uint16_t*, const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, uint16_t*, float*,
+    float*, int64_t, int64_t, int64_t, float, float, float, int, int);
+extern "C" void xdna_region_bn_bwd_bf16(
+    const uint16_t*, const uint16_t*, const uint16_t*, const uint16_t*, const float*, const float*,
+    uint16_t*, uint16_t*, uint16_t*, int64_t, int64_t, int64_t, float, int);
 extern "C" void xdna_region_maxpool2_bwd_bf16(
     const uint16_t*, const uint16_t*, uint16_t*, int64_t, int64_t, int64_t, int);
 extern "C" void xdna_pack_conv3x3_halo_padded_bf16(
@@ -3833,6 +3839,17 @@ std::optional<at::Tensor> optional_cpu_alias_xdna(
   return cpu_alias(*tensor);
 }
 
+// PyTorch's CPU batch-norm out= kernels pick the memory format from the strides:
+// a transposed (permuted) view can look channels-last without being it, and the
+// kernel then reads with the wrong indexing (wrong, run-to-run varying results).
+// Inputs that are neither contiguous nor channels-last contiguous are made
+// contiguous first.
+at::Tensor batch_norm_layout_safe(const at::Tensor& t) {
+  if (t.is_contiguous()) return t;
+  if (t.dim() == 4 && t.is_contiguous(at::MemoryFormat::ChannelsLast)) return t;
+  return t.contiguous();
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> native_batch_norm_xdna(
     const at::Tensor& input,
     const std::optional<at::Tensor>& weight,
@@ -3845,7 +3862,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_batch_norm_xdna(
   ScopedMappedCpu mapped_phase("aten::native_batch_norm");
   TORCH_CHECK(input.dim() >= 2, "XDNA BatchNorm expects rank >= 2 input");
   ensure_host_current(input);
-  auto input_cpu = cpu_alias(input);
+  auto input_cpu = batch_norm_layout_safe(cpu_alias(input));
   auto weight_cpu = optional_cpu_alias_xdna(weight);
   auto bias_cpu = optional_cpu_alias_xdna(bias);
   auto running_mean_cpu = optional_cpu_alias_xdna(running_mean);
@@ -3903,8 +3920,8 @@ native_batch_norm_backward_xdna(
   ScopedMappedCpu mapped_phase("aten::native_batch_norm_backward");
   ensure_host_current(grad_out);
   ensure_host_current(input);
-  auto go_cpu = cpu_alias(grad_out);
-  auto input_cpu = cpu_alias(input);
+  auto go_cpu = batch_norm_layout_safe(cpu_alias(grad_out));
+  auto input_cpu = batch_norm_layout_safe(cpu_alias(input));
   if (input.dim() == 4) {
     const bool input_cl =
         input.is_contiguous(at::MemoryFormat::ChannelsLast);
@@ -5029,6 +5046,78 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         xdna_region_relu_bwd_bf16(pr, pbase, pa, pb, po, r.numel(), float(scale), t);
       }
       mark_host_dirty(out);
+    });
+
+    auto f32_host = [](const at::Tensor& t, const char* what) {
+      TORCH_CHECK(t.device().type() == kXdnaType && t.scalar_type() == at::kFloat && t.is_contiguous(),
+                  what, " must be a contiguous fp32 XDNA tensor");
+      ensure_host_current(t);
+      return reinterpret_cast<const float*>(t.const_data_ptr());
+    };
+    auto f32_out = [](const at::Tensor& t, const char* what) {
+      TORCH_CHECK(t.device().type() == kXdnaType && t.scalar_type() == at::kFloat && t.is_contiguous(),
+                  what, " must be a contiguous fp32 XDNA tensor");
+      ensure_host_current(t);
+      return reinterpret_cast<float*>(t.mutable_data_ptr());
+    };
+    // Training BatchNorm2d + LeakyReLU forward on NCHW bf16 (see region_kernels.cpp).
+    m.def("region_bn_fwd", [=](const at::Tensor& x, const std::optional<at::Tensor>& w,
+                               const std::optional<at::Tensor>& b, const at::Tensor& rm,
+                               const at::Tensor& rv, const at::Tensor& y, const at::Tensor& mean,
+                               const at::Tensor& invstd, double eps, double slope, double factor,
+                               bool update) {
+      TORCH_CHECK(x.dim() == 4 && y.sizes().equals(x.sizes()), "region_bn_fwd: shape mismatch");
+      const int64_t N = x.size(0), C = x.size(1), HW = x.size(2) * x.size(3);
+      TORCH_CHECK(mean.numel() == C && invstd.numel() == C && rm.numel() == C && rv.numel() == C,
+                  "region_bn_fwd: per-channel size mismatch");
+      const auto* px = bf16_host(x, "x");
+      const uint16_t* pw = w ? bf16_host(*w, "weight") : nullptr;
+      const uint16_t* pb = b ? bf16_host(*b, "bias") : nullptr;
+      auto* prm = bf16_out(rm, "running_mean");
+      auto* prv = bf16_out(rv, "running_var");
+      auto* py = bf16_out(y, "y");
+      auto* pmean = f32_out(mean, "mean");
+      auto* pinv = f32_out(invstd, "invstd");
+      const int t = nthreads();
+      {
+        py::gil_scoped_release release;
+        xdna_region_bn_fwd_bf16(px, pw, pb, prm, prv, py, pmean, pinv, N, C, HW, float(eps),
+                                float(slope), float(factor), update ? 1 : 0, t);
+      }
+      mark_host_dirty(y);
+      mark_host_dirty(mean);
+      mark_host_dirty(invstd);
+      if (update) {
+        mark_host_dirty(rm);
+        mark_host_dirty(rv);
+      }
+    });
+    m.def("region_bn_bwd", [=](const at::Tensor& dy, const at::Tensor& y, const at::Tensor& x,
+                               const std::optional<at::Tensor>& w, const at::Tensor& mean,
+                               const at::Tensor& invstd, const std::optional<at::Tensor>& dx,
+                               const std::optional<at::Tensor>& dw, const std::optional<at::Tensor>& db,
+                               double slope) {
+      TORCH_CHECK(x.dim() == 4 && dy.sizes().equals(x.sizes()) && y.sizes().equals(x.sizes()),
+                  "region_bn_bwd: shape mismatch");
+      const int64_t N = x.size(0), C = x.size(1), HW = x.size(2) * x.size(3);
+      const auto* pdy = bf16_host(dy, "dy");
+      const auto* py = bf16_host(y, "y");
+      const auto* px = bf16_host(x, "x");
+      const uint16_t* pw = w ? bf16_host(*w, "weight") : nullptr;
+      const auto* pmean = f32_host(mean, "mean");
+      const auto* pinv = f32_host(invstd, "invstd");
+      uint16_t* pdx = dx ? bf16_out(*dx, "dx") : nullptr;
+      uint16_t* pdw = dw ? bf16_out(*dw, "dweight") : nullptr;
+      uint16_t* pdb = db ? bf16_out(*db, "dbias") : nullptr;
+      const int t = nthreads();
+      {
+        py::gil_scoped_release release;
+        xdna_region_bn_bwd_bf16(pdy, py, px, pw, pmean, pinv, pdx, pdw, pdb, N, C, HW,
+                                float(slope), t);
+      }
+      if (dx) mark_host_dirty(*dx);
+      if (dw) mark_host_dirty(*dw);
+      if (db) mark_host_dirty(*db);
     });
     m.def("region_maxpool2_bwd", [=](const at::Tensor& x, const at::Tensor& g, const at::Tensor& out) {
       TORCH_CHECK(x.dim() == 4 && out.sizes().equals(x.sizes()) && g.dim() == 4 &&

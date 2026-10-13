@@ -348,3 +348,114 @@ def fuse_perceptual_loss(loss_module, features_attr: str = "perceptual_vgg"):
 
     loss_module.compute_perceptual_loss = compute_perceptual_loss
     return True
+
+
+# ---------------------------------------------------------------------------
+# Training BatchNorm2d + LeakyReLU/ReLU as one op
+# ---------------------------------------------------------------------------
+class _BatchNormAct(torch.autograd.Function):
+    """y = act(batch_norm(x)) with training statistics, on contiguous NCHW bf16.
+
+    Contract: statistics over (N, H, W) of every element, biased variance for
+    the normalisation, unbiased variance for the running update (once per call),
+    affine weight/bias.  Saved for backward: x, y (the activation mask is y > 0),
+    weight, and the fp32 per-channel mean / inverse std.  Not double
+    differentiable.  Gradients: input, weight and bias, each only if requested.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, running_mean, running_var, eps, slope, factor):
+        C = _native()
+        y = torch.empty_like(x)
+        mean = torch.empty(x.shape[1], dtype=torch.float32, device=x.device)
+        invstd = torch.empty_like(mean)
+        C.region_bn_fwd(x, weight, bias, running_mean, running_var, y, mean, invstd,
+                        eps, slope, factor, True)
+        ctx.save_for_backward(x, y, weight, mean, invstd)
+        ctx.slope = slope
+        return y
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, dy):
+        C = _native()
+        x, y, weight, mean, invstd = ctx.saved_tensors
+        need_x, need_w, need_b = ctx.needs_input_grad[0:3]
+        if not dy.is_contiguous():
+            dy = dy.contiguous()
+        dx = torch.empty_like(x) if need_x else None
+        dw = torch.empty_like(weight) if need_w else None
+        db = torch.empty_like(weight) if need_b else None
+        C.region_bn_bwd(dy, y, x, weight, mean, invstd, dx, dw, db, ctx.slope)
+        return dx, dw, db, None, None, None, None, None
+
+
+# Below this size the eager BatchNorm + activation is as fast as the fused op (the
+# fused kernel wins on large tensors only: 13 MB 3.5 -> 2.3 ms, 6.6 MB 1.2 -> 0.8 ms,
+# 3.3 MB and smaller no gain), so small layers keep the eager pair.
+_NORM_ACT_MIN_BYTES = int(os.environ.get("XDNA_REGION_NORM_ACT_MIN_BYTES", "4000000"))
+
+
+def _norm_act_eligible(bn: nn.BatchNorm2d, x: torch.Tensor) -> bool:
+    if not enabled() or not bn.training or not bn.track_running_stats or not bn.affine:
+        return False
+    if bn.momentum is None:  # cumulative moving average: leave to the eager path
+        return False
+    if not isinstance(x, torch.Tensor) or x.dim() != 4 or x.device.type != "xdna":
+        return False
+    if x.dtype != torch.bfloat16 or not x.is_contiguous() or x.numel() // x.shape[1] <= 1:
+        return False
+    if x.numel() * 2 < _NORM_ACT_MIN_BYTES:
+        return False
+    for t in (bn.weight, bn.bias, bn.running_mean, bn.running_var):
+        if (t is None or t.device.type != "xdna" or t.dtype != torch.bfloat16
+                or not t.is_contiguous() or t.numel() != x.shape[1]):
+            return False
+    return True
+
+
+def fuse_norm_activation(bn: nn.BatchNorm2d, act: nn.Module) -> bool:
+    """Declare that ``act`` is applied directly to the output of ``bn`` (like
+    ``torch.ao.quantization.fuse_modules``) and run the pair as one fused op.
+
+    Both modules keep their parameters, buffers and state_dict keys; only their
+    ``forward`` is wrapped.  When the fused op is eligible (training mode, bf16
+    contiguous NCHW on XDNA, affine, tracked statistics with a float momentum),
+    ``bn(x)`` returns the *activated* tensor and ``act`` passes that tensor
+    through; anything else runs both modules unchanged.
+
+    The pairing is the caller's statement about the model's dataflow.  If the
+    activation is not applied to the norm output directly (an add or a branch in
+    between), the activation would be applied twice or to the wrong tensor: do
+    not declare such a pair.  Returns True if installed.
+    """
+    if not enabled() or not isinstance(bn, nn.BatchNorm2d):
+        return False
+    if isinstance(act, nn.LeakyReLU):
+        slope = float(act.negative_slope)
+    elif isinstance(act, nn.ReLU):
+        slope = 0.0
+    else:
+        return False
+    if slope < 0.0 or getattr(bn, "_xdna_fused_act", None) is not None:
+        return getattr(bn, "_xdna_fused_act", None) is act
+    bn_forward, act_forward = bn.forward, act.forward
+    token = object()
+
+    def fused_bn(x):
+        if not _norm_act_eligible(bn, x):
+            return bn_forward(x)
+        bn.num_batches_tracked.add_(1)
+        y = _BatchNormAct.apply(x, bn.weight, bn.bias, bn.running_mean, bn.running_var,
+                                float(bn.eps), slope, float(bn.momentum))
+        y._xdna_act_token = token
+        return y
+
+    def checked_act(x):
+        if getattr(x, "_xdna_act_token", None) is token:
+            return x
+        return act_forward(x)
+
+    bn.forward, act.forward = fused_bn, checked_act
+    bn._xdna_fused_act = act
+    return True

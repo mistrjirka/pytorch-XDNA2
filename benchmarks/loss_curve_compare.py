@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--threads", type=int, default=10)
     ap.add_argument("--fuse-loss", action="store_true")
+    ap.add_argument("--fuse-bn-act", action="store_true")
     ap.add_argument("--compare", nargs="+")
     a = ap.parse_args()
     if a.compare:
@@ -60,6 +61,9 @@ def main():
     torch.manual_seed(100)
     model = MyNet(3, 3, 5).to("xdna", torch.bfloat16).train()
     loss_fn = ImageGenLoss(4.0, 6.0, device="xdna").to("xdna", torch.bfloat16)
+    if a.fuse_bn_act:
+        from nis_adapters import fuse_nis_norm_act
+        assert fuse_nis_norm_act(model) > 0
     if a.fuse_loss:
         from xdna_train import regions
         assert regions.fuse_perceptual_loss(loss_fn), "loss does not match the region pattern"
@@ -84,7 +88,7 @@ def main():
         sched.step()
         losses.append(val.item())
         step_ms.append((time.perf_counter() - t) * 1e3)
-    json.dump({"fuse": a.fuse_loss, "loss": losses, "step_ms": step_ms, "steps": a.steps}, open(a.out, "w"))
+    json.dump({"fuse": a.fuse_loss, "fuse_bn_act": a.fuse_bn_act, "loss": losses, "step_ms": step_ms, "steps": a.steps}, open(a.out, "w"))
     print(f"done {a.steps} steps, median {statistics.median(step_ms[20:]):.1f} ms, last loss {losses[-1]:.3f}")
 
 

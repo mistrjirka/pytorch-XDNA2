@@ -43,6 +43,8 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=0, help="default: 12, or 40 for --mode auto")
     ap.add_argument("--wall-steps", type=int, default=20)
     ap.add_argument("--no-trace", action="store_true", help="only the unprofiled wall time")
+    ap.add_argument("--fuse-bn-act", action="store_true",
+                    help="pair each BatchNorm2d with its activation (benchmarks/nis_adapters.py)")
     ap.add_argument("--fuse-loss", action="store_true",
                     help="route the perceptual loss through xdna_train.regions (opt-in region)")
     a = ap.parse_args()
@@ -65,6 +67,11 @@ def main() -> None:
     torch.manual_seed(0)
     model = MyNet(3, 3, 5).to(dev, dt)
     loss_fn = ImageGenLoss(4.0, 6.0, device=dev).to(dev, dt)
+    n_bn = 0
+    if a.fuse_bn_act:
+        from nis_adapters import fuse_nis_norm_act
+        n_bn = fuse_nis_norm_act(model)
+        assert n_bn > 0, "no norm/activation pair found"
     fused = False
     if a.fuse_loss:
         from xdna_train import regions
@@ -119,7 +126,7 @@ def main() -> None:
     meta = {
         "probe": "synthetic NIS-shaped step (fixed random B40 36x36, Adam without weight decay)",
         "commit": commit, "torch": torch.__version__, "threads": a.threads,
-        "fuse_loss": fused, "first_losses": losses[:3], "last_loss": losses[-1],
+        "fuse_loss": fused, "fused_norm_act_pairs": n_bn, "first_losses": losses[:3], "last_loss": losses[-1],
         "requested_mode": a.mode, "npu_mode_now": xdna_train.npu_mode(),
         "autotune_result": xdna_train.autotune_result(),
         "env": {k: v for k, v in os.environ.items() if k.startswith(("XDNA_", "OMP_", "MKL_"))},
