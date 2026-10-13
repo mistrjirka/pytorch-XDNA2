@@ -617,6 +617,13 @@ def allocator_stats() -> dict[str, int]:
     return dict(_C.allocator_stats())
 
 
+def async_dw_stats() -> dict:
+    """State of the early weight-gradient launch: kicks of the helper thread,
+    jobs it started, and the learned NPU dX calls per step (0 until two steps agree)."""
+    register_xdna_device()
+    return dict(_C.async_dw_stats())
+
+
 def reset_mapped_cpu_stats() -> None:
     """Reset profiling counters for XDNA handlers that execute on mapped CPU storage."""
     _C.reset_mapped_cpu_stats()

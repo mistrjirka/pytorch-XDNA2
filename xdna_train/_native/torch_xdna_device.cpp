@@ -268,6 +268,192 @@ XdnaBoCache& bo_cache() {
   return *cache;
 }
 
+
+// A deferred host job (the NPU dW of a conv3x3w gradient) that fills a mapped
+// BO after the producing op returned.  Whoever needs the result first runs it:
+// the gradient's reader, or the launcher thread once the NPU input-gradient
+// chain of the step has ended.  Unlike std::async(deferred), whose state
+// always reports "deferred", the state here says whether the job has started,
+// so the allocator can drop a job nobody started but must wait for a running
+// one (it writes into the BO that is being released).
+struct DeferredHostJob {
+  enum class State { Pending, Running, Done, Dropped };
+
+  explicit DeferredHostJob(std::function<void()> work) : fn(std::move(work)) {}
+
+  // True if the caller now owns the run (Pending -> Running).
+  bool claim() {
+    std::lock_guard<std::mutex> lock(m);
+    if (state != State::Pending) return false;
+    state = State::Running;
+    return true;
+  }
+
+  void run_claimed() {
+    std::exception_ptr failure;
+    try {
+      fn();
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    fn = nullptr;  // drops the packed operands
+    {
+      std::lock_guard<std::mutex> lock(m);
+      err = failure;
+      state = State::Done;
+    }
+    cv.notify_all();
+  }
+
+  // Reader side: run the job if nobody did, else wait for it; every call
+  // rethrows a failure, like shared_future::get().
+  void run_or_wait() {
+    if (claim()) run_claimed();
+    std::unique_lock<std::mutex> lock(m);
+    cv.wait(lock, [&] { return state == State::Done || state == State::Dropped; });
+    if (err) std::rethrow_exception(err);
+  }
+
+  // Allocator side: an unstarted job is dropped, a started one is awaited.
+  // Returns the failure of a job that ended in error, never throws.
+  std::exception_ptr release() {
+    std::unique_lock<std::mutex> lock(m);
+    if (state == State::Pending) {
+      state = State::Dropped;
+      fn = nullptr;
+      cv.notify_all();
+      return nullptr;
+    }
+    cv.wait(lock, [&] { return state == State::Done || state == State::Dropped; });
+    return err;
+  }
+
+  std::mutex m;
+  std::condition_variable cv;
+  State state = State::Pending;
+  std::exception_ptr err;
+  std::function<void()> fn;
+  std::atomic<bool> consumed{false};  // a reader has asked for it (epoch bookkeeping)
+};
+
+// Runs registered DeferredHostJobs on a helper thread when kicked.  The kick
+// comes from the conv backward after the last NPU dX of the step (learned from
+// the previous steps, see AsyncDwPolicy), so the dW passes run while the CPU
+// finishes the rest of backward.  A job a reader already started is skipped.
+class DeferredJobLauncher {
+ public:
+  static DeferredJobLauncher& instance() {
+    static auto* launcher = new DeferredJobLauncher();  // process lifetime
+    return *launcher;
+  }
+
+  void add(std::shared_ptr<DeferredHostJob> job) {
+    std::lock_guard<std::mutex> lock(m_);
+    queue_.push_back(std::move(job));
+  }
+
+  // Wake the thread for everything registered so far.
+  void kick() {
+    {
+      std::lock_guard<std::mutex> lock(m_);
+      if (queue_.empty()) return;
+      if (!thread_started_) {
+        thread_started_ = true;
+        std::thread([this] { loop(); }).detach();
+      }
+      for (auto& job : queue_) ready_.push_back(std::move(job));
+      queue_.clear();
+      ++kicks_;
+    }
+    cv_.notify_one();
+  }
+
+  // Jobs registered but not yet kicked are dropped from the list once they ran.
+  void forget_unkicked() {
+    std::lock_guard<std::mutex> lock(m_);
+    queue_.clear();
+  }
+
+  uint64_t kicks() const { return kicks_.load(); }
+  uint64_t started_by_thread() const { return started_.load(); }
+
+ private:
+  void loop() {
+    for (;;) {
+      std::shared_ptr<DeferredHostJob> job;
+      {
+        std::unique_lock<std::mutex> lock(m_);
+        cv_.wait(lock, [&] { return !ready_.empty(); });
+        job = std::move(ready_.front());
+        ready_.pop_front();
+      }
+      if (job->claim()) {
+        ++started_;
+        job->run_claimed();
+      }
+    }
+  }
+
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::deque<std::shared_ptr<DeferredHostJob>> queue_, ready_;
+  bool thread_started_ = false;
+  std::atomic<uint64_t> kicks_{0};
+  std::atomic<uint64_t> started_{0};
+};
+
+
+// When to start the deferred dWs early.  A training step has a fixed number K
+// of NPU dX calls in backward; after the K-th one the NPU is idle while the CPU
+// finishes the rest of backward, so the dWs run then instead of at the
+// optimizer.  K is the dX count of the previous step, trusted once two steps in
+// a row agree; any other graph never starts early and keeps the lazy behaviour.
+// XDNA_ASYNC_DW=0 turns this off.
+struct AsyncDwPolicy {
+  std::atomic<int> epoch_dx{0};   // NPU dX calls since the last consumed dW
+  std::atomic<int> last_epoch{0};
+  std::atomic<int> stable{0};     // K, or 0 while not yet known
+};
+
+AsyncDwPolicy& async_dw_policy() {
+  static auto* policy = new AsyncDwPolicy();
+  return *policy;
+}
+
+bool async_dw_enabled() {
+  static const bool enabled = []() {
+    const char* raw = std::getenv("XDNA_ASYNC_DW");
+    return !(raw != nullptr && raw[0] == '0');
+  }();
+  return enabled;
+}
+
+void async_dw_count_dx() {
+  if (async_dw_enabled()) ++async_dw_policy().epoch_dx;
+}
+
+// A reader asked for a deferred dW: the step's backward is over.
+void async_dw_epoch_end() {
+  auto& policy = async_dw_policy();
+  const int n = policy.epoch_dx.exchange(0);
+  if (n <= 0) return;
+  if (n == policy.last_epoch.load()) {
+    policy.stable = n;
+  } else {
+    policy.last_epoch = n;
+    policy.stable = 0;
+  }
+  DeferredJobLauncher::instance().forget_unkicked();
+}
+
+void async_dw_maybe_kick() {
+  if (!async_dw_enabled()) return;
+  auto& policy = async_dw_policy();
+  const int k = policy.stable.load();
+  // >=: a dW created after the learned point (a conv without dX) starts at once too.
+  if (k > 0 && policy.epoch_dx.load() >= k) DeferredJobLauncher::instance().kick();
+}
+
 struct XdnaAllocation {
   uint64_t magic = kXdnaAllocationMagic;
   ShimBo* bo = nullptr;
@@ -282,7 +468,7 @@ struct XdnaAllocation {
   // Host work may fill this mapped BO after the producing ATen op returns.
   // Consumers fence on this future only when the storage is actually read.
   std::mutex pending_mutex;
-  std::shared_future<void> pending_host_write;
+  std::shared_ptr<DeferredHostJob> pending_host_write;
 
   // conv3x3w: this tensor packed for the NPU, kept for its deferred dW
   // (Conv3x3wPacked).  The tag identifies the packed view, version and epoch.
@@ -329,24 +515,25 @@ at::Tensor cpu_alias_unchecked(const at::Tensor& t) {
 }
 
 void wait_pending_host_write(XdnaAllocation* allocation) {
-  std::shared_future<void> pending;
+  std::shared_ptr<DeferredHostJob> pending;
   {
     std::lock_guard<std::mutex> guard(allocation->pending_mutex);
     pending = allocation->pending_host_write;
   }
-  if (pending.valid()) {
-    pending.get();
+  if (pending) {
+    if (!pending->consumed.exchange(true)) async_dw_epoch_end();
+    pending->run_or_wait();
   }
 }
 
 void set_pending_host_write(
     const at::Tensor& tensor,
-    std::shared_future<void> pending) {
+    std::shared_ptr<DeferredHostJob> pending) {
   auto* allocation = allocation_from_tensor(tensor);
   {
     std::lock_guard<std::mutex> guard(allocation->pending_mutex);
     TORCH_CHECK(
-        !allocation->pending_host_write.valid(),
+        !allocation->pending_host_write,
         "XDNA allocation already has pending host work");
     allocation->pending_host_write = std::move(pending);
   }
@@ -418,19 +605,20 @@ uint64_t write_epoch_of(const at::Tensor& tensor) {
 // only compute a gradient nobody reads.  A started job must finish before the
 // BO is reused; its error cannot leave a destructor, so it is reported here.
 void release_pending_host_write(XdnaAllocation* allocation) {
-  std::shared_future<void> pending;
+  std::shared_ptr<DeferredHostJob> pending;
   {
     std::lock_guard<std::mutex> guard(allocation->pending_mutex);
     pending = std::move(allocation->pending_host_write);
   }
-  if (!pending.valid() ||
-      pending.wait_for(std::chrono::seconds(0)) == std::future_status::deferred) {
-    return;
-  }
-  try {
-    pending.get();
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "XDNA: deferred host write failed: %s\n", e.what());
+  if (!pending) return;
+  const std::exception_ptr failure = pending->release();
+  if (failure && !pending->consumed.load()) {
+    try {
+      std::rethrow_exception(failure);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "XDNA: deferred host write failed: %s\n", e.what());
+    } catch (...) {
+    }
   }
 }
 
@@ -4173,6 +4361,7 @@ convolution_backward_overrideable_xdna(
     // The dX packed dY exactly as dW needs it (same chunks: dX's input
     // channels are dW's output channels).
     if (w3_dw_job) w3_dw_job->d_buf = std::move(w3_dy_packed);
+    async_dw_count_dx();
     cpu_mask[0] = false;
   } else if (full_dx) {
     TORCH_CHECK(full_dx_owner != nullptr, "full-frame dX runtime owner missing");
@@ -4187,14 +4376,15 @@ convolution_backward_overrideable_xdna(
                               w3_dw_job->d_buf);
     auto* gw_ptr = static_cast<uint16_t*>(cpu_alias(gw).data_ptr());
     auto* rt = w3_dw_slot.get();
-    std::shared_future<void> pending =
-        std::async(std::launch::deferred,
-                   [job = w3_dw_job, gw_ptr, rt, plan = *w3_dw_plan]() {
-                     rt->compute(gw_ptr, plan, job->x_buf, job->d_buf);
-                     *job = Conv3x3wDwJob();
-                   }).share();
-    set_pending_host_write(gw, std::move(pending));
+    auto host_job = std::make_shared<DeferredHostJob>(
+        [job = w3_dw_job, gw_ptr, rt, plan = *w3_dw_plan]() {
+          rt->compute(gw_ptr, plan, job->x_buf, job->d_buf);
+          *job = Conv3x3wDwJob();
+        });
+    set_pending_host_write(gw, host_job);
+    if (async_dw_enabled()) DeferredJobLauncher::instance().add(host_job);
   }
+  async_dw_maybe_kick();
 
   if (cpu_mask[0] || cpu_mask[1] || cpu_mask[2]) {
     ScopedMappedCpu mapped_phase("aten::convolution_backward.cpu_mapped");
@@ -4785,6 +4975,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("reset_mapped_cpu_stats", []() {
     std::lock_guard<std::mutex> guard(mapped_cpu_stats_mutex());
     mapped_cpu_stats_map().clear();
+  });
+  m.def("async_dw_stats", []() {
+    py::dict out;
+    auto& launcher = DeferredJobLauncher::instance();
+    auto& policy = async_dw_policy();
+    out["enabled"] = py::bool_(async_dw_enabled());
+    out["kicks"] = py::int_(launcher.kicks());
+    out["started_by_helper"] = py::int_(launcher.started_by_thread());
+    out["dx_per_step"] = py::int_(policy.stable.load());
+    return out;
   });
   m.def("mapped_cpu_stats", []() {
     std::lock_guard<std::mutex> guard(mapped_cpu_stats_mutex());
