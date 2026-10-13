@@ -169,3 +169,41 @@ Each removal is its own commit on the pruning branch (`9e1a5de..HEAD`):
 - Lazy decoder values (`XDNA_LAZY_DECODER_VALUES`, `XDNA_LAZY_DECODER_DW`), virtual values, fused cat2+upsample2 forward; their two tests.
 - Shadowed legacy full-frame streams (res146 / dX292 / dX584 of the legacy family), `configure_fast_dx584` and the `XDNA_ENABLE_FAST_DX584` / `XDNA_FAST_DX584_ARTIFACT_DIR` aliases; the `XDNA_FULLFRAME_TM` environment channel (tile M is now passed as an argument).
 - Unused C pack entry points in `conv_pack.cpp`.
+
+## 2026-10-13: early start of the NPU weight gradients
+
+Timeline. In the profiled NIS step (126 ms) the last NPU dX call ends at 81 ms. The
+CPU then works alone for 31 ms (five 9x9 residual blocks and the encoder convolutions)
+while the NPU idles. The six dW passes (11.9 ms) started only at the optimizer, at 112 ms.
+
+Change. The NPU dW passes are still deferred, but they can now start earlier. Once two
+training steps show the same number K of NPU dX calls in backward, a helper thread
+starts the deferred dW passes right after the K-th dX call of the following steps. They
+run while the CPU finishes backward. A reader still waits for its gradient, and runs the
+job itself if the helper has not started it. The first two steps, and models whose dX
+count per step is unstable, keep the lazy behaviour. `XDNA_ASYNC_DW=0` turns the feature
+off. The default is on.
+
+Measurement. Ryzen AI 9 365 on AC power. NIS style-transfer training step: MyNet(3,3,5),
+batch 40, 36x36, BF16, Adam, 10 CPU threads. Four runs per setting, in ABBA order, on the
+same tree. Both settings give the same loss (22.9).
+
+| Setting | Run 1 | Run 2 | Run 3 | Run 4 | Mean |
+|---|---|---|---|---|---|
+| `XDNA_ASYNC_DW=0` (ms) | 124.3 | 120.3 | 119.9 | 125.7 | 122.6 |
+| `XDNA_ASYNC_DW=1` (ms) | 113.3 | 108.9 | 110.6 | 109.3 | 110.5 |
+
+The step is about 10 percent faster with the feature on.
+
+Limits. The feature helps only when backward has CPU work after the last NPU dX call.
+If the learned K is wrong, because the structure changed, the early start can overlap
+with later NPU dX calls. That costs hardware-context switches, but the results stay
+identical. The test is `tests/run_async_dw.py`. With gradient accumulation or several
+optimizers, the dX count may never stabilise, and the feature then stays lazy. A process
+that exits while a started dW is running is not handled specially. That window is a few
+milliseconds after backward.
+
+Candidates not done. Running the target-image VGG forward during the forward NPU waits
+can save at most 5.6 ms, and only while the host is blocked. Overlapping the target and
+prediction VGG passes gains about 0, because both use the same CPU cores. Both were
+measured as small or zero, so they were not implemented.

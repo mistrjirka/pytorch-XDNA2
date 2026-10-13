@@ -230,6 +230,8 @@ optimizer step when timing training. For a backward-only benchmark, explicitly
 read every gradient being measured, for example with `.cpu()`, and account for
 that readback cost. See [benchmark methodology](performance.md#reproducing-the-measurements).
 
+`XDNA_ASYNC_DW` (default `1`) starts the deferred weight-gradient passes earlier. Once the backend has seen two training steps with the same number K of NPU input-gradient (dX) calls in backward, a helper thread starts the deferred dW passes right after the K-th dX call of the next steps, so they overlap the CPU work that remains in backward. The first two steps, and models whose NPU dX count per step is not stable, keep the lazy behaviour. To check whether it is active, call `xdna_train.async_dw_stats()`; it returns `enabled`, `kicks` (helper wake-ups), `started_by_helper` (jobs the helper started) and `dx_per_step` (the learned K, 0 until two steps agree). Set `XDNA_ASYNC_DW=0` before import to turn it off. A weight-gradient job that the helper thread already started is awaited when its gradient is read.
+
 ## Further reading
 
 [Backend architecture](xdna-device-architecture.md) describes mapped tensor
