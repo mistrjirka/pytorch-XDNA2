@@ -81,11 +81,14 @@ Accuracy (`tests/run_regions_bn.py`, 7 shapes, 3 steps each, vs an fp32 CPU refe
 fp32 than the eager bf16 pair on output, input / weight / bias gradients and both running statistics in every case
 (e.g. 40x64x36x36: dx 0.0149 vs 0.0181, dW 0.0089 vs 0.0138).
 
-Speed: microbenchmark fwd+bwd, eager -> fused: 13.3 MB tensor 3.46 -> 2.29 ms, 6.6 MB 1.18 -> 0.82 ms; 3.3 MB and
+Speed (microbenchmark, reliable): fwd+bwd, eager -> fused: 13.3 MB tensor 3.46 -> 2.29 ms, 6.6 MB 1.18 -> 0.82 ms; 3.3 MB and
 smaller: no gain (0.40 -> 0.43, 0.15 -> 0.14), hence the size threshold.  Profile (clean, cooled): BatchNorm +
 activation 9.9 ms of host time eager -> ~1.2 ms, with the fused op itself ~7 ms, net -3 to -5 ms op time.  Full
-step (wall): about -1 to -3 ms (91.4 -> 90.1 ms mean of valid pairs; the machine throttles after a few minutes of
-back-to-back runs and 105-130 ms outliers had to be dropped).  So it is a ~2% gain, well below the 6-8 ms I
+step (wall): NOT established.  My pairs suggested -1 to -3 ms, but they needed outliers dropped (the machine throttles
+after a few minutes of back-to-back runs) and an external audit of the same configuration (loss-only 93.5 / 96.2 ms vs
+loss+BN 108.5 / 92.3 ms, nothing discarded) could not separate the two; run-to-run variation of identical runs is larger
+than the claimed gain.  What is solid: the microbenchmark gain on the two largest layers (~1.2 + 0.4 ms) and the
+op-time profile.  Do not count the BN fusion as a confirmed full-step gain.  It is also far below the 6-8 ms I
 estimated: eager BatchNorm on the large tensors is already vectorised, and only the two 36x36 128-channel layers
 have enough bytes to gain.
 
@@ -97,3 +100,31 @@ input (e.g. a transposed view) returned wrong, run-to-run varying results (6-75%
 a strided CPU alias to PyTorch's `native_batch_norm[_backward]_out`, which picks its memory format from the strides
 and mis-indexes a permuted view.  Such inputs are now made contiguous first (`batch_norm_layout_safe`); test in
 `run_regions_bn.py`.
+
+## Contract bugs found by an external audit (fixed 2026-10-14, `tests/run_regions_contract.py`)
+
+All five reproduced before the fix:
+- `copy.deepcopy` of a model with a fused norm/activation pair, or of a fused loss, kept using the ORIGINAL module's
+  parameters (the wrappers were closures over the original): the copy's batch counter did not move, the original got
+  the weight gradient, and a copied loss with zeroed feature weights still returned 0.17.  The wrappers are now module
+  level functions bound with `types.MethodType` (deepcopy rebinds them to the copy) and read everything from `self`.
+  Paired modules must be copied together (the pairing is stored on the norm).
+- Feature weights that became trainable after `fuse_perceptual_loss` silently lost their gradients.  Eligibility is
+  re-checked on every call (conv weights / biases must not require grad) and the chain is rebuilt if the layers or
+  weights were replaced; otherwise the module's own method runs.
+- The "already activated" mark was never consumed, so a second `act(y)` on the activated tensor was skipped (15.7%
+  error).  The mark now covers exactly one activation call.
+- A changed `negative_slope` was ignored on the fused path (27% error); it is read on every call.
+
+Not changed (documented): pickling a whole fused module with `torch.save(model)` is not supported (bound methods in
+the instance dict); save `state_dict()` instead.
+
+## Using the fusions in the real NIS script
+
+The unchanged coursework `style_transfer.py` defaults to CPU and calls neither adapter; the benchmarks switch them on
+explicitly.  After `model.to('xdna', bf16)` and building the loss on XDNA the script would need, for example:
+
+    from xdna_train import regions
+    regions.fuse_perceptual_loss(loss_fn)            # loss_fn = ImageGenLoss(...) on xdna
+    sys.path.insert(0, '<repo>/benchmarks'); from nis_adapters import fuse_nis_norm_act
+    fuse_nis_norm_act(model)                         # optional; gain not established

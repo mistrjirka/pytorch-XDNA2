@@ -38,6 +38,8 @@ from __future__ import annotations
 import os
 import statistics
 import time
+import types
+import weakref
 from dataclasses import dataclass, field
 
 import torch
@@ -183,8 +185,13 @@ class FrozenFeatureChain:
         if torch.is_grad_enabled() and not x.requires_grad:
             return False  # the region's backward produces dX only
         for op in self.ops:
-            if op.kind == "conv" and (op.weight.device.type != "xdna"
-                                      or op.weight.dtype != torch.bfloat16):
+            if op.kind != "conv":
+                continue
+            if op.weight.device.type != "xdna" or op.weight.dtype != torch.bfloat16:
+                return False
+            # the region produces dX only: weights that became trainable after the
+            # region was installed must take the eager path (and get their gradients)
+            if op.weight.requires_grad or (op.bias is not None and op.bias.requires_grad):
                 return False
         return True
 
@@ -309,44 +316,77 @@ def frozen_feature_mse(chain: FrozenFeatureChain, x: torch.Tensor, target: torch
     return _FrozenFeatureMSE.apply(chain, x, target)
 
 
+def _loss_chain(loss_module):
+    """The region chain for the module's CURRENT feature layers (cached on the
+    module; rebuilt if the layers or their weights were replaced), or None."""
+    cfg = loss_module.__dict__["_xdna_region_cfg"]
+    net = getattr(loss_module, cfg["features_attr"], None)
+    feats = getattr(getattr(net, "model", None), "features", None)
+    taps = getattr(net, "feature_layers", None)
+    if feats is None or taps is None:
+        return None
+    layers = list(feats)[: max(taps) + 1] if len(taps) else []
+    chain = loss_module.__dict__.get("_xdna_chain")
+    if chain is not None:
+        convs = [m for m in layers if isinstance(m, nn.Conv2d)]
+        cur = [op for op in chain.ops if op.kind == "conv"]
+        if (len(convs) != len(cur) or chain.taps != tuple(sorted(set(int(t) for t in taps)))
+                or any(m.weight is not op.weight or m.bias is not op.bias for m, op in zip(convs, cur))):
+            chain = None
+    if chain is None:
+        chain = FrozenFeatureChain.from_sequential(layers, taps)
+        loss_module.__dict__["_xdna_chain"] = chain
+    return chain
+
+
+def _fused_compute_perceptual_loss(self, input, target):
+    """Bound to the loss module (types.MethodType), so a deepcopy rebinds it to the
+    copy; everything is read from ``self`` at call time."""
+    chain = _loss_chain(self)
+    if chain is None or not enabled() or not chain.eligible(input, target):
+        return type(self).compute_perceptual_loss(self, input, target)
+    net = getattr(self, self.__dict__["_xdna_region_cfg"]["features_attr"])
+    x, t = input, target
+    norm = getattr(net, "norm", None) if getattr(net, "use_norm", False) else None
+    if norm is not None:
+        mean, std = getattr(norm, "mean", None), getattr(norm, "std", None)
+        if mean is None or std is None:
+            return type(self).compute_perceptual_loss(self, input, target)
+        m = torch.as_tensor(mean, dtype=x.dtype, device=x.device).view(1, -1, 1, 1)
+        s = torch.as_tensor(std, dtype=x.dtype, device=x.device).view(1, -1, 1, 1)
+        x = (x - m) / s
+        t = (t - m) / s
+    return frozen_feature_mse(chain, x, t)
+
+
 def fuse_perceptual_loss(loss_module, features_attr: str = "perceptual_vgg"):
     """Route ``loss_module.compute_perceptual_loss`` through the region when the
     module follows the common pattern: ``getattr(loss_module, features_attr)``
     has ``model.features`` (a Sequential), ``feature_layers`` (tap indices),
     optional ``use_norm`` / ``norm`` (a Normalize with mean/std), and the loss is
-    the mean squared tap difference.  Returns True if the region was installed;
-    inputs the region does not accept still take the module's own method.
+    the mean squared tap difference.  Returns True if the region was installed.
+
+    Every call re-checks eligibility against the module's current state: inputs or
+    layers the region does not accept (trainable feature weights, other dtypes,
+    replaced layers) take the module's own method, so nothing is silently dropped.
+    The wrapper is a method bound to ``loss_module``, so ``copy.deepcopy`` of the
+    module gives a copy that uses its own weights.
     """
     if not enabled():
         return False
     net = getattr(loss_module, features_attr, None)
     feats = getattr(getattr(net, "model", None), "features", None)
     taps = getattr(net, "feature_layers", None)
-    if feats is None or taps is None:
+    if feats is None or taps is None or not hasattr(loss_module, "compute_perceptual_loss"):
         return False
-    chain = FrozenFeatureChain.from_sequential(feats, taps)
-    if chain is None:
+    if FrozenFeatureChain.from_sequential(list(feats)[: max(taps) + 1], taps) is None:
         return False
-    norm = getattr(net, "norm", None) if getattr(net, "use_norm", False) else None
-    mean = std = None
-    if norm is not None:
-        mean, std = getattr(norm, "mean", None), getattr(norm, "std", None)
-        if mean is None or std is None:
+    if getattr(net, "use_norm", False):
+        norm = getattr(net, "norm", None)
+        if getattr(norm, "mean", None) is None or getattr(norm, "std", None) is None:
             return False
-    original = loss_module.compute_perceptual_loss
-
-    def compute_perceptual_loss(input, target):
-        if not chain.eligible(input, target):
-            return original(input, target)
-        x, t = input, target
-        if mean is not None:
-            m = torch.as_tensor(mean, dtype=x.dtype, device=x.device).view(1, -1, 1, 1)
-            s = torch.as_tensor(std, dtype=x.dtype, device=x.device).view(1, -1, 1, 1)
-            x = (x - m) / s
-            t = (t - m) / s
-        return frozen_feature_mse(chain, x, t)
-
-    loss_module.compute_perceptual_loss = compute_perceptual_loss
+    loss_module.__dict__["_xdna_region_cfg"] = {"features_attr": features_attr}
+    loss_module.compute_perceptual_loss = types.MethodType(_fused_compute_perceptual_loss, loss_module)
     return True
 
 
@@ -414,48 +454,63 @@ def _norm_act_eligible(bn: nn.BatchNorm2d, x: torch.Tensor) -> bool:
     return True
 
 
+def _act_slope(act):
+    if isinstance(act, nn.LeakyReLU):
+        return float(act.negative_slope)
+    if isinstance(act, nn.ReLU):
+        return 0.0
+    return None
+
+
+def _fused_bn_forward(self, x):
+    """Bound to the BatchNorm module (types.MethodType): a deepcopy rebinds it to
+    the copy.  The paired activation is read from ``self`` and its slope at call time."""
+    act = self.__dict__.get("_xdna_pair")
+    slope = _act_slope(act) if act is not None else None
+    if slope is None or slope < 0.0 or not _norm_act_eligible(self, x):
+        return type(self).forward(self, x)
+    self.num_batches_tracked.add_(1)
+    y = _BatchNormAct.apply(x, self.weight, self.bias, self.running_mean, self.running_var,
+                            float(self.eps), slope, float(self.momentum))
+    y._xdna_act_for = weakref.ref(act)
+    return y
+
+
+def _checked_act_forward(self, x):
+    """Pass through a tensor that the paired fused norm already activated -- once --
+    and activate everything else."""
+    ref = getattr(x, "_xdna_act_for", None)
+    if ref is not None and ref() is self:
+        x._xdna_act_for = None  # consumed: a later call on the same tensor activates
+        return x
+    return type(self).forward(self, x)
+
+
 def fuse_norm_activation(bn: nn.BatchNorm2d, act: nn.Module) -> bool:
     """Declare that ``act`` is applied directly to the output of ``bn`` (like
     ``torch.ao.quantization.fuse_modules``) and run the pair as one fused op.
 
     Both modules keep their parameters, buffers and state_dict keys; only their
-    ``forward`` is wrapped.  When the fused op is eligible (training mode, bf16
-    contiguous NCHW on XDNA, affine, tracked statistics with a float momentum),
-    ``bn(x)`` returns the *activated* tensor and ``act`` passes that tensor
-    through; anything else runs both modules unchanged.
+    ``forward`` is wrapped, by methods bound to the modules themselves, so
+    ``copy.deepcopy`` of a model containing the pair gives a working fused pair
+    (copy the two modules together: the pairing is stored on the norm).  When the
+    fused op is eligible (training mode, bf16 contiguous NCHW on XDNA, affine,
+    tracked statistics with a float momentum, a large enough tensor), ``bn(x)``
+    returns the *activated* tensor and the next call of ``act`` on exactly that
+    tensor passes it through once; anything else runs both modules unchanged.  The
+    activation's current ``negative_slope`` is read on every call.
 
     The pairing is the caller's statement about the model's dataflow.  If the
     activation is not applied to the norm output directly (an add or a branch in
     between), the activation would be applied twice or to the wrong tensor: do
     not declare such a pair.  Returns True if installed.
     """
-    if not enabled() or not isinstance(bn, nn.BatchNorm2d):
+    if not enabled() or type(bn) is not nn.BatchNorm2d or type(act) not in (nn.LeakyReLU, nn.ReLU):
         return False
-    if isinstance(act, nn.LeakyReLU):
-        slope = float(act.negative_slope)
-    elif isinstance(act, nn.ReLU):
-        slope = 0.0
-    else:
-        return False
-    if slope < 0.0 or getattr(bn, "_xdna_fused_act", None) is not None:
-        return getattr(bn, "_xdna_fused_act", None) is act
-    bn_forward, act_forward = bn.forward, act.forward
-    token = object()
-
-    def fused_bn(x):
-        if not _norm_act_eligible(bn, x):
-            return bn_forward(x)
-        bn.num_batches_tracked.add_(1)
-        y = _BatchNormAct.apply(x, bn.weight, bn.bias, bn.running_mean, bn.running_var,
-                                float(bn.eps), slope, float(bn.momentum))
-        y._xdna_act_token = token
-        return y
-
-    def checked_act(x):
-        if getattr(x, "_xdna_act_token", None) is token:
-            return x
-        return act_forward(x)
-
-    bn.forward, act.forward = fused_bn, checked_act
-    bn._xdna_fused_act = act
+    if bn.__dict__.get("_xdna_pair") is not None:
+        return bn.__dict__["_xdna_pair"] is act
+    object.__setattr__(bn, "_xdna_pair", act)  # plain attribute, not a registered submodule
+    bn.forward = types.MethodType(_fused_bn_forward, bn)
+    if not isinstance(act.forward, types.MethodType) or act.forward.__func__ is not _checked_act_forward:
+        act.forward = types.MethodType(_checked_act_forward, act)
     return True
