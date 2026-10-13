@@ -2,6 +2,7 @@
 
 from .device import (
     allocator_stats,
+    async_dw_stats,
     autotune_result,
     bo_handle,
     coherency_state,
@@ -32,6 +33,7 @@ __all__ = [
     "synchronize",
     "empty_cache",
     "allocator_stats",
+    "async_dw_stats",
     "autotune_result",
     "set_npu_mode",
     "npu_mode",
