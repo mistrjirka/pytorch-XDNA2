@@ -23,6 +23,7 @@ lib.xdna_conv3x3w_unpack_output_bf16.argtypes = [P, P, I, I, I, I, I, I]
 lib.xdna_conv3x3w_pack_input_range_bf16.argtypes = [P, P, I, I, I, I, I, I, I]
 lib.xdna_conv3x3w_unpack_output_range_bf16.argtypes = [P, P, I, I, I, I, I, I, I, I]
 lib.xdna_conv3x3w_pack_input_strips_range_bf16.argtypes = [P, P, I, I, I, I, I, I, I, I, I, I]
+lib.xdna_conv3x3w_pack_input_strips_range_bfp16.argtypes = [P, P, P, I, I, I, I, I, I, I, I, I, I]
 lib.xdna_conv3x3w_unpack_output_strips_range_bf16.argtypes = [P, P, I, I, I, I, I, I, I, I, I]
 
 rng = np.random.default_rng(0)
@@ -244,6 +245,59 @@ def strip_case(B, C, H, W, Cout):
 for s in [(2, 64, 8, 36, 64), (3, 64, 8, 37, 64), (2, 70, 9, 56, 10), (2, 64, 6, 64, 128),
           (2, 3, 7, 68, 64), (1, 64, 5, 69, 64), (3, 128, 4, 112, 128), (2, 64, 3, 224, 128), (2, 64, 5, 35, 64)]:
     strip_case(*s)
+
+
+
+def bfp_case(B, C, H, W):
+    """bfp16 input layout of the forward/dX kernel (strips, halo modes, pieces,
+    a buffer reused across inputs) vs the numpy reference, plus timing."""
+    S, So = ref.strip_geometry(W)
+    chunks = -(-C // 64)
+    Wg = W if S == 1 else So + 2
+    _, _, groups = ref.geometry(B * S, H, Wg)
+    ok = True
+    for halo_zero in ([0] if S == 1 else [0, 1]):
+        dst = dst16 = None
+        for _ in range(2):
+            x = rng.standard_normal((B, C, H, W)).astype(np.float32)
+            x[0, :, 0, 0] = 0.0                      # an all-zero block
+            if C > 9:
+                x[-1, 1:9, -1, -1] *= 1e-30          # tiny values next to normal ones
+            xb = np.ascontiguousarray(ref.bf16_bits(x))
+            expect = ref.pack_input_strips_bfp(x, chunks, bool(halo_zero))
+            expect16 = ref.pack_input_strips(x, chunks, bool(halo_zero))
+            if dst is None:
+                dst = np.zeros(expect.shape, np.uint8)
+            if dst16 is None:
+                dst16 = np.zeros(expect16.shape, np.uint16)
+            lib.xdna_conv3x3w_pack_input_strips_range_bfp16(
+                xb.ctypes.data, dst.ctypes.data, dst16.ctypes.data, B, C, H, W, S, So, halo_zero,
+                chunks, 0, groups)
+            ok &= np.array_equal(dst, expect)
+            ok &= np.array_equal(dst16, expect16)
+        if groups > 1:
+            d2 = np.zeros(expect.shape, np.uint8)
+            k = max(1, groups // 3)
+            for g0, n in ((0, k), (k, groups - k)):
+                piece = np.zeros((n,) + expect.shape[1:], np.uint8)
+                lib.xdna_conv3x3w_pack_input_strips_range_bfp16(
+                    xb.ctypes.data, piece.ctypes.data, None, B, C, H, W, S, So, halo_zero, chunks, g0, n)
+                d2[g0:g0 + n] = piece
+            ok &= np.array_equal(d2, expect)
+    ms = timed(lambda: lib.xdna_conv3x3w_pack_input_strips_range_bfp16(
+        xb.ctypes.data, dst.ctypes.data, None, B, C, H, W, S, So, 0, chunks, 0, groups), reps=5)
+    ms2 = timed(lambda: lib.xdna_conv3x3w_pack_input_strips_range_bfp16(
+        xb.ctypes.data, dst.ctypes.data, dst16.ctypes.data, B, C, H, W, S, So, 0, chunks, 0, groups), reps=5)
+    bf = np.zeros((groups, chunks, ref.GROUP_ROWS, 64), np.uint16)
+    ms16 = timed(lambda: lib.xdna_conv3x3w_pack_input_strips_range_bf16(
+        xb.ctypes.data, bf.ctypes.data, B, C, H, W, S, So, 0, chunks, 0, groups), reps=5)
+    print(f"bfp case B={B} C={C} H={H} W={W} (bf16 layout {ms16:.3f} ms, both {ms2:.3f} ms)")
+    report("pack bfp", bool(ok), ms)
+
+
+for s in [(2, 64, 8, 36), (2, 70, 9, 30), (2, 3, 7, 68), (3, 128, 4, 112), (2, 64, 5, 35),
+          (40, 256, 36, 36), (8, 64, 48, 48)]:
+    bfp_case(*s)
 
 print("ALL OK" if not fails else f"{fails} FAILED")
 sys.exit(1 if fails else 0)

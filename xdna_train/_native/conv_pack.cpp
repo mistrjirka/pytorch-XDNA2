@@ -5,6 +5,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #include <emmintrin.h>
+#include <immintrin.h>
 #endif
 
 // Width of the pack loops only.  Set through num_threads() on each loop so the
@@ -692,6 +693,184 @@ void xdna_conv3x3w_pack_input_strips_range_bf16(
                   dst + (((g - 1 - g0) * chunks + chunk) * kGroupRows + r +
                          kGroupOutRows) * kKStep,
                   tile[xi], std::size_t(cc) * sizeof(uint16_t));
+          }
+        }
+      }
+    }
+  }
+}
+
+}  // extern "C"
+
+namespace {
+constexpr int kGroupRowsBfp = 2128;  // conv3x3w_host.GROUP_ROWS (bfp16 input layout)
+
+// 8 bf16 values -> one bfp16ebs8 block: shared exponent byte (the largest
+// biased exponent) + 8 int8 mantissas, value * 2^(133 - exp) rounded to
+// nearest even and clipped (conv3x3w_host.bfp16_encode).
+inline void encode_bfp_block(const uint16_t* v, uint8_t* out) {
+  int mx = 0;
+  for (int i = 0; i < 8; ++i) {
+    const int e = (v[i] >> 7) & 0xFF;
+    mx = e > mx ? e : mx;
+  }
+  const uint64_t sb = uint64_t(1023 + 133 - mx) << 52;
+  double scale;
+  std::memcpy(&scale, &sb, sizeof(scale));
+  out[0] = uint8_t(mx);
+  for (int i = 0; i < 8; ++i) {
+    const uint32_t bits = uint32_t(v[i]) << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    double q = __builtin_nearbyint(double(f) * scale);
+    q = q < -128.0 ? -128.0 : (q > 127.0 ? 127.0 : q);
+    out[1 + i] = uint8_t(int8_t(int(q)));
+  }
+}
+
+// encode_bfp_block for 4 consecutive blocks (32 values) with AVX-512BW, in
+// integers: a normal bf16 value is (128 + m) * 2^(e - 134), so its mantissa
+// is (128 + m) >> (mx - e + 1) rounded to nearest even (subnormals: m >> mx).
+// Bit-identical to encode_bfp_block.
+__attribute__((target("avx512f,avx512bw")))
+void encode_bfp_blocks4_avx512(const uint16_t* v, uint8_t exps[4], uint8_t mant[32]) {
+  const __m512i x = _mm512_loadu_si512(v);
+  const __m512i ff = _mm512_set1_epi16(0xFF), one = _mm512_set1_epi16(1);
+  const __m512i e = _mm512_and_si512(_mm512_srli_epi16(x, 7), ff);
+  // block max: each 128-bit lane is one block of 8 values
+  __m512i m = _mm512_max_epu16(e, _mm512_rol_epi32(e, 16));
+  m = _mm512_max_epu16(m, _mm512_shuffle_epi32(m, _MM_PERM_CDAB));
+  m = _mm512_max_epu16(m, _mm512_shuffle_epi32(m, _MM_PERM_BADC));
+  const __mmask32 normal = _mm512_cmpgt_epu16_mask(e, _mm512_setzero_si512());
+  const __m512i m7 = _mm512_and_si512(x, _mm512_set1_epi16(0x7F));
+  const __m512i v2 = _mm512_mask_blend_epi16(normal, m7, _mm512_or_si512(m7, _mm512_set1_epi16(0x80)));
+  const __m512i ee = _mm512_max_epu16(e, one);
+  __m512i sh = _mm512_add_epi16(_mm512_sub_epi16(m, ee), one);
+  sh = _mm512_min_epu16(sh, _mm512_set1_epi16(15));
+  const __m512i odd = _mm512_and_si512(_mm512_srlv_epi16(v2, sh), one);
+  const __mmask32 pos = _mm512_cmpgt_epu16_mask(sh, _mm512_setzero_si512());
+  const __m512i half = _mm512_sllv_epi16(one, _mm512_sub_epi16(sh, one));
+  const __m512i bias = _mm512_maskz_add_epi16(pos, _mm512_sub_epi16(half, one), odd);
+  __m512i q = _mm512_srlv_epi16(_mm512_add_epi16(v2, bias), sh);
+  const __mmask32 neg = _mm512_test_epi16_mask(x, _mm512_set1_epi16(int16_t(0x8000)));
+  q = _mm512_min_epu16(q, _mm512_mask_blend_epi16(neg, _mm512_set1_epi16(127), _mm512_set1_epi16(128)));
+  q = _mm512_mask_sub_epi16(q, neg, _mm512_setzero_si512(), q);
+  _mm256_storeu_si256((__m256i*)mant, _mm512_cvtepi16_epi8(q));
+  alignas(64) uint16_t mm[32];
+  _mm512_store_si512(mm, m);
+  for (int k = 0; k < 4; ++k) exps[k] = uint8_t(mm[8 * k]);
+}
+
+bool have_avx512bw() {
+  static const bool ok = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
+  return ok;
+}
+
+// One pixel's nblk (<= 8) channel blocks -> enc[k] = 9 bytes each.
+inline void encode_pixel_bfp(const uint16_t* px, int nblk, uint8_t (*enc)[9]) {
+  if (have_avx512bw()) {
+    for (int k0 = 0; k0 < nblk; k0 += 4) {
+      uint8_t exps[4], mant[32];
+      encode_bfp_blocks4_avx512(px + 8 * k0, exps, mant);
+      for (int k = k0; k < nblk && k < k0 + 4; ++k) {
+        enc[k][0] = exps[k - k0];
+        std::memcpy(&enc[k][1], mant + 8 * (k - k0), 8);
+      }
+    }
+    return;
+  }
+  for (int k = 0; k < nblk; ++k) encode_bfp_block(px + 8 * k, enc[k]);
+}
+}  // namespace
+
+extern "C" {
+
+// xdna_conv3x3w_pack_input_strips_range_bf16 for the forward/dX kernel's
+// bfp16 input: dst laid out [ng][chunks][8 channel blocks][GROUP_ROWS][9 B],
+// GROUP_ROWS = 2128, each block = one pixel's 8 channels.  Same contract:
+// only blocks holding real pixels are written, the caller zero-fills dst once
+// per shape (zero bytes are a valid zero block).  dst16, if not null, also
+// receives xdna_conv3x3w_pack_input_strips_range_bf16's result for the same
+// groups (the layout of the deferred weight gradient), from the same read.
+void xdna_conv3x3w_pack_input_strips_range_bfp16(
+    const uint16_t* src,
+    uint8_t* dst,
+    uint16_t* dst16,
+    int B,
+    int C,
+    int H,
+    int W,
+    int S,
+    int So,
+    int halo_zero,
+    int chunks,
+    int g0,
+    int ng) {
+  const int Wg = S == 1 ? W : So + 2;
+  const int wp = Wg + 2;
+  const int Bv = B * S;
+  const std::size_t img = std::size_t(H + 2) * wp;
+  const std::size_t plo = std::size_t(g0) * kGroupOutRows;
+  const std::size_t phi =
+      std::size_t(g0 + ng) * kGroupOutRows + (kGroupRowsBfp - kGroupOutRows);
+  const int v0 = int(plo / img);
+  const int v1 = int((phi - 1) / img) + 1 < Bv ? int((phi - 1) / img) + 1 : Bv;
+  if (v1 <= v0) return;
+  const std::size_t plane = std::size_t(kGroupRowsBfp) * 9;  // one channel block
+#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
+  for (int vb = v0; vb < v1; ++vb) {
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+      for (int y = 0; y < H; ++y) {
+        const int cc = C - chunk * kKStep < kKStep ? C - chunk * kKStep : kKStep;
+        const int nblk = (cc + 7) / 8;
+        const int b = vb / S, sidx = vb % S;
+        const int xs0 = S == 1 ? 0 : sidx * So - 1;
+        const std::size_t pr = (std::size_t(vb) * (H + 2) + y + 1) * wp + 1;
+        if (cc <= 0 || pr + Wg <= plo || pr >= phi) continue;
+        int ja = xs0 < 0 ? -xs0 : 0;
+        int jb = W - xs0 < Wg ? W - xs0 : Wg;
+        const int j0 = pr < plo ? int(plo - pr) : 0;
+        const int j1 = pr + Wg > phi ? int(phi - pr) : Wg;
+        if (ja < j0) ja = j0;
+        if (jb > j1) jb = j1;
+        const uint16_t* s =
+            src + ((std::size_t(b) * C + chunk * kKStep) * H + y) * W + xs0;
+        for (int xb = ja; xb < jb; xb += 8) {
+          const int nx = jb - xb < 8 ? jb - xb : 8;
+          uint16_t tile[8][kKStep];
+          if (cc < kKStep) std::memset(tile, 0, sizeof(tile));
+          gather_pixels(s + xb, std::size_t(H) * W, cc, nx, tile);
+          for (int xi = 0; xi < nx; ++xi) {
+            const int j = xb + xi;
+            if (halo_zero && S > 1 && (j == 0 || j == Wg - 1))
+              std::memset(tile[xi], 0, sizeof(tile[xi]));
+            uint8_t enc[8][9];
+            encode_pixel_bfp(tile[xi], nblk, enc);
+            const std::size_t p = pr + j;
+            const std::size_t g = p / kGroupOutRows;
+            const std::size_t r = p % kGroupOutRows;
+            if (dst16) {
+              if (g >= std::size_t(g0) && g < std::size_t(g0 + ng))
+                std::memcpy(
+                    dst16 + (((g - g0) * chunks + chunk) * kGroupRows + r) * kKStep,
+                    tile[xi], std::size_t(cc) * sizeof(uint16_t));
+              if (g > std::size_t(g0) && g <= std::size_t(g0 + ng) &&
+                  r + kGroupOutRows < std::size_t(kGroupRows))
+                std::memcpy(
+                    dst16 + (((g - 1 - g0) * chunks + chunk) * kGroupRows + r +
+                             kGroupOutRows) * kKStep,
+                    tile[xi], std::size_t(cc) * sizeof(uint16_t));
+            }
+            if (g >= std::size_t(g0) && g < std::size_t(g0 + ng)) {
+              uint8_t* d = dst + ((g - g0) * chunks + chunk) * 8 * plane + r * 9;
+              for (int k = 0; k < nblk; ++k) std::memcpy(d + k * plane, enc[k], 9);
+            }
+            if (g > std::size_t(g0) && g <= std::size_t(g0 + ng) &&
+                r + kGroupOutRows < std::size_t(kGroupRowsBfp)) {
+              uint8_t* d = dst + ((g - 1 - g0) * chunks + chunk) * 8 * plane +
+                           (r + kGroupOutRows) * 9;
+              for (int k = 0; k < nblk; ++k) std::memcpy(d + k * plane, enc[k], 9);
+            }
           }
         }
       }

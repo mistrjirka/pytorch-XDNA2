@@ -5,13 +5,14 @@ changes the instruction stream.  Each dispatch writes, per core, a runtime
 parameter block [groups, channel_chunks, 9 tap row offsets] and releases a
 barrier, so switching layers costs no hardware-context switch.
 
-Data flow (bf16 activations x bfp16ebs8 weights -> bf16, BF16 running sum):
+Data flow (bfp16ebs8 activations x bfp16ebs8 weights -> bf16, BF16 running sum):
   * Output rows are padded-grid pixels: row p of image b is the window whose
     top-left input pixel is p, so tap (dy, dx) is row offset dy*(W+2)+dx.
   * Each of the 32 cores owns M = 64 consecutive output rows and all N = 128
     output channels.  Per (group, 64-channel chunk) a column's shim streams its
-    4 cores' input windows (64 + halo rows x 64 channels) through the memtile;
-    each core keeps its window in L1 and reads the 9 taps by pointer offset.
+    4 cores' input windows (144 rows x 64 channels, bfp16) through the memtile;
+    each core keeps its window in L1, plus a copy shifted by 16 bytes (see the
+    kernel), and reads the 9 taps by byte offset.
   * Weights (K ordered (chunk, dy, dx, c)) are read once per group and
     broadcast to all cores.
 
@@ -23,8 +24,9 @@ Two hardware rules this design depends on (each one hung the array):
     group therefore issues one task per channel and at most 4 are in flight.
 
 Host layouts (see xdna_train conv packing):
-  X: [groups][chunks][GROUP_ROWS][64] bf16, GROUP_ROWS = 2048 + WIN_ROWS - 64,
-     padded NHWC rows with each group's halo duplicated
+  X: [groups][chunks][8][GROUP_ROWS][9] bfp16ebs8, GROUP_ROWS = 2048 + WIN_ROWS - 64,
+     padded NHWC rows with each group's halo duplicated, one block per pixel
+     and 8 channels, channel-block major (conv3x3w_host.pack_input_bfp)
   B: [K/64 * N/8 ... ] bfp16ebs8 in AMD's ATB 1x2/8x8 shuffle, K = 576 * chunks
   C: [groups * 2048][128] bf16 padded-grid rows
 
@@ -59,8 +61,9 @@ COLS, ROWS = 8, 4
 M_CORE = 64          # output rows per core
 N = 128              # output channels per pass
 K_STEP = 64          # channels per window chunk / K step
-MAX_WIDTH = 36       # widest supported image (window rows = 64 + 2*(W+2) + 2)
-WIN_ROWS = M_CORE + 2 * (MAX_WIDTH + 2) + 2
+MAX_WIDTH = 36       # widest supported image (needs 64 + 2*(W+2) + 2 = 142 rows)
+WIN_ROWS = 144       # window rows, rounded up so rows * 9 bytes is word aligned
+RW = 18              # 32-bit words per row of the stored layout (8 blocks x 9 B)
 GROUP_OUT_ROWS = M_CORE * ROWS * COLS
 GROUP_ROWS = GROUP_OUT_ROWS + WIN_ROWS - M_CORE
 RTP_LEN = 16
@@ -102,8 +105,9 @@ def conv3x3w(
     k = K_STEP
     K = 9 * k * chunks
 
-    A_l2_ty = np.ndarray[(ROWS * WIN_ROWS, k), np.dtype[bfloat16]]
-    A_l1_ty = np.ndarray[(WIN_ROWS, k), np.dtype[bfloat16]]
+    A_l2_ty = np.ndarray[(ROWS * WIN_ROWS * RW,), np.dtype[np.int32]]
+    A_l1_ty = np.ndarray[(WIN_ROWS * RW,), np.dtype[np.int32]]
+    S_l1_ty = np.ndarray[(WIN_ROWS * RW + 16,), np.dtype[np.int32]]
     B_ty_l = np.ndarray[(k, N // 8), np.dtype[v8bfp16ebs8]]
     C_l2_ty = np.ndarray[(ROWS * M_CORE, N), np.dtype[bfloat16]]
     C_l1_ty = np.ndarray[(M_CORE, N), np.dtype[bfloat16]]
@@ -114,13 +118,13 @@ def conv3x3w(
                                    arg_types=[C_l1_ty], compile_flags=flags + ["-DZERO_ONLY"],
                                    use_chess=False)
     matmul_kernel = ExternalFunction("matmul_window", source_file=str(KERNEL_SRC),
-                                     arg_types=[A_l1_ty, B_ty_l, C_l1_ty, np.int32],
-                                     compile_flags=flags + ["-DWINDOW_ONLY", f"-DWIN_R={WIN_ROWS}"],
+                                     arg_types=[A_l1_ty, S_l1_ty, B_ty_l, C_l1_ty, np.int32],
+                                     compile_flags=flags + ["-DWINDOW_ONLY", f"-DWINB={WIN_ROWS}"],
                                      use_chess=False)
-
-    # Core receive: rows arrive row-major (WIN_ROWS x 64); store 8-channel
-    # blocked [8][WIN_ROWS][8] so every 8x8 A block is contiguous.
-    a_l1_dims = [(WIN_ROWS, 8), (k // 8, WIN_ROWS * 8), (8, 1)]
+    prep_kernel = ExternalFunction("prep_window", source_file=str(KERNEL_SRC),
+                                   arg_types=[A_l1_ty, S_l1_ty],
+                                   compile_flags=flags + ["-DPREP_ONLY", f"-DWINB={WIN_ROWS}"],
+                                   use_chess=False)
     c_l2l3_dims = [(M_CORE // r, r * N), (r, t), (N // t, r * t), (t, 1)]
 
     A_l3l2, A_l2l1, C_l2l3 = [], [], []
@@ -130,11 +134,10 @@ def conv3x3w(
         A_l3l2.append(a)
         A_l2l1.append(a.cons().split(
             tile=Tile(col, 1),
-            offsets=[row * WIN_ROWS * k for row in range(ROWS)],
+            offsets=[row * WIN_ROWS * RW for row in range(ROWS)],
             obj_types=[A_l1_ty] * ROWS,
             names=[f"A_L2L1_{col}_{row}" for row in range(ROWS)],
             depths=[1] * ROWS,
-            dims_from_stream=[a_l1_dims] * ROWS,
         ))
         c = ObjectFifo(C_l2_ty, name=f"C_L2L3_{col}", depth=2, dims_to_stream=c_l2l3_dims)
         C_l2l3.append(c)
@@ -151,8 +154,10 @@ def conv3x3w(
     rtps = [[Buffer(rtp_ty, name=f"rtp_{col}_{row}", initial_value=np.zeros(RTP_LEN, np.int32),
                     use_write_rtp=True) for col in range(COLS)] for row in range(ROWS)]
     barriers = [[WorkerRuntimeBarrier() for _ in range(COLS)] for _ in range(ROWS)]
+    shifted = [[Buffer(S_l1_ty, name=f"win_shift_{col}_{row}") for col in range(COLS)]
+               for row in range(ROWS)]
 
-    def core_fn(in_a, in_b, out_c, zero, matmul, rtp, barrier):
+    def core_fn(in_a, in_b, out_c, zero, matmul, prep, shift, rtp, barrier):
         barrier.wait_for_value(1)
         # debug_static: 1 = all static, 2 = static offsets, 3 = static loops
         if debug_static in (1, 3):
@@ -174,9 +179,10 @@ def conv3x3w(
             zero(elem_out)
             for _ in range_(n_chunks):
                 win = in_a.acquire(1)
+                prep(win, shift)
                 for tap in range(9):
                     eb = in_b.acquire(1)
-                    matmul(win, eb, elem_out, offs[tap])
+                    matmul(win, shift, eb, elem_out, offs[tap])
                     in_b.release(1)
                 in_a.release(1)
             out_c.release(1)
@@ -184,13 +190,14 @@ def conv3x3w(
     workers = Worker.grid(ROWS, COLS, lambda row, col: Worker(
         core_fn,
         [A_l2l1[col][row].cons(), B_l2l1.cons(), C_l1l2[row][col].prod(),
-         zero_kernel, matmul_kernel, rtps[row][col], barriers[row][col]],
+         zero_kernel, matmul_kernel, prep_kernel, shifted[row][col], rtps[row][col],
+         barriers[row][col]],
         tile=Tile(col, 2 + row),
         stack_size=0xD00,
     ))
 
-    x_elems = groups * chunks * GROUP_ROWS * k
-    X_ty = np.ndarray[(x_elems,), np.dtype[bfloat16]]
+    x_elems = groups * chunks * GROUP_ROWS * RW
+    X_ty = np.ndarray[(x_elems,), np.dtype[np.int32]]
     B_ty = np.ndarray[(K * N // 8,), np.dtype[v8bfp16ebs8]]
     C_ty = np.ndarray[(groups * GROUP_OUT_ROWS * N,), np.dtype[bfloat16]]
     B_tap = TensorTiler2D.group_tiler((1, K * N // 8), (1, K * N // 8), (1, 1))[0]
@@ -201,10 +208,11 @@ def conv3x3w(
         # leading entry is the shim BD iteration counter.  Always pass 4
         # entries; with 3 the compiler moves the core dimension into the
         # iteration slot (wrong data).  One task per group keeps the shim
-        # channel's task queue (depth 4) from overflowing.
-        base = grp * chunks * GROUP_ROWS * k + col * ROWS * M_CORE * k
-        return TensorAccessPattern((x_elems,), base, [chunks, ROWS, WIN_ROWS, k],
-                                   [GROUP_ROWS * k, M_CORE * k, k, 1])
+        # channel's task queue (depth 4) from overflowing.  Per chunk, each
+        # core gets its WIN_ROWS rows of all 8 channel blocks.
+        base = grp * chunks * GROUP_ROWS * RW + col * ROWS * M_CORE * 9 // 4
+        return TensorAccessPattern((x_elems,), base, [chunks, ROWS, 8, WIN_ROWS * 9 // 4],
+                                   [GROUP_ROWS * RW, M_CORE * 9 // 4, GROUP_ROWS * 9 // 4, 1])
 
     params = [groups, chunks] + [dy * wp + dx for dy in range(3) for dx in range(3)]
 

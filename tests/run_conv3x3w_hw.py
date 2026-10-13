@@ -42,14 +42,14 @@ def main():
     ok = True
     for (B, H, W, Cin, Cout) in shapes:
         chunks = -(-Cin // h.K_STEP)
-        key = f"b{B}_h{H}_w{W}_c{chunks}"
+        _, _, groups = h.geometry(B, H, W)
+        key = f"g{groups}_w{W + 2}_c{chunks}"
         instr = np.fromfile(art / f"{key}.bin", dtype=np.uint32)
         x = rng.standard_normal((B, Cin, H, W), dtype=np.float32)
         x = np.where(x > 0, x, 0.2 * x)
         w = rng.standard_normal((Cout, Cin, 3, 3), dtype=np.float32) * np.sqrt(2.0 / (9 * Cin))
         xb, wb = h.bf16_value(h.bf16_bits(x)), h.bf16_value(h.bf16_bits(w))
-        xs = h.pack_input(xb, chunks)
-        _, _, groups = h.geometry(B, H, W)
+        xs = h.pack_input_bfp(xb, chunks)
         c_elems = groups * h.GROUP_OUT_ROWS * h.N
         bo_i = pyxrt.bo(dev, instr.nbytes, pyxrt.bo.cacheable, kern.group_id(1))
         bo_x = pyxrt.bo(dev, xs.nbytes, pyxrt.bo.host_only, kern.group_id(3))

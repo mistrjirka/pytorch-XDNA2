@@ -46,6 +46,31 @@ def pack_input(x_nchw, chunks):
     return np.ascontiguousarray(out)
 
 
+# Forward/dX input in bfp16 (the conv3x3w kernel): each core's window holds
+# 144 rows (rows * 9 bytes stays word aligned), stored per 8-channel block.
+WIN_ROWS_BFP = 144
+GROUP_ROWS_BFP = GROUP_OUT_ROWS + WIN_ROWS_BFP - M_CORE
+
+
+def pack_input_bfp(x_nchw, chunks):
+    """NCHW float -> [groups][chunks][8][GROUP_ROWS_BFP][9] bfp16ebs8 bytes.
+
+    Same padded-grid rows and halos as pack_input; a block is one pixel's 8
+    consecutive channels, stored channel-block major so a core reads any 8
+    consecutive pixels of one channel block as 72 contiguous bytes.
+    """
+    B, C, H, W = x_nchw.shape
+    wp, m_total, groups = geometry(B, H, W)
+    rows = np.zeros((groups * GROUP_OUT_ROWS + WIN_ROWS_BFP, chunks * K_STEP), np.float32)
+    grid = np.zeros((B, H + 2, wp, chunks * K_STEP), np.float32)
+    grid[:, 1:H + 1, 1:W + 1, :C] = bf16_value(bf16_bits(x_nchw.transpose(0, 2, 3, 1)))
+    rows[:m_total] = grid.reshape(m_total, -1)
+    idx = np.arange(groups)[:, None] * GROUP_OUT_ROWS + np.arange(GROUP_ROWS_BFP)[None, :]
+    g = rows[idx].reshape(groups, GROUP_ROWS_BFP, chunks, 8, 8).transpose(0, 2, 3, 1, 4)
+    out = bfp16_encode(np.ascontiguousarray(g))
+    return out.reshape(groups, chunks, 8, GROUP_ROWS_BFP, 9)
+
+
 def atb_shuffle(b, k=K_STEP, n=N):
     """AMD gemm_atb layout_transpose_L1_1x2_8x8block for a (K, N) matrix."""
     K, Nn = b.shape
@@ -125,6 +150,10 @@ def strip_batch(x_nchw, halo_zero=False):
 
 def pack_input_strips(x_nchw, chunks, halo_zero=False):
     return pack_input(strip_batch(x_nchw, halo_zero), chunks)
+
+
+def pack_input_strips_bfp(x_nchw, chunks, halo_zero=False):
+    return pack_input_bfp(strip_batch(x_nchw, halo_zero), chunks)
 
 
 def unpack_output_strips(c_bits, batch, height, width, cout):

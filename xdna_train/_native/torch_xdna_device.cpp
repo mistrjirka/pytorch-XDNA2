@@ -101,6 +101,8 @@ extern "C" void xdna_conv3x3w_unpack_output_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int);
 extern "C" void xdna_conv3x3w_pack_input_strips_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
+extern "C" void xdna_conv3x3w_pack_input_strips_range_bfp16(
+    const uint16_t*, uint8_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
 extern "C" void xdna_conv3x3w_unpack_output_strips_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
 extern "C" int shim_dispatch_poisoned(void);
@@ -1780,7 +1782,10 @@ struct XdnaConv3x3wRuntime {
   static constexpr int64_t kN = 128;
   static constexpr int64_t kKStep = 64;
   static constexpr int64_t kGroupOutRows = 2048;
-  static constexpr int64_t kGroupRows = 2126;
+  // bfp16 input rows per group (conv3x3w_host.GROUP_ROWS_BFP), 72 bytes each
+  static constexpr int64_t kGroupRows = 2128;
+  static constexpr int64_t kRowBytes = 72;
+  static constexpr int64_t kDwGroupRows = 2126;  // bf16 layout of the dW kernel
   static constexpr int64_t kMaxWidth = 36;
   static constexpr int64_t kMaxGroups = 1024;
 
@@ -2068,28 +2073,40 @@ struct XdnaConv3x3wRuntime {
     // (smaller) stream over a window of the same buffers, so the host packs
     // piece i+1 and unpacks piece i-1 while the NPU computes piece i.
     auto pieces = piece_streams(p, s);
-    const size_t in_group = static_cast<size_t>(p.chunks * kGroupRows * kKStep * 2);
+    const size_t in_group = static_cast<size_t>(p.chunks * kGroupRows * kRowBytes);
     const size_t out_group = static_cast<size_t>(kGroupOutRows * kN * 2);
     const int64_t m_total = p.batch * p.strips * (p.h + 2) * p.wp;
     auto xin = acquire_packed(static_cast<size_t>(p.groups) * in_group);
     xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
     const std::array<int64_t, 5> xshape = {p.batch, p.cin, p.h, p.w, p.chunks};
-    if (xin->shape != xshape) {
-      if (xin->shape != std::array<int64_t, 5>{}) std::memset(xin->ptr, 0, xin->bytes);
-      xin->shape = xshape;
+    auto reshape = [&](Conv3x3wPacked& b) {
+      if (b.shape != xshape) {
+        if (b.shape != std::array<int64_t, 5>{}) std::memset(b.ptr, 0, b.bytes);
+        b.shape = xshape;
+      }
+    };
+    reshape(*xin);
+    // The deferred dW reads the input in the bf16 layout (kDwGroupRows rows of
+    // 64 channels per group): the same pass writes that copy too.
+    std::shared_ptr<Conv3x3wPacked> x16;
+    if (keep_input) {
+      x16 = acquire_packed(static_cast<size_t>(p.groups * p.chunks * kDwGroupRows * kKStep * 2));
+      reshape(*x16);
     }
+    const size_t in16_group = static_cast<size_t>(p.chunks * kDwGroupRows * kKStep);
     auto pack_piece = [&](const Conv3x3wPiece& pc) {
       ScopedMappedCpu pack_phase("npu_conv3x3w.pack");
       struct Acc { double& d; double t; decltype(now_ms)& f; ~Acc() { d += f() - t; } } acc{trace_pack_ms, now_ms(), now_ms};
-      xdna_conv3x3w_pack_input_strips_range_bf16(
+      xdna_conv3x3w_pack_input_strips_range_bfp16(
           static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
-          static_cast<uint16_t*>(xin->ptr) + pc.g0 * in_group / 2,
+          static_cast<uint8_t*>(xin->ptr) + pc.g0 * in_group,
+          x16 ? static_cast<uint16_t*>(x16->ptr) + pc.g0 * in16_group : nullptr,
           int(p.batch), int(p.cin), int(p.h), int(p.w), int(p.strips), int(p.strip_out), 0,
           int(p.chunks), int(pc.g0), int(pc.ng));
       TORCH_CHECK(shim_bo_sync_to_device(xin->sub(pc.g0 * in_group, pc.ng * in_group)) == 0,
                   "failed to sync conv3x3w input: ", shim_last_error());
     };
-    if (keep_input) *keep_input = xin;
+    if (keep_input) *keep_input = x16;
     std::lock_guard<std::mutex> guard(mutex);
     const uint64_t call_start = s.use_clock + 1;
     std::optional<at::Tensor> w_cpu;
@@ -2180,6 +2197,11 @@ struct XdnaConv3x3wRuntime {
       }
       if (j + 1 < tasks.size()) start(tasks[j + 1], cur);
       unpack(tasks[j]);
+    }
+    if (x16) {
+      ScopedMappedCpu sync_phase("npu_conv3x3w.dw_copy_sync");
+      TORCH_CHECK(shim_bo_sync_to_device(x16->bo) == 0,
+                  "failed to sync conv3x3w input copy: ", shim_last_error());
     }
     if (bias.has_value() && bias->defined()) {
       ensure_host_current(*bias);
