@@ -76,7 +76,7 @@ forward, loss, backward and optimizer calls remain the same.
 
 The [recorded 12-workload benchmark](docs/performance.md) on Ryzen AI 9 365
 measured **1.21x CPU BF16 throughput on average** (geometric mean), with individual
-results from 0.97x to 2.03x. It used AC power and 16 CPU threads. Gains include CPU
+results from 0.97x to 2.03x. It used AC power and 10 CPU threads (the PyTorch default on this machine). Gains include CPU
 execution improvements; they do not all come from NPU computation.
 
 NPU acceleration covers selected BF16 3x3 convolutions and fixed matrix shapes.

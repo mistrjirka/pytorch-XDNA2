@@ -9,7 +9,7 @@ The raw run is in `benchmarks/results/zoo_fae72c2_ac.json`; the table below
 is its medians.
 
 Setup: Ryzen AI 9 365, XRT 2.21.75, PyTorch 2.14.1, Python 3.12, BF16,
-AC power and 16 CPU threads. The harness uses synthetic inputs, AdamW, 24 warmup
+AC power and 10 CPU threads (the PyTorch default on this machine). The harness uses synthetic inputs, AdamW, 24 warmup
 steps and 10 timed steps. CPU and XDNA run in separate processes in alternating
 order, CPU/XDNA then XDNA/CPU. Each reported time is the median of the two
 per-round medians and includes forward, loss, backward and the optimizer step.
