@@ -36,8 +36,9 @@ relu+maxpool 1.1 ms (torch max_pool2d alone 2.3), relu backward + tap 0.25, max-
 0.10 (was 1.8 before restructuring), add-tap 0.2.  The earlier versions were scalar:
 GCC would not vectorize loops with short-circuit NaN tests, `if` argmax chains, an early
 return in the rounding helper, or float compares under trapping-math (see the notes in
-`region_kernels.cpp`).  The forward pool row kernel is still not vectorized on the SSE2
-baseline build (target_clones helps little); an AVX2 intrinsics version could save ~0.7 ms/call.
+`region_kernels.cpp`).  The forward pool row kernel now has an AVX2 intrinsics path (runtime-dispatched, scalar fallback for
+odd widths): relu+maxpool 1.1 -> 0.18 ms at 40x64x36x36 (torch max_pool2d 1.9).  Full step after the change:
+fused median 90.7 ms (88.7-95.2, 4 runs) vs eager 104.8 ms; the pool's own share (~1-2 ms) is not separable from noise.
 
 Placement of the region's own convolutions (`XDNA_REGION_PLACEMENT=measure|cost|npu|cpu`):
 in isolation the NPU saves 0.6-0.8 ms per call on 64->64@36 and 64->128@18 (fwd and dX);

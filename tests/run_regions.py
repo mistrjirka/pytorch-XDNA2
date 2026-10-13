@@ -181,6 +181,19 @@ def same_bits(x, y):
 
 
 report("relu+maxpool2 kernel bit-exact (incl. NaN, ties)", same_bits(r, rr) and same_bits(p, pp))
+# wide rows reach the AVX2 loop (Wo = 18: two vector iterations... one full + tail)
+torch.manual_seed(4)
+aw = (torch.randn(2, 3, 10, 36) * 2).bfloat16()
+aw[0, 0, 0, :6] = float("nan")
+aw[0, 1, 2:4, 8:20] = 0
+aw[1, 2, 4:6, 20:30] = 1.5  # ties everywhere in the window
+aw[1, 0, 6, 33] = float("nan")
+rw = torch.empty_like(aw, device="xdna")
+pw = torch.empty(2, 3, 5, 18, dtype=torch.bfloat16, device="xdna")
+C.region_relu_maxpool2(aw.to("xdna"), rw, pw)
+rrw = torch.relu(aw)
+report("relu+maxpool2 kernel bit-exact on wide rows (AVX2 path, NaN, ties)",
+       same_bits(rw, rrw) and same_bits(pw, torch.nn.functional.max_pool2d(rrw, 2, 2)))
 g = torch.randn(3, 5, 6, 5).bfloat16()
 out = torch.empty_like(a, device="xdna")
 C.region_maxpool2_bwd(rr.to("xdna"), g.to("xdna"), out)

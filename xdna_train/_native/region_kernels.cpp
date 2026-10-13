@@ -14,6 +14,8 @@
 // GCC will not if-convert them and the loops stay scalar.
 #pragma GCC optimize("no-trapping-math")
 
+#include <immintrin.h>
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -112,6 +114,36 @@ static void pool_row_pairs(const uint16_t* r0, const uint16_t* r1, uint16_t* dst
     dst[x] = uint16_t(nan_or_gt(v1, v0) ? m1 : m0);
   }
 }
+
+// AVX2 version: 8 output pixels (16 columns of each row) per iteration.  The
+// float bit patterns are the bf16 values shifted into the high half, so a
+// select on floats picks bf16 elements; same vertical-then-horizontal order and
+// NaN rule as the scalar loop above.
+__attribute__((target("avx2")))
+static void pool_row_pairs_avx2(const uint16_t* r0, const uint16_t* r1, uint16_t* dst, int64_t Wo) {
+  const uint32_t* w0 = reinterpret_cast<const uint32_t*>(r0);
+  const uint32_t* w1 = reinterpret_cast<const uint32_t*>(r1);
+  const __m256i hi_mask = _mm256_set1_epi32(int(0xffff0000u));
+  auto pick = [](__m256 v, __m256 m) {  // v > m, or v is NaN
+    return _mm256_or_ps(_mm256_cmp_ps(v, m, _CMP_GT_OQ), _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
+  };
+  int64_t x = 0;
+  for (; x + 8 <= Wo; x += 8) {
+    const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + x));
+    const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + x));
+    const __m256 f00 = _mm256_castsi256_ps(_mm256_slli_epi32(a, 16));
+    const __m256 f01 = _mm256_castsi256_ps(_mm256_and_si256(a, hi_mask));
+    const __m256 f10 = _mm256_castsi256_ps(_mm256_slli_epi32(b, 16));
+    const __m256 f11 = _mm256_castsi256_ps(_mm256_and_si256(b, hi_mask));
+    const __m256 v0 = _mm256_blendv_ps(f00, f10, pick(f10, f00));
+    const __m256 v1 = _mm256_blendv_ps(f01, f11, pick(f11, f01));
+    const __m256 r = _mm256_blendv_ps(v0, v1, pick(v1, v0));
+    const __m256i bits = _mm256_srli_epi32(_mm256_castps_si256(r), 16);
+    const __m256i packed = _mm256_permute4x64_epi64(_mm256_packus_epi32(bits, bits), 0x08);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x), _mm256_castsi256_si128(packed));
+  }
+  if (x < Wo) pool_row_pairs(r0 + 2 * x, r1 + 2 * x, dst + x, Wo - x);
+}
 }  // extern "C++"
 
 // r = relu(a) over [planes][H][W]; p = 2x2 stride-2 max-pool of r, [planes][H/2][W/2].
@@ -133,7 +165,9 @@ void xdna_region_relu_maxpool2_bf16(const uint16_t* a, uint16_t* r, uint16_t* p,
       const uint16_t* r0 = rp + (2 * y) * W;
       const uint16_t* r1 = r0 + W;
       if ((W & 1) == 0 && ((uintptr_t(rp) & 3) == 0)) {
-        pool_row_pairs(r0, r1, pp + y * Wo, Wo);
+        static const bool avx2 = __builtin_cpu_supports("avx2");
+        if (avx2) pool_row_pairs_avx2(r0, r1, pp + y * Wo, Wo);
+        else pool_row_pairs(r0, r1, pp + y * Wo, Wo);
       } else {
         for (int64_t x = 0; x < Wo; ++x) {  // scan-order maximum, NaN wins
           uint16_t m = r0[2 * x];
