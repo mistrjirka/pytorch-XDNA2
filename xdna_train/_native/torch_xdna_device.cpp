@@ -20,6 +20,8 @@
 #include <ATen/ops/lerp_ops.h>
 #include <ATen/ops/sigmoid_ops.h>
 #include <ATen/ops/sub_ops.h>
+#include <ATen/ops/mse_loss_ops.h>
+#include <ATen/ops/smooth_l1_loss_ops.h>
 #include <ATen/ExpandUtils.h>
 #include <ATen/ops/add.h>
 #include <ATen/ops/cat.h>
@@ -3134,6 +3136,67 @@ at::Tensor& sub_out_xdna(
 }
 
 
+// mse_loss / smooth_l1_loss with a reduction.  Without a functional kernel the
+// dispatcher reaches the CPU kernel through its out= overload with a 0-d out
+// tensor, which PyTorch resizes with a UserWarning that CPU users never get.
+// These run the CPU functional op on the mapped storage instead.  reduction
+// "none" keeps an elementwise result and uses the out= overload with a
+// correctly shaped, XDNA-resident out (no warning, no copy).
+template <typename Functional, typename OutOverload>
+at::Tensor reduced_loss_xdna(
+    const char* name,
+    const at::Tensor& self,
+    const at::Tensor& target,
+    int64_t reduction,
+    Functional functional,
+    OutOverload with_out) {
+  ScopedMappedCpu mapped_phase(name);
+  ensure_host_current(self);
+  ensure_host_current(target);
+  auto self_cpu = cpu_alias(self);
+  auto target_cpu = cpu_alias(target);
+  if (reduction == at::Reduction::None) {
+    const auto shape = at::infer_size(self.sizes(), target.sizes());
+    std::vector<c10::SymInt> sym_shape(shape.begin(), shape.end());
+    auto out = xdna_empty_like_shape(
+        sym_shape, at::result_type(self, target));
+    auto out_cpu = cpu_alias(out);
+    with_out(out_cpu, self_cpu, target_cpu);
+    mark_host_dirty(out);
+    return out;
+  }
+  const at::Tensor value = functional(self_cpu, target_cpu);
+  auto out = xdna_empty_like_shape(std::vector<c10::SymInt>{}, value.scalar_type());
+  cpu_alias(out).copy_(value);
+  mark_host_dirty(out);
+  return out;
+}
+
+at::Tensor mse_loss_xdna(
+    const at::Tensor& self, const at::Tensor& target, int64_t reduction) {
+  return reduced_loss_xdna(
+      "aten::mse_loss", self, target, reduction,
+      [&](const at::Tensor& a, const at::Tensor& b) {
+        return at::_ops::mse_loss::call(a, b, reduction);
+      },
+      [&](at::Tensor& out, const at::Tensor& a, const at::Tensor& b) {
+        at::_ops::mse_loss_out::call(a, b, reduction, out);
+      });
+}
+
+at::Tensor smooth_l1_loss_xdna(
+    const at::Tensor& self, const at::Tensor& target, int64_t reduction,
+    double beta) {
+  return reduced_loss_xdna(
+      "aten::smooth_l1_loss", self, target, reduction,
+      [&](const at::Tensor& a, const at::Tensor& b) {
+        return at::_ops::smooth_l1_loss::call(a, b, reduction, beta);
+      },
+      [&](at::Tensor& out, const at::Tensor& a, const at::Tensor& b) {
+        at::_ops::smooth_l1_loss_out::call(a, b, reduction, beta, out);
+      });
+}
+
 at::Tensor& addmm_out_xdna(
     const at::Tensor& self,
     const at::Tensor& mat1,
@@ -3652,6 +3715,12 @@ native_batch_norm_backward_xdna(
   auto save_mean_cpu = optional_cpu_alias_xdna(save_mean);
   auto save_invstd_cpu = optional_cpu_alias_xdna(save_invstd);
 
+  // The out= overload cannot take a partial output mask (PyTorch's generated
+  // out wrapper compares every out tensor with the kernel's result, and an
+  // unrequested result is undefined).  So all three gradients are always
+  // computed; those autograd did not ask for go to throwaway CPU tensors.  The
+  // weight and bias gradients are cheap reductions the kernel needs anyway.
+  const int64_t channels = input.size(1);
   at::Tensor gi;
   at::Tensor gw;
   at::Tensor gb;
@@ -3663,23 +3732,19 @@ native_batch_norm_backward_xdna(
     gi = xdna_empty_like_layout(input);
     gi_cpu = cpu_alias(gi);
   } else {
-    gi_cpu = at::empty({0}, input_cpu.options());
+    gi_cpu = at::empty_like(input_cpu);
   }
   if (output_mask[1]) {
-    const int64_t channels = input.size(1);
-    gw = xdna_empty_like_shape(
-        {c10::SymInt(channels)}, input.scalar_type());
+    gw = xdna_empty_like_shape({c10::SymInt(channels)}, input.scalar_type());
     gw_cpu = cpu_alias(gw);
   } else {
-    gw_cpu = at::empty({0}, input_cpu.options());
+    gw_cpu = at::empty({channels}, input_cpu.options());
   }
   if (output_mask[2]) {
-    const int64_t channels = input.size(1);
-    gb = xdna_empty_like_shape(
-        {c10::SymInt(channels)}, input.scalar_type());
+    gb = xdna_empty_like_shape({c10::SymInt(channels)}, input.scalar_type());
     gb_cpu = cpu_alias(gb);
   } else {
-    gb_cpu = at::empty({0}, input_cpu.options());
+    gb_cpu = at::empty({channels}, input_cpu.options());
   }
 
   at::native_batch_norm_backward_out(
@@ -3695,7 +3760,7 @@ native_batch_norm_backward_xdna(
       save_invstd_cpu,
       train,
       eps,
-      output_mask);
+      {true, true, true});
 
   if (gi.defined()) mark_host_dirty(gi);
   if (gw.defined()) mark_host_dirty(gw);
@@ -4353,6 +4418,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("lerp.Scalar_out", TORCH_FN(lerp_scalar_out_xdna));
   m.impl("sigmoid.out", TORCH_FN(sigmoid_out_xdna));
   m.impl("sub.out", TORCH_FN(sub_out_xdna));
+  m.impl("mse_loss", TORCH_FN(mse_loss_xdna));
+  m.impl("smooth_l1_loss", TORCH_FN(smooth_l1_loss_xdna));
   m.impl("addmm.out", TORCH_FN(addmm_out_xdna));
   m.impl("bmm.out", TORCH_FN(bmm_out_xdna));
   m.impl("cat", TORCH_FN(cat_xdna));
