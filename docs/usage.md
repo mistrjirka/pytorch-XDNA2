@@ -11,8 +11,9 @@ on Ninja for compiling its native extension.
 See [Arch, Ubuntu and Fedora instructions](system-dependencies.md).
 
 The system needs the `amdxdna` driver, XRT headers and runtime, and a C++20 compiler
-with OpenMP. On the development Arch Linux machine the XRT packages are `xrt` and
-`xrt-plugin-amdxdna`. These are system prerequisites, not Python dependencies.
+with OpenMP. On the development Arch Linux machine the packages are `xrt-base`, `xrt-npu`,
+`amdxdna-driver` and `xrt-plugin-amdxdna` (see the [Arch recipe](system-dependencies.md#arch-linux)).
+These are system prerequisites, not Python dependencies.
 See the upstream [driver](https://github.com/amd/xdna-driver) and
 [XRT](https://github.com/Xilinx/XRT) documentation for system setup.
 
