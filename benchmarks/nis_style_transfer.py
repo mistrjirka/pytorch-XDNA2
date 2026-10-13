@@ -10,7 +10,12 @@ Configs run serially in alternating (ABBA) order.  A thermal guard waits for
 the CPU to cool before each run and kills a run that overheats, because
 sustained CPU+NPU load can trip this laptop's thermal shutdown.
 
-    python benchmarks/nis_style_transfer.py --iters 200 --rounds 2
+    NIS_ROOT=/path/to/nis/lab02_cnn python benchmarks/nis_style_transfer.py --iters 200 --rounds 2
+
+NIS_ROOT must be set to the NIS lab02_cnn directory; the script exits with a
+message otherwise.  NIS_PYTHON is the python executable with the coursework
+dependencies (default: the python running this script).  The test frames are
+read from data/ under NIS_ROOT.
 """
 from __future__ import annotations
 
@@ -24,8 +29,8 @@ import tempfile
 import time
 from pathlib import Path
 
-NIS = Path("/home/jirka/programovani/magistr/nis/lab02_cnn")
-PY = "/home/jirka/programovani/magistr/nis/.venv/bin/python"
+NIS = Path(os.environ.get("NIS_ROOT") or ".")  # set in main() after the check
+PY = os.environ.get("NIS_PYTHON", sys.executable)
 REPO = Path(__file__).resolve().parents[1]
 
 CONFIGS = {
@@ -197,6 +202,11 @@ def main() -> None:
                     help="extra config NAME=BASE:K=V,K=V (e.g. nonpu=xdna-bf16-repo:XDNA_NPU_MODE=0)")
     ap.add_argument("--out", default=str(REPO / "benchmarks" / "results" / "nis_style_transfer.json"))
     args = ap.parse_args()
+    global NIS
+    nis_root = os.environ.get("NIS_ROOT", "")
+    if not nis_root or not os.path.isdir(nis_root):
+        sys.exit("nis_mynet skipped: set NIS_ROOT to the NIS lab02_cnn directory")
+    NIS = Path(nis_root)
     if args.quick:
         args.preheat, args.iters, args.skip, args.rounds, args.frames = 45.0, 60, 10, 1, 5
     for spec in args.define:

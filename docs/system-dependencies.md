@@ -30,6 +30,7 @@ Enable the NPU/IPU in BIOS and install a mutually compatible `amdxdna` driver,
 firmware, XRT runtime, **XRT NPU plugin**, development headers and utilities.
 An FPGA-only XRT package is insufficient. The [AMD driver repository](https://github.com/amd/xdna-driver)
 recommends building XRT from its matched `xrt` submodule when using source builds.
+Kernel and firmware requirements are those of the `amdxdna` driver; this package enforces no minimum (the doctor suggests Linux 6.14 or newer, see `xdna_tools/diagnostics.py` line 208), and the Ubuntu and Fedora commands in this file were not re-verified by the maintainer on 2026-10-13.
 
 The native extension also needs a C++20 compiler with OpenMP, Ninja and headers for
 the **Python interpreter running your program**. uv-managed Python includes its
@@ -48,8 +49,9 @@ Install basic build dependencies:
 sudo pacman -S --needed base-devel python ninja git git-lfs
 ```
 
-The development machine uses packages named `xrt` and `xrt-plugin-amdxdna`. These
-names do not imply availability in Arch's official repositories. For a reproducible
+The development machine uses packages named `xrt-base`, `xrt-npu`, `amdxdna-driver`
+and `xrt-plugin-amdxdna`, built as in the recipe below. These names do not imply
+availability in Arch's official repositories. For a reproducible
 source installation, follow [AMD's Arch build steps](https://github.com/amd/xdna-driver#steps-to-create-release-build-packages-arch-linux).
 Clone with submodules and Git LFS, inspect the dependency script, and build the
 matched XRT and driver sources. Upstream provides these packaging recipes:

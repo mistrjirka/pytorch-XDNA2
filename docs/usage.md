@@ -11,8 +11,9 @@ on Ninja for compiling its native extension.
 See [Arch, Ubuntu and Fedora instructions](system-dependencies.md).
 
 The system needs the `amdxdna` driver, XRT headers and runtime, and a C++20 compiler
-with OpenMP. On the development Arch Linux machine the XRT packages are `xrt` and
-`xrt-plugin-amdxdna`. These are system prerequisites, not Python dependencies.
+with OpenMP. On the development Arch Linux machine the packages are `xrt-base`, `xrt-npu`,
+`amdxdna-driver` and `xrt-plugin-amdxdna` (see the [Arch recipe](system-dependencies.md#arch-linux)).
+These are system prerequisites, not Python dependencies.
 See the upstream [driver](https://github.com/amd/xdna-driver) and
 [XRT](https://github.com/Xilinx/XRT) documentation for system setup.
 
@@ -47,6 +48,19 @@ export XRT_INCLUDE_DIR=/path/to/xrt/include
 export XRT_LIB_DIR=/path/to/xrt/lib
 python -m xdna_train
 ```
+
+An explicit `XRT_INCLUDE_DIR` or `XRT_LIB_DIR` is used as given. If it is wrong,
+the search does not fall back to other locations. When these variables are unset,
+the search also checks the directories named by `XRT_ROOT` and `XILINX_XRT`
+(`include/` for headers; `lib/` and `lib64/` for the library, see
+`xdna_tools/diagnostics.py` lines 76-86 and 106-110). It then checks `/usr/include`,
+`/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/opt/xilinx/xrt`.
+
+The C++ compiler is taken from `CXX` when it is set. `CXX` may contain extra words,
+such as `ccache g++`. The doctor checks the programs named there and reports an
+error if one is missing (`xdna_tools/diagnostics.py` lines 152-170). The native
+build records `CXX` in its cache key (`xdna_train/_build.py` line 39). When `CXX` is
+unset, the doctor looks for `c++` and then `g++`.
 
 ### Convolution compiler
 
@@ -84,9 +98,15 @@ export XDNA_IRON_PYTHON=/path/to/mlir-aie-env/bin/python
 ```
 
 An explicit value takes precedence over automatic setup, and an empty value
-disables compilation and setup. Without an explicit override, an existing managed
-compiler is preferred, followed by the legacy `~/mlir-aie-env` / `~/ironenv`
-environments and the source-tree sibling `mlir-aie-env`.
+disables compilation and setup. Without an explicit override, the backend uses the
+first of these that exists:
+
+1. the managed compiler prepared by `torch-xdna2-setup`
+2. `mlir-aie-env` in the parent directory of the repository checkout
+3. `~/mlir-aie-env/bin/python`
+4. `~/ironenv/bin/python`
+
+If none exists, automatic setup runs unless `XDNA_AUTO_SETUP=0` or offline mode is set.
 
 A new convolution shape can still require another instruction stream. Those
 streams compile on demand and are cached separately; while they build, the

@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Compare the C++ conv3x3w host layouts against conv3x3w_host.py (bit-exact)."""
-import ctypes, os, subprocess, sys, tempfile, time
+import ctypes, os, shlex, subprocess, sys, tempfile, time
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -9,8 +9,9 @@ import conv3x3w_host as ref
 
 tmp = tempfile.mkdtemp()
 so = os.path.join(tmp, "conv_pack.so")
-subprocess.check_call(["g++", "-O2", "-std=c++20", "-fopenmp", "-shared", "-fPIC",
-                       os.path.join(ROOT, "xdna_train", "_native", "conv_pack.cpp"), "-o", so])
+cxx = shlex.split(os.environ.get("CXX", "g++"))
+subprocess.check_call(cxx + ["-O2", "-std=c++20", "-fopenmp", "-shared", "-fPIC",
+                             os.path.join(ROOT, "xdna_train", "_native", "conv_pack.cpp"), "-o", so])
 lib = ctypes.CDLL(so)
 lib.xdna_conv_set_threads(8)
 P = ctypes.c_void_p

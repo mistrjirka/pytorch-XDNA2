@@ -88,8 +88,11 @@ optimization notes, see the [optimization log](OPTIMIZATION_LOG.md).
 ## Reproducing the measurements
 
 Run from a checkout in the configured Python/XRT/IRON environment. Install a
-`torchvision` build compatible with your PyTorch build for ResNet, VGG and MobileNet.
-For example, compare three of the self-contained workloads:
+`torchvision` build compatible with your PyTorch build. It is needed for `resnet18`,
+`resnet18_224`, `vgg11_128` and `mobilenet_v3`. The `unet`, `transformer`, `mlp`,
+`lstm`, `conv1d_audio`, `conv_autoencoder` and `embedding` models need only `torch`.
+For example, compare three workloads (`resnet18` and `mobilenet_v3` need `torchvision`,
+`unet` does not):
 
 ```bash
 PYTHONPATH=. python benchmarks/model_zoo.py \
