@@ -429,8 +429,13 @@ class _StepAutotuner:
     pending kernel builds are done) the modes run in blocks of one transition
     step plus `steps` timed steps, in ABBA order (2 1 0 0 1 2, `rounds` times)
     so that drift (heat, background load) does not favour one mode; an NPU mode
-    must beat CPU-only by `tolerance`.
+    must beat CPU-only by `tolerance`.  Steps timed while a kernel build was
+    still pending ran the CPU path in all modes, so a measurement that saw one
+    is thrown away and repeated (at most MAX_RESTARTS times) instead of
+    finalized: otherwise a fresh install would settle on CPU only.
     """
+
+    MAX_RESTARTS = 5
 
     def __init__(self, warmup: int, steps: int, rounds: int, tolerance: float) -> None:
         self.warmup, self.steps, self.tolerance = warmup, steps, tolerance
@@ -444,6 +449,8 @@ class _StepAutotuner:
         self.samples: dict[int, list[float]] = {m: [] for m in (2, 1, 0)}
         self.result: dict | None = None
         self.active = True
+        self.builds_seen = False    # a timed step ran while builds were pending
+        self.restarts = 0
 
     def __call__(self, optimizer, args, kwargs) -> None:
         import time
@@ -473,6 +480,7 @@ class _StepAutotuner:
             self.skip -= 1
             return
         self.samples[self.order[self.phase]].append((now - last) * 1e3)
+        self.builds_seen |= _C.iron_builds_pending() > 0
         self.timed += 1
         if self.timed < self.steps:
             return
@@ -481,6 +489,13 @@ class _StepAutotuner:
         if self.phase < len(self.order):
             _C.set_npu_mode(self.order[self.phase])
             self.skip = 1
+            return
+        if self.builds_seen and self.restarts < self.MAX_RESTARTS:
+            self.restarts += 1
+            self.builds_seen = False
+            self.samples = {m: [] for m in (2, 1, 0)}
+            self.phase, self.timed, self.skip = 0, 0, 1
+            _C.set_npu_mode(self.order[0])
             return
         self._decide()
 
