@@ -90,7 +90,7 @@ def main() -> None:
     if model_name == "nis_full":
         nis_root = os.environ.get("NIS_ROOT", "")
         if not nis_root or not os.path.isdir(nis_root):
-            sys.exit("nis_mynet skipped: set NIS_ROOT to the NIS lab02_cnn directory")
+            sys.exit("this benchmark needs the NIS coursework code: set NIS_ROOT to the NIS lab02_cnn directory")
     if args._worker:
         print("PROFILE=" + json.dumps(worker(args._worker[0], args._worker[1], args.steps)))
         return

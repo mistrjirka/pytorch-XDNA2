@@ -205,7 +205,7 @@ def main() -> None:
     global NIS
     nis_root = os.environ.get("NIS_ROOT", "")
     if not nis_root or not os.path.isdir(nis_root):
-        sys.exit("nis_mynet skipped: set NIS_ROOT to the NIS lab02_cnn directory")
+        sys.exit("this benchmark needs the NIS coursework code: set NIS_ROOT to the NIS lab02_cnn directory")
     NIS = Path(nis_root)
     if args.quick:
         args.preheat, args.iters, args.skip, args.rounds, args.frames = 45.0, 60, 10, 1, 5

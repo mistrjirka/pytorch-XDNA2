@@ -155,7 +155,7 @@ def main():
                     help="dW arithmetic in the emulated run (exact = CPU)")
     args = ap.parse_args()
     if not NIS or not os.path.isdir(NIS):
-        sys.exit("nis_mynet skipped: set NIS_ROOT to the NIS lab02_cnn directory")
+        sys.exit("this benchmark needs the NIS coursework code: set NIS_ROOT to the NIS lab02_cnn directory")
     global DW_MODE
     DW_MODE = args.dw
     base = run(False, args.steps, args.seed)

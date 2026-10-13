@@ -30,7 +30,7 @@ Enable the NPU/IPU in BIOS and install a mutually compatible `amdxdna` driver,
 firmware, XRT runtime, **XRT NPU plugin**, development headers and utilities.
 An FPGA-only XRT package is insufficient. The [AMD driver repository](https://github.com/amd/xdna-driver)
 recommends building XRT from its matched `xrt` submodule when using source builds.
-Kernel and firmware requirements are those of the `amdxdna` driver; this package enforces no minimum (the doctor suggests Linux 6.14 or newer, see `xdna_tools/diagnostics.py` line 208), and the Ubuntu and Fedora commands in this file were not re-verified by the maintainer on 2026-10-13.
+Kernel and firmware requirements are those of the `amdxdna` driver; this package enforces no minimum (the doctor suggests Linux 6.14 or newer, see `xdna_tools/diagnostics.py` line 208).
 
 The native extension also needs a C++20 compiler with OpenMP, Ninja and headers for
 the **Python interpreter running your program**. uv-managed Python includes its
