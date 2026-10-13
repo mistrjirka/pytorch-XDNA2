@@ -48,6 +48,19 @@ export XRT_LIB_DIR=/path/to/xrt/lib
 python -m xdna_train
 ```
 
+An explicit `XRT_INCLUDE_DIR` or `XRT_LIB_DIR` is used as given. If it is wrong,
+the search does not fall back to other locations. When these variables are unset,
+the search also checks the directories named by `XRT_ROOT` and `XILINX_XRT`
+(`include/` for headers; `lib/` and `lib64/` for the library, see
+`xdna_tools/diagnostics.py` lines 76-86 and 106-110). It then checks `/usr/include`,
+`/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` and `/opt/xilinx/xrt`.
+
+The C++ compiler is taken from `CXX` when it is set. `CXX` may contain extra words,
+such as `ccache g++`. The doctor checks the programs named there and reports an
+error if one is missing (`xdna_tools/diagnostics.py` lines 152-170). The native
+build records `CXX` in its cache key (`xdna_train/_build.py` line 39). When `CXX` is
+unset, the doctor looks for `c++` and then `g++`.
+
 ### Convolution compiler
 
 General 3x3 convolution requires IRON and Peano. When no existing compiler is
