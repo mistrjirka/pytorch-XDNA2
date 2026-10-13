@@ -77,9 +77,9 @@ The previous README recorded these separately from the model-zoo run:
 | DRIVE segmentation, earlier full-frame checkpoint | 0.151 to 0.155 it/s | 0.210 to 0.212 it/s | Training plus validation |
 
 The style-transfer runs use batch 40 and 36x36 patches. The
-[NIS harness](../benchmarks/nis_style_transfer.py) depends on the maintainer's
-coursework scripts, Python environment and data outside this repository; it cannot
-be reproduced from a fresh clone alone.
+[NIS harness](../benchmarks/nis_style_transfer.py) depends on the NIS coursework
+scripts and data outside this repository (set `NIS_ROOT` to its `lab02_cnn`
+directory); it cannot be reproduced from a fresh clone alone.
 
 The DRIVE measurement uses `MyNet(3,1,7)`, batch 4 and 584x564 images. It predates
 the 2026-10-12 cleanup and has not been rerun since that cleanup. For historical
@@ -97,15 +97,18 @@ For example, compare three workloads (`resnet18` and `mobilenet_v3` need `torchv
 ```bash
 PYTHONPATH=. python benchmarks/model_zoo.py \
   --models resnet18,unet,mobilenet_v3 \
-  --steps 10 --warmup 24 --rounds 2 --threads 16 \
+  --steps 10 --warmup 24 --rounds 2 --threads 10 \
   --json /tmp/torch-xdna2-model-zoo.json
 ```
 
 Use the keys in [model_zoo.py](../benchmarks/model_zoo.py) to select other models.
-The default list includes `nis_mynet`, which imports `MyNet` from coursework
-outside the repository; omit it on a fresh clone. Reproducing all 12 rows requires
-that external model source. The real application benchmarks also require external
-data.
+The table was measured with 10 threads, the PyTorch default on that machine; pass
+the thread count your machine uses. The `nis_mynet` row imports `MyNet` from the NIS
+coursework outside this repository. Set `NIS_ROOT` to its `lab02_cnn` directory to
+include it; without `NIS_ROOT` it is left out of the default list and the other 11
+rows run. The application benchmarks (`nis_style_transfer.py`,
+`bfp16_training_gate.py`, `profile_step.py` with the NIS model) also need `NIS_ROOT`,
+`NIS_PYTHON` (a Python with the coursework dependencies) and the coursework's data.
 
 Use AC power and record the power profile, hardware/software versions, thread
 counts, input shapes and environment overrides. Run hardware benchmarks serially.
