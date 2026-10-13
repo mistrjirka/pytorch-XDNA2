@@ -1,361 +1,110 @@
 # torch-xdna2
 
-Experimental first-class PyTorch backend for the AMD XDNA2 NPU in Ryzen AI / Strix systems.
+Train BF16 PyTorch models on AMD Ryzen AI XDNA2 (Strix) using `torch.device("xdna")`.
+The backend offloads selected convolutions and matrix multiplies to the NPU.
+Other supported operations run on the CPU using shared, host-visible memory.
 
-The target interface is ordinary PyTorch:
+**Alpha:** operator coverage and performance depend on your model. CPU fallback
+does not guarantee that every PyTorch operation works.
 
-```python
-import torch
-import xdna_train
+## Requirements
 
-device = torch.device("xdna")
-model = MyModel().bfloat16().to(device)
-x = x.bfloat16().to(device)
+- Linux with a working `amdxdna` driver and an XDNA2 / Strix NPU.
+- AMD XRT runtime and development headers, plus a C++20 compiler with OpenMP.
+- Python 3.12 to 3.14 and PyTorch 2.14.x.
 
-y = model(x)
-loss = loss_fn(y, target.bfloat16().to(device))
-loss.backward()
-optimizer.step()
-```
-
-No model rewrite is required for the first-class device path. Unsupported operations execute on the CPU over the same host-visible XRT-backed tensor storage.
-
-> **Status:** experimental / alpha. Current performance work targets BF16 training on XDNA2. FP32 tensors mostly use CPU compatibility paths and are not the performance target.
+Tested on a Ryzen AI 9 365 with XRT 2.21.75, PyTorch 2.14.1 and Python 3.12.
+The Python package does not install the driver or XRT.
 
 ## Install
 
-### 1. System prerequisites
-
-You need:
-
-- a working AMD `amdxdna` kernel driver;
-- AMD XRT development headers and runtime (`xrt/xrt_device.h`, `libxrt_coreutil.so`);
-- a C++20 compiler.
-
-On the Arch Linux development machine the XRT packages are:
-
-```text
-xrt
-xrt-plugin-amdxdna
-```
-
-The Python package does **not** install the kernel driver or XRT.
-
-### 2. Install directly from GitHub
-
-With uv:
+In a virtual environment with your preferred PyTorch 2.14.x build:
 
 ```bash
 uv pip install "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
 ```
 
-Install the PyTorch build you want first (for example ROCm on AMD systems). If you are force-reinstalling only this backend and want to preserve that PyTorch build, use:
+For pip, replace `uv pip install` with `python -m pip install`.
+
+General 3x3 NPU convolution also needs an [mlir-aie / IRON environment](https://github.com/Xilinx/mlir-aie).
+Point the backend at its Python executable:
 
 ```bash
-uv pip install --reinstall --no-deps "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
+export XDNA_IRON_PYTHON=/path/to/mlir-aie-env/bin/python
 ```
 
-Or add it to a uv project:
+Without IRON or previously compiled programs, those convolutions use the CPU.
+The first import compiles the native extension; convolution programs compile on
+first use. Builds are cached in `~/.cache/torch-xdna2/`.
 
-```bash
-uv add "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
-```
-
-With pip:
-
-```bash
-pip install "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
-```
-
-The conv3x3w NPU convolution families (large 3x3 convs, forward/dX/dW) need an
-[mlir-aie / IRON](https://github.com/Xilinx/mlir-aie) Python environment to compile their
-instruction streams on first use (~7 s each, cached under `~/.cache/torch-xdna2/`). Point
-`XDNA_IRON_PYTHON` at it (or put it at `~/mlir-aie-env`); without it those convs silently
-stay on the CPU. See [docs/OPTIMIZATION_LOG.md](docs/OPTIMIZATION_LOG.md) for what is
-accelerated and what was tried.
-
-The first import builds a small native bridge against the **exact installed PyTorch ABI** and caches it under `~/.cache/torch-xdna2/`. Validated XDNA instruction streams are bundled with the package.
-
-To build/check explicitly:
+Check the installation:
 
 ```bash
 python -m xdna_train
-# or
-torch-xdna2-build
 ```
 
-If XRT is in a non-standard location:
+Look for `xdna_available=True`. See [setup and troubleshooting](docs/usage.md)
+for XRT paths, reinstalling without replacing PyTorch, and build failures.
 
-```bash
-export XRT_INCLUDE_DIR=/path/to/xrt/include
-export XRT_LIB_DIR=/path/to/xrt/lib
-```
+## Train
 
-## Quick check
+A complete training step with synthetic inputs:
 
 ```python
 import torch
 import xdna_train
 
 xdna_train.register_xdna_device()
-print(torch.xdna.is_available())
+device = torch.device("xdna")
+model = torch.nn.Conv2d(128, 128, 3, padding=1).bfloat16().to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+x = torch.randn(16, 128, 36, 36, dtype=torch.bfloat16, device=device)
+target = torch.zeros_like(x)
 
-x = torch.ones(1024, dtype=torch.bfloat16, device="xdna")
-print(x.device, x.cpu()[:4])
+optimizer.zero_grad(set_to_none=True)
+loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
+loss.backward()
+optimizer.step()
+print("loss:", loss.item())
 ```
 
-### What `import xdna_train` changes in the process
+For an existing model, move its parameters and inputs to `xdna` and use BF16 for
+floating-point inputs. Keep class labels and token indices integer. The normal
+forward, loss, backward and optimizer calls remain the same.
 
-Importing registers the device (like other out-of-tree PyTorch backends), so
-`torch.device("xdna")` works without further calls. The first import compiles
-the native extension into `~/.cache/torch-xdna2` (later imports reuse it).
-Effects outside XDNA tensors are kept small:
+## Performance and limits
 
-- `Module.to("xdna")`, `.xdna()` and `.to_empty(device="xdna")` keep the
-  module's `Parameter` objects (PyTorch would create new ones for an
-  out-of-tree device, leaving an optimizer built before the move on the old
-  CPU tensors). Other conversions keep PyTorch's default behaviour.
-- Optimizer hooks act only on XDNA parameters: fused kernels by default, a
-  version bump after fused steps (the NPU weight cache relies on it), and the
-  step autotuner, which only times an optimizer that trains XDNA parameters.
-- The CPU allocator is wrapped so CPU fallback ops can write their outputs
-  straight into NPU-visible memory; other CPU allocations pass through
-  unchanged (`XDNA_ADOPT_HOST_OUTPUTS=0` disables the wrapper).
-- Backward runs on the calling thread for the importing thread (see below).
+The [recorded 12-workload benchmark](docs/performance.md) on Ryzen AI 9 365
+measured **1.21x CPU BF16 throughput on average** (geometric mean), with individual
+results from 0.97x to 2.03x. It used AC power and 16 CPU threads. Gains include CPU
+execution improvements; they do not all come from NPU computation.
 
-## What is implemented
+NPU acceleration covers selected BF16 3x3 convolutions and fixed matrix shapes.
+Small operations, attention, recurrent layers and most other matrix shapes use
+the CPU. Measure your own workload after compilation and warmup.
 
-The current backend uses PyTorch `PrivateUse1` renamed to `xdna` and provides:
+- FP32 uses CPU paths. FP16 training and inference speed are not validated.
+- General NPU convolutions use block floating-point arithmetic (BFP16), so results
+  differ from CPU BF16. Check loss and gradients for your model.
+- Concurrent NPU processes can exhaust hardware contexts and fail to initialize.
+- Import installs allocator and optimizer hooks and changes backward threading
+  on the importing thread. See [runtime behavior](docs/usage.md#runtime-behavior).
 
-- `torch.device("xdna")` / `torch.xdna`;
-- XRT-BO-backed PyTorch storage;
-- a caching XRT allocator;
-- host/device coherency tracking;
-- CPU execution directly over mapped XRT storage for unsupported operations;
-- BF16 rectangular GEMM forward/dX/dW on XDNA2;
-- BF16 3x3 Conv forward/dX families for validated training geometries;
-- channels-last layout preservation through important compatibility operations;
-- stride-aware view support for non-contiguous tensors when PyTorch can represent the view without copying;
-- native mapped-storage `add.out` support for autograd gradient accumulation, avoiding a large generic CPU-fallback boundary;
-- mapped-storage out-variant coverage for common AdamW/elementwise primitives (`mul`, `div`, `sqrt`, `addcmul`, `addcdiv`, `lerp`, `sigmoid`, `sub`);
-- mapped-storage `addmm.out` and `bmm.out` compatibility paths for Linear/attention shapes not yet covered by the fixed NPU GEMM family;
-- CPU `dW` overlapped with dependency-critical NPU `dX` when that is faster;
-- batch-4 CPU `dW` reduction split into batch-1 oneDNN calls by default, reducing shared LPDDR/fabric pressure during NPU `dX` overlap;
-- full-frame batch-4 decoder/residual programs for the current Strix training path.
+When benchmarking, include `optimizer.step()` or explicitly read the gradients.
+`torch.xdna.synchronize()` alone does **not** execute deferred weight gradients.
 
-The bundled full-frame family is enabled automatically. The current Strix package also enables validated resident-weight / queue-pipelined fast paths for the large decoder dX family and conv11 dX when their bundled artifacts are present. Disable them independently for A/B debugging (about +7 % step time each on the B4 584x564 workload) with:
+## Documentation and help
 
-```bash
-XDNA_ENABLE_FAST_FULLFRAME=0 python ...
-XDNA_ENABLE_FAST_CONV11=0 python ...
-```
+- [Usage and troubleshooting](docs/usage.md): setup, CPU fallback, tuning and runtime behavior.
+- [Performance](docs/performance.md): all measurements, tested workloads and reproduction commands.
+- [Development](docs/development.md): tests, local builds and backend architecture.
 
-Disable the full-frame backend entirely with:
-
-```bash
-XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_CONV=0 python ...
-```
-
-For batch-4 heterogeneous Conv backward, the CPU weight-gradient reduction is split into batch-1 oneDNN calls by default. This preserves oneDNN's AVX-512 BF16 compute kernel while reducing the working set and shared memory-fabric pressure seen by concurrent NPU dX. Override or disable it with:
-
-```bash
-XDNA_CPU_DW_BATCH_CHUNK=0 python ...   # disable
-XDNA_CPU_DW_BATCH_CHUNK=2 python ...   # alternate chunk size
-```
-
-## Environment variables
-
-Nothing needs to be set for normal use. Every variable, its default and the evidence for
-it is listed in [docs/MODES_AUDIT.md](docs/MODES_AUDIT.md); the ones worth knowing:
-
-| Purpose | Variables |
-|---|---|
-| Choose NPU paths | `XDNA_NPU_MODE=0\|1\|2` (fixes the mode, disables the tuner), `XDNA_AUTOTUNE=0` (no step tuning), `XDNA_AUTOTUNE_VERBOSE=1` (print the choice), `XDNA_AUTOTUNE_{WARMUP,STEPS,ROUNDS,TOLERANCE}` |
-| Kill switches (A/B runs) | `XDNA_CONV3X3W=0`, `XDNA_CONV3X3W_DW=0`, `XDNA_ENABLE_FAST_FULLFRAME=0`, `XDNA_ENABLE_FAST_CONV11=0`, `XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_CONV=0`, `XDNA_DISABLE_CPU_DW_OVERLAP=1`, `XDNA_CPU_DW_BATCH_CHUNK=0`, `XDNA_CPU_ISLANDS=0`, `XDNA_FUSED_OPTIMIZER=0`, `XDNA_ZERO_COPY_FALLBACK=0`, `XDNA_ADOPT_HOST_OUTPUTS=0` |
-| Keep PyTorch behaviour | `XDNA_AUTOGRAD_THREAD=1` (keep PyTorch's separate autograd device thread) |
-| conv3x3w build and tuning | `XDNA_IRON_PYTHON` (mlir-aie Python; empty disables on-demand builds), `XDNA_CONV3X3W_SYNC_BUILD=1` (build before the first call), `XDNA_CONV3X3W_{MIN_MACS,DW_MIN_MACS}` (size floors), `XDNA_CONV3X3W_FORCE=1` (bypass the cost model), `XDNA_CONV3X3W_PIECES` (pipelined piece count), `XDNA_CONV3X3W_WEIGHT_CACHE=0`, cost-model constants `XDNA_CONV3X3W_{NPU_OVERHEAD_MS,NPU_GMACS,HOST_GBS,CPU_GMACS,MARGIN}` |
-| Artifact overrides (use another build) | `XDNA_CONV3X3W_DIR`, `XDNA_CONV3X3W_DW_DIR` (xclbin + streams), `XDNA_FULLFRAME_ARTIFACT_DIR`, `XDNA_FAST_FULLFRAME_ARTIFACT_DIR`, `XDNA_FAST_CONV11_ARTIFACT_DIR` |
-| Host resources | `XDNA_BO_CACHE_MB` (freed-BO cache size), `XDNA_HOST_THREADS` (intra-op width), `XDNA_CONV_PACK_THREADS` (full-frame pack/unpack width), `XDNA_CPU_DW_BATCH_CHUNK` (batch-split CPU dW, default 1 for B4) |
-| Diagnostics | `XDNA_CONV3X3W_TRACE=1` (per-conv trace), `XDNA_PROFILE_MAPPED_CPU=1` (`xdna_train.mapped_cpu_stats()`), `XDNA_PROFILE_FALLBACK=1` (per-op CPU-fallback counters) |
-| Build and tests | `TORCH_XDNA2_CACHE` (native build cache), `TORCH_XDNA2_BUILD_VERBOSE=1`, `XRT_INCLUDE_DIR`, `XRT_LIB_DIR`, `XDNA_TRAIN_PHYSICAL=1` (enable the pytest hardware tests) |
-
-Variables that were removed (experiments that were slower or dead code) are no
-longer read; `docs/MODES_AUDIT.md` lists each one with the measurement behind the removal.
-
-## Current measured checkpoint
-
-On the development Ryzen AI 9 365 / Strix machine, XRT 2.21.75, BF16, 16 CPU threads, performance power profile, the real full-frame DRIVE `MyNet(3,1,7)` training+validation loop has recently measured approximately:
-
-```text
-CPU BF16:                              0.151 - 0.155 it/s
-XDNA legacy full-frame path:           ~0.200 - 0.201 it/s
-XDNA q4 resident full-frame + conv11:  ~0.210 - 0.212 it/s
-Mean speedup vs CPU:                   ~1.38x end-to-end
-```
-
-In the latest package-level ABBA bracket, the q4 resident full-frame path alone averaged about 0.2038 it/s; adding the validated conv11 q4 dX path averaged about 0.2111 it/s. The large 256→128 @ 584 decoder dX itself improved from roughly 615 ms to roughly 469 ms, while preserving BF16 numerical agreement with the CPU reference.
-
-A later same-package ABBA test of the batch-split CPU dW scheduler measured 0.20295 it/s enabled versus 0.19823 it/s disabled (+2.4% throughput in that run). On the isolated 256→128 @ 584 backward region, the same change reduced median wall time from about 659 ms to about 621–623 ms while keeping the NPU dX path unchanged and preserving BF16 training loss.
-
-The next generic fallback audit found seven large `aten::add.out` calls in backward costing about 60–66 ms per step through the generic fallback. Registering a mapped-storage `add.out` implementation removed that fallback; a short interleaved NIS check measured roughly 0.2117 it/s with the native overload versus 0.2053 it/s without it, with unchanged loss.
-
-Applying the bounded rolling-DMA schedule to the non-resident forward streams improved fwd292 from about 124 ms to about 97 ms and fwd584 from about 486 ms to about 382 ms without changing the universal XCLBIN. A clean-fork NIS ABBA measured about 0.21572 it/s with the rolled forward streams versus about 0.20995 it/s with the previous streams (+2.7%), with unchanged loss.
-
-The metric is the notebook metric:
-
-```python
-len(train_loader) / (train_time + validation_time)
-```
-
-with training batch size 4 and validation batch size 2.
-
-These numbers are hardware/workload-specific checkpoints, not a general performance claim.
-
-## Design rules
-
-The backend deliberately avoids several XDNA2 performance anti-patterns discovered during development:
-
-- do not promote an NPU primitive from kernel-only timing;
-- do not materialize im2col matrices;
-- preserve useful physical layouts across producer/consumer regions;
-- overlap CPU and NPU only when lifetime and memory-bandwidth costs are measured;
-- do not retain giant monotonic XRT arenas merely to reduce allocation calls;
-- prefer bounded resident physical program families over per-op program switching;
-- measure the complete training loop after every promoted optimization.
-
-See:
-
-- `docs/xdna-device-architecture.md`
-- `docs/fullframe-conv-backward-plan.md`
-
-## Conv output layout
-
-NPU convolutions return contiguous NCHW tensors. A fixed-shape family (since removed)
-returned the kernel's native `[Y,X,B,C]` layout as a strided view; **CPU BatchNorm
-forward/backward was substantially slower** on those strides (zero-copy does not imply
-cheap CPU execution), and one producer-side conversion to NCHW took the real NIS
-style-transfer step from 598.3 to 510.1 ms (10 Torch threads, B40, 36x36, before conv3x3w). Run the hardware smoke test with
-`python tests/run_conv_output_layout.py`, or with `pytest` installed,
-`XDNA_TRAIN_PHYSICAL=1 pytest tests/test_conv_output_layout.py`.
-
-## conv3x3w: general 3x3 convolution family
-
-`xdna_train/_designs/conv3x3w.py` (forward and dX) and `conv3x3w_dw.py` (dW)
-run any 3x3 / stride-1 / pad-1 convolution with width <= 36 on the full
-array: bf16 activations with bfp16 weights/operands, ~1% relative error
-against FP32 (CPU BF16 is ~0.2%). A 300-step NIS training run with every
-eligible forward, dX and dW in this arithmetic tracked BF16 training within
-noise (`benchmarks/bfp16_training_gate.py`).
-
-- One xclbin per family; instruction streams per (groups, padded width,
-  channel chunks[, pass]) are compiled on first use in a niced background
-  process (~7 s each) and cached under `~/.cache/torch-xdna2/<family>/<source
-  hash>/`. Until a stream exists the convolution runs on the CPU.
-  `XDNA_IRON_PYTHON` names the mlir-aie (IRON) Python used for builds.
-- dW lives in a second xclbin; a hardware-context switch costs ~2.6 ms, so NPU
-  dWs are deferred to the gradient's first reader (normally the optimizer)
-  and run back to back. dWs below 1 GMAC stay on the CPU, overlapped with
-  the NPU dX chain.
-- Switches: `XDNA_CONV3X3W=0`, `XDNA_CONV3X3W_DW=0`,
-  `XDNA_CONV3X3W_MIN_MACS`, `XDNA_CONV3X3W_DW_MIN_MACS`,
-  `XDNA_CONV3X3W_WEIGHT_CACHE=0`, `XDNA_CONV3X3W_SYNC_BUILD=1` (build before
-  the first call, for tests).
-- Before pushing: `PYTHONPATH=. python tests/quick_check.py` (~15 s; trains a
-  small conv net on CPU and XDNA and compares the loss, then the fast
-  scripts below).
-- Tests: `tests/run_conv3x3w_pack.py`, `tests/run_conv3x3w_torch.py`
-  (includes the weight cache under every optimizer, fused ones too),
-  `tests/run_conv3x3w_hw.py`, `tests/run_conv3x3w_dw_hw.py`,
-  `tests/run_view_safety.py` (out-of-bounds `as_strided`, overlapping
-  `copy_`, `unfold` as a view), `tests/run_deferred_dw.py` (deferred NPU dW
-  does not read X / dY after backward), `tests/run_conv_output_layout.py`
-  (contiguous NCHW output feeds CPU BatchNorm), `tests/run_conv3x3w_costmodel.py`.
-
-### Never slower than the CPU: what the backend does for every model
-
-- **Backward on the calling thread.** PyTorch normally runs a non-CPU
-  device's backward on a separate thread with its own OpenMP pool, which
-  fights the forward pool for cores. `register_xdna_device()` disables that
-  for the registering thread (`XDNA_AUTOGRAD_THREAD=1` restores it).
-- **Step autotuner.** During the first ~21 steps of the first optimizer
-  that trains XDNA parameters, the backend times
-  whole training steps with all NPU paths, without NPU weight gradients, and
-  CPU only (ABBA order), and keeps the fastest. An NPU mode must win by 3 %.
-  `xdna_train.autotune_result()` shows the choice, and
-  `XDNA_AUTOTUNE_VERBOSE=1` prints it. `XDNA_NPU_MODE=0|1|2` fixes the mode,
-  and `XDNA_AUTOTUNE=0` keeps all NPU paths without measuring.
-- **CPU islands.** `nn.LSTM` and `nn.GRU` run as PyTorch's fused oneDNN CPU
-  kernels on zero-copy views of the XDNA tensors (`XDNA_CPU_ISLANDS=0`
-  disables this).
-- **Fused optimizers.** Adam, AdamW and SGD param groups that left both
-  `fused` and `foreach` unset use PyTorch's fused kernel
-  (`XDNA_FUSED_OPTIMIZER=0` disables this). Fused kernels do not bump the
-  parameters' version counters, so a post-step hook does, or NPU convs
-  would keep using cached old weights.
-- **Deferred weight gradients.** An NPU dW is not run when the backward pass
-  ends: it runs on the first read of the gradient (normally the optimizer
-  step) and is dropped if the gradient is freed unread. So
-  `torch.xdna.synchronize()` does **not** flush it, and a benchmark that
-  times `backward()` plus `synchronize()` leaves the dW out. Time through
-  `optimizer.step()` or read a gradient (`.cpu()`, `.item()`).
-  Weight gradients below 3 GMAC (`XDNA_CONV3X3W_DW_MIN_MACS`) stay on the
-  CPU: below that the NPU dW's program switch costs more than it saves.
-
-NIS style transfer (MyNet(3,3,5), B40, 36x36, VGG loss, Adam), Ryzen AI 9 365
-on AC, quick-mode ABBA (`benchmarks/nis_style_transfer.py`): CPU BF16 171.4
-ms/step, XDNA 147.7 ms/step (1.16x); without NPU dW 167.7 ms/step.
-
-## Compatibility
-
-Currently tested on:
-
-- Linux / `amdxdna`;
-- XDNA2 / Ryzen AI Strix;
-- XRT 2.21.75;
-- PyTorch 2.14.1;
-- Python 3.12;
-- BF16 training.
-
-The package pins the supported PyTorch range to 2.14.x because the native `PrivateUse1` ABI is version-sensitive. The extension is rebuilt for each Python/PyTorch/source fingerprint.
-
-## Training coverage suite
-
-The installed `torch-xdna2-coverage` command runs small real training motifs rather than inference-only operator probes. It currently covers MLP, residual CNN, U-Net-like decoder, Transformer, Mobile/depthwise, embedding/MLP, and a `nis-mini` workload. `nis-mini` preserves the NIS MyNet channel widths, all seven residual blocks, both cat/nearest-upsample decoder stages, final 1x1 Conv, sigmoid+BCE, and Adam while shrinking only the spatial input from 584x564 to 72x68. Each result reports full-step time, overload-aware generic CPU fallbacks, and XDNA handlers that still execute CPU math over mapped XRT storage.
-
-```bash
-torch-xdna2-coverage --motif all --steps 2 --threads 8
-torch-xdna2-coverage --motif nis-mini --steps 5 --threads 16
-torch-xdna2-coverage --motif transformer --json
-```
-
-Use this suite as an admission test for generic backend work: an optimization should improve the relevant motif and should not regress unrelated motifs before it is promoted. On the development Strix machine, the first `nis-mini` checkpoint measured about 96.6 ms/step through XDNA versus about 73.0 ms/step on CPU BF16; roughly 75 ms/step of the XDNA run was generic-shape Conv forward/backward still executing on CPU over mapped XRT storage, making it a fast target for broadening NPU Conv support.
-
-## Development
-
-Build a wheel:
-
-```bash
-uv build
-```
-
-Install a local checkout:
-
-```bash
-uv pip install --no-deps .
-```
-
-Run the import-only test:
-
-```bash
-pytest
-```
-
-Hardware check:
-
-```bash
-python -m xdna_train
-```
+For bugs, [open an issue](https://github.com/mistrjirka/pytorch-XDNA2/issues) with a
+minimal example, tensor shapes and dtypes, hardware/software versions, and the
+output of `python -m xdna_train`. Include power settings and full-step timings for
+performance reports.
 
 ## License
 
-Project code is MIT licensed. Bundled/generated third-party components retain their own licenses; see `THIRD_PARTY_NOTICES.md` and `LICENSES/`.
+[MIT](LICENSE). Bundled components retain their own licenses; see
+[third-party notices](THIRD_PARTY_NOTICES.md) and [LICENSES](LICENSES/).
