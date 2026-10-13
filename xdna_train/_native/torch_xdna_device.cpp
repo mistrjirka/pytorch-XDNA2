@@ -135,6 +135,12 @@ thread_local c10::DeviceIndex g_current_device = 0;
 // step).  Follow the width the user sets on the thread that loaded the
 // backend (the Python main thread) and apply it to every other thread
 // before host compute.  XDNA_HOST_THREADS=N pins the width instead.
+// Per-thread placement override for the general 3x3 conv family (set by training
+// regions for their own convolutions): 0 = cost model, 1 = NPU if it can run,
+// 2 = CPU.  g_conv3x3w_npu_runs counts convolutions actually executed on the NPU.
+thread_local int g_conv_placement = 0;
+std::atomic<int64_t> g_conv3x3w_npu_runs{0};
+
 std::atomic<int> g_host_threads{0};
 std::thread::id g_host_threads_owner;
 bool g_host_threads_fixed = false;
@@ -1826,7 +1832,8 @@ struct XdnaConv3x3wRuntime {
       const char* raw = std::getenv("XDNA_CONV3X3W_FORCE");
       return raw != nullptr && raw[0] != 0 && std::strcmp(raw, "0") != 0;
     }();
-    if (force) return true;
+    if (g_conv_placement == 2) return false;
+    if (g_conv_placement == 1 || force) return true;
     static const double overhead_ms = env_double("XDNA_CONV3X3W_NPU_OVERHEAD_MS", 0.5);
     static const double npu_gmacs = env_double("XDNA_CONV3X3W_NPU_GMACS", 5.5);
     static const double host_gbs = env_double("XDNA_CONV3X3W_HOST_GBS", 20.0);
@@ -2042,6 +2049,7 @@ struct XdnaConv3x3wRuntime {
       Conv3x3wStream& s,
       const char* phase,
       std::shared_ptr<Conv3x3wPacked>* keep_input = nullptr) {
+    g_conv3x3w_npu_runs.fetch_add(1, std::memory_order_relaxed);
     static const bool trace = [] {
       const char* e = std::getenv("XDNA_CONV3X3W_TRACE");
       return e != nullptr && e[0] != 0 && e[0] != '0';
@@ -5039,6 +5047,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     });
   }
   m.def("set_npu_mode", [](int mode) { g_npu_mode.store(mode); });
+  m.def("set_conv_placement", [](int mode) {
+    const int prev = g_conv_placement;
+    g_conv_placement = mode;
+    return prev;
+  });
+  m.def("conv3x3w_npu_runs", []() { return g_conv3x3w_npu_runs.load(); });
   m.def("iron_builds_pending", []() {
     int n = 0;
     if (auto& rt = conv3x3w_runtime_slot()) n += rt->builder.outstanding.load();

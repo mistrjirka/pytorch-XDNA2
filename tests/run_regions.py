@@ -106,7 +106,8 @@ for name, spec, taps, shape in CASES:
     g1 = xg.grad.clone()
     xg.grad = None
     lg.backward()
-    same = torch.equal(g1.cpu(), xg.grad.cpu())
+    # measured placement alternates CPU/NPU between calls, so a repeat differs by rounding
+    same = rel(xg.grad.cpu(), g1.cpu()) < 0.01
     e_loss_eager = abs(le.float().item() - lr.item()) / lr.item()
     e_loss_region = abs(lg.float().item() - lr.item()) / lr.item()
     e_grad_eager = rel(xe.grad.cpu(), xr.grad)
@@ -119,6 +120,26 @@ for name, spec, taps, shape in CASES:
            f"loss err vs fp32: eager {e_loss_eager:.4f} region {e_loss_region:.4f} | "
            f"grad rel err vs fp32: eager {e_grad_eager:.4f} region {e_grad_region:.4f} | "
            f"region-vs-eager grad {d_grad:.4f}, repeat backward equal {same}")
+
+# the measured placement settles after enough calls and stays accurate
+feats32 = build(VGG, 1)
+featsd = nn.Sequential(*[__import__("copy").deepcopy(l) for l in feats32]).to("xdna", torch.bfloat16)
+chain = regions.FrozenFeatureChain.from_sequential(featsd, (0, 3, 5))
+xs = torch.randn(8, 3, 36, 36).bfloat16().to("xdna")
+ts = torch.rand(8, 3, 36, 36).bfloat16().to("xdna")
+grads = []
+for _ in range(16):
+    xi = xs.clone().requires_grad_()
+    regions.frozen_feature_mse(chain, xi, ts).backward()
+    grads.append(xi.grad.cpu())
+choices = {k: v["choice"] for k, v in chain.placer.state.items()}
+# conv0 (3 input channels) may never reach the NPU: it stays in its trial phase (<= 48
+# calls, both placements are CPU then) and then falls back to the cost model.
+settled = {k: c for k, c in choices.items() if k[0] != 0}
+report("placer settles (convs the NPU can run are decided)",
+       len(settled) == 4 and all(c is not None for c in settled.values()),
+       str({f"{k[1]}{k[0]}": {1: "npu", 2: "cpu", 0: "cost"}[c] for k, c in choices.items() if c is not None}))
+report("results stay consistent across placements", all(rel(g, grads[0]) < 0.02 for g in grads[1:]))
 
 # kernel-level checks against torch
 torch.manual_seed(3)
