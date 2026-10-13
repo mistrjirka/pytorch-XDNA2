@@ -149,13 +149,31 @@ def _configure_iron_family(name: str, configure, min_macs: int) -> None:
     h = hashlib.sha256()
     for p in sources:
         h.update(p.read_bytes())
+    from xdna_tools import toolchain
     from ._build import _cache_root
     env = name.upper()
+    managed = False
+    explicit = "XDNA_IRON_PYTHON" in os.environ
+    cached = toolchain.managed_python() if not explicit else None
+    python = str(cached) if cached else _iron_python()
+    if cached:
+        managed = True
+    elif not python and not explicit:
+        managed = True
+        prepared = toolchain.automatic_python()
+        python = str(prepared) if prepared else ""
+    if managed:
+        # Never mix programs built by a different compiler with these streams.
+        h.update(toolchain.toolchain_id().encode())
     cache = Path(os.environ.get(f"XDNA_{env}_DIR") or _cache_root() / name / h.hexdigest()[:16])
-    python = _iron_python()
     build_cmd = ""
     if python:
-        build_cmd = f"nice -n 10 {shlex.quote(python)} {shlex.quote(str(sources[0]))}"
+        if managed:
+            runner = Path(toolchain.__file__).with_name("_run_iron.py")
+            command = ["nice", "-n", "10", sys.executable, str(runner), "--python", python, str(sources[0])]
+        else:
+            command = ["nice", "-n", "10", str(Path(python).expanduser()), str(sources[0])]
+        build_cmd = shlex.join(command)
     if not build_cmd and not (cache / f"{name}.xclbin").is_file():
         return
     configure(
@@ -200,6 +218,8 @@ def register_xdna_device() -> None:
             stacklevel=2,
         )
 
+    from xdna_tools.diagnostics import require_runtime_dependencies
+    require_runtime_dependencies()
     _configure_default_allocator_budget()
 
     _load_native()

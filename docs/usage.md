@@ -8,6 +8,8 @@ Install a PyTorch 2.14.x build suited to your system first. Use Python 3.12 to 3
 Python 3.12 and PyTorch 2.14.1 are the tested combination. The package also depends
 on Ninja for compiling its native extension.
 
+See [Arch, Ubuntu and Fedora instructions](system-dependencies.md).
+
 The system needs the `amdxdna` driver, XRT headers and runtime, and a C++20 compiler
 with OpenMP. On the development Arch Linux machine the XRT packages are `xrt` and
 `xrt-plugin-amdxdna`. These are system prerequisites, not Python dependencies.
@@ -48,25 +50,57 @@ python -m xdna_train
 
 ### Convolution compiler
 
-General 3x3 convolution programs are built with [mlir-aie / IRON](https://github.com/Xilinx/mlir-aie)
-in a separate Python environment:
+General 3x3 convolution requires IRON and Peano. When no existing compiler is
+configured, the backend automatically prepares a private Python 3.12 environment
+on its first successful initialization. This works independently of an application
+using Python 3.12, 3.13 or 3.14. The initial download is about 410 MB plus Python if
+needed. Setup prints its log path and waits for the compiler before returning.
+It never runs sudo or installs packages into the training environment.
+
+The package pins MLIR-AIE 1.3.4 and Peano 21.0.0.2026062301+cb664e8c, together with
+all their Python dependencies. Downloads must match the included SHA256 hashes;
+no LLVM source build is needed. The managed environment lives in
+`~/.cache/torch-xdna2/toolchains/<lock-hash>/env/`. `XDG_CACHE_HOME` changes the
+cache parent; `TORCH_XDNA2_CACHE` overrides the entire backend cache root.
+
+```bash
+torch-xdna2-setup          # Optional: prepare the compiler before the application
+torch-xdna2-setup --check  # Read cache status only; no network or backend import
+torch-xdna2-setup --retry  # Explicit retry after fixing a failed setup
+```
+
+Setup is serialized across processes. An interrupted environment is never marked
+ready. A failed automatic attempt emits a warning, retains its `setup.log` and
+falls back to CPU convolution. Repeated automatic attempts have a 10-minute
+cooldown; explicit `--retry` bypasses it. Restart the training process after
+repairing compiler setup so the families are configured again.
+
+For offline or administrator-managed environments, set `XDNA_AUTO_SETUP=0` or
+`UV_OFFLINE=1` before import. Neither removes an existing cached compiler. To use
+your own compiler instead:
 
 ```bash
 export XDNA_IRON_PYTHON=/path/to/mlir-aie-env/bin/python
 ```
 
-The backend also looks in `~/mlir-aie-env/bin/python` and `~/ironenv/bin/python`.
-An empty `XDNA_IRON_PYTHON` disables on-demand compilation. Already cached programs
-can still be used. Bundled matrix and full-frame programs do not need an IRON build.
+An explicit value takes precedence over automatic setup, and an empty value
+disables compilation and setup. Without an explicit override, an existing managed
+compiler is preferred, followed by the legacy `~/mlir-aie-env` / `~/ironenv`
+environments and the source-tree sibling `mlir-aie-env`.
 
-A new convolution shape can require another program. While it builds, that
-convolution uses a CPU path. The default cache is `~/.cache/torch-xdna2/`;
-`TORCH_XDNA2_CACHE` changes its root. Historical builds took about 7 seconds per
-instruction stream on the development machine; compilation time varies.
+A new convolution shape can still require another instruction stream. Those
+streams compile on demand and are cached separately; while they build, the
+operation uses CPU fallback. Managed streams are keyed by compiler lock and source
+hash, so changing the compiler cannot reuse an incompatible stream. Build errors
+print an actionable warning and identify the family's `build.log`.
+
+Bundled matrix and full-frame programs need no IRON compilation. The driver,
+XRT and host C++ compiler remain [system prerequisites](system-dependencies.md).
 
 ## Check a failed installation
 
-Run this in the same environment as the application:
+Start with `torch-xdna2-doctor` in the application environment. It checks local
+dependencies without importing PyTorch or opening the NPU. Then run:
 
 ```bash
 TORCH_XDNA2_BUILD_VERBOSE=1 python -m xdna_train

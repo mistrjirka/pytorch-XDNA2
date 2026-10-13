@@ -8,6 +8,8 @@ from pathlib import Path
 
 import torch
 from torch.utils.cpp_extension import load
+from xdna_tools.toolchain import cache_root as _cache_root
+from xdna_tools.diagnostics import find_xrt_paths
 
 _ROOT = Path(__file__).resolve().parent
 _NATIVE = _ROOT / "_native"
@@ -23,19 +25,18 @@ def _env_id() -> dict[str, object]:
     }
 
 
-def _cache_root() -> Path:
-    raw = os.environ.get("TORCH_XDNA2_CACHE")
-    return Path(raw).expanduser() if raw else Path.home() / ".cache" / "torch-xdna2"
-
-
 def build_native():
     sources = [
         _NATIVE / "torch_xdna_device.cpp",
         _NATIVE / "train_xrt_shim.cpp",
         _NATIVE / "conv_pack.cpp",
     ]
-    hash_inputs = sources + [_SHIM / "xrt_shim.cpp", _SHIM / "xrt_shim.h"]
+    hash_inputs = sources + [_SHIM / "xrt_shim.cpp", _SHIM / "xrt_shim.h", Path(__file__)]
+    xrt_include, xrt_lib = find_xrt_paths()
+    if xrt_include is None or xrt_lib is None:
+        raise RuntimeError("XRT development headers/libraries are missing. Run torch-xdna2-doctor; see docs/system-dependencies.md.")
     env = _env_id()
+    env.update(xrt_include=str(xrt_include), xrt_lib=str(xrt_lib), cxx=os.environ.get("CXX", "c++"))
     h = hashlib.sha256(json.dumps(env, sort_keys=True).encode())
     for path in hash_inputs:
         h.update(path.name.encode())
@@ -45,12 +46,7 @@ def build_native():
     build_dir = _cache_root() / "native" / module_name
     build_dir.mkdir(parents=True, exist_ok=True)
 
-    include_paths = [str(_SHIM)]
-    xrt_include = os.environ.get("XRT_INCLUDE_DIR")
-    if xrt_include:
-        include_paths.append(xrt_include)
-
-    xrt_lib = os.environ.get("XRT_LIB_DIR", "/usr/lib")
+    include_paths = [str(_SHIM), str(xrt_include)]
     return load(
         name=module_name,
         sources=[str(p) for p in sources],

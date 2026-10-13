@@ -17,6 +17,20 @@ python -m xdna_train
 active PyTorch ABI when loaded. `--no-deps` preserves the installed PyTorch build
 but skips dependency installation and resolution.
 
+## Setup tests without an NPU
+
+The setup helpers live in `xdna_tools`, separate from the backend's auto-registering
+import. These standard-library tests mock missing packages, paths and downloads:
+
+```bash
+python -m unittest discover -s tests -p 'test_setup_diagnostics.py'
+python -m unittest discover -s tests -p 'test_toolchain_setup.py'
+python -m unittest discover -s tests -p 'test_setup_integration.py'
+```
+
+An installed wheel must contain the compiler lock file and the doctor/setup entry
+points. Test the isolated managed compiler on hardware before changing its pins.
+
 ## Correctness tests
 
 From the repository root on an XDNA2 machine:

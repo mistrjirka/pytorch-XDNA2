@@ -1278,18 +1278,34 @@ struct IronStreamBuilder {
   // copy-on-write, and the first host write to a pinned XRT buffer after it
   // moves the page away from the NPU, which keeps reading the stale copy.
   // glibc's posix_spawn shares the address space (vfork semantics).
+  static std::string shell_quote(const std::string& value) {
+    std::string result = "'";
+    for (const char ch : value) {
+      if (ch == '\'') result += "'\\''";
+      else result += ch;
+    }
+    return result + "'";
+  }
+
   void build(const std::string& args) {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    const std::string line = cmd + " --out '" + dir + "' " + args + " >> '" + dir +
-        "/build.log' 2>&1";
+    const std::string log = dir + "/build.log";
+    const std::string line = cmd + " --out " + shell_quote(dir) + " " + args +
+        " >> " + shell_quote(log) + " 2>&1";
     std::string sh = "/bin/sh", flag = "-c";
     char* argv[] = {sh.data(), flag.data(), const_cast<char*>(line.c_str()), nullptr};
     pid_t pid = 0;
-    if (posix_spawn(&pid, "/bin/sh", nullptr, nullptr, argv, environ) == 0) {
-      int status = 0;
-      while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-      }
+    int status = 0;
+    const int rc = posix_spawn(&pid, "/bin/sh", nullptr, nullptr, argv, environ);
+    pid_t waited = -1;
+    if (rc == 0) {
+      do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+    }
+    if (rc != 0 || waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      std::fprintf(stderr,
+          "torch-xdna2: convolution program build failed; using CPU fallback. "
+          "See %s and run torch-xdna2-doctor.\n", log.c_str());
     }
   }
 

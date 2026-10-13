@@ -1,5 +1,15 @@
 # Modes audit: environment variables, modes and NPU families
 
+## Automatic compiler setup
+
+`XDNA_AUTO_SETUP=0` disables managed compiler installation; `UV_OFFLINE=1` prevents
+first-time downloads. Neither disables an already completed managed compiler.
+An explicit `XDNA_IRON_PYTHON` (including an empty value) overrides automatic
+selection. `TORCH_XDNA2_CACHE` covers native artifacts and the managed compiler;
+otherwise `XDG_CACHE_HOME` or `~/.cache` is used. These are setup controls, not
+convolution performance modes. See [usage](usage.md#convolution-compiler).
+
+
 Inventory of everything that selects a code path in `xdna_train`, taken at commit
 `9e1a5de` (before pruning). `file:line` references are to that commit; the
 **Status** column says what the pruning branch did with each row. The last section

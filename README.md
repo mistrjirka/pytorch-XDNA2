@@ -26,16 +26,16 @@ uv pip install "git+https://github.com/mistrjirka/pytorch-XDNA2.git"
 
 For pip, replace `uv pip install` with `python -m pip install`.
 
-General 3x3 NPU convolution also needs an [mlir-aie / IRON environment](https://github.com/Xilinx/mlir-aie).
-Point the backend at its Python executable:
+The first import checks system dependencies, builds the native extension, and
+prepares a private [IRON / Peano compiler](docs/usage.md#convolution-compiler)
+for general 3x3 convolution. Its pinned wheels download about 410 MB once, plus
+Python 3.12 if needed. Your training environment is unchanged; no compiler
+activation or path configuration is needed.
 
-```bash
-export XDNA_IRON_PYTHON=/path/to/mlir-aie-env/bin/python
-```
-
-Without IRON or previously compiled programs, those convolutions use the CPU.
-The first import compiles the native extension; convolution programs compile on
-first use. Builds are cached in `~/.cache/torch-xdna2/`.
+Install the driver/XRT and build tools using the [Arch, Ubuntu or Fedora guide](docs/system-dependencies.md).
+Missing prerequisites produce actionable warnings on import. `torch-xdna2-doctor`
+checks them without loading the backend or downloading anything. To disable
+automatic downloads, set `XDNA_AUTO_SETUP=0` before import.
 
 Check the installation:
 
@@ -44,7 +44,7 @@ python -m xdna_train
 ```
 
 Look for `xdna_available=True`. See [setup and troubleshooting](docs/usage.md)
-for XRT paths, reinstalling without replacing PyTorch, and build failures.
+for offline use, XRT paths and build failures.
 
 ## Train
 
