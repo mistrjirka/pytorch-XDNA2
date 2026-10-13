@@ -5,9 +5,8 @@
 ## Recorded model-zoo results
 
 These measurements were recorded on 2026-10-13 for backend commit `fae72c2`.
-The table was checked against `benchmarks/results/zoo_fae72c2_ac.json` during
-review of the maintainer's local documentation cleanup `78f7531`. That raw run
-file has not been published in this repository; the reviewed summary is below.
+The raw run is in `benchmarks/results/zoo_fae72c2_ac.json`; the table below
+is its medians.
 
 Setup: Ryzen AI 9 365, XRT 2.21.75, PyTorch 2.14.1, Python 3.12, BF16,
 AC power and 16 CPU threads. The harness uses synthetic inputs, AdamW, 24 warmup
