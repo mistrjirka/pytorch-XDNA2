@@ -137,7 +137,7 @@ thread_local c10::DeviceIndex g_current_device = 0;
 // CPU dW overlap uses std::async/queue threads.  Fresh threads take their
 // OpenMP width from ATen's process-wide value, which other code lowers:
 // DataLoader(pin_memory=True) calls torch.set_num_threads(1) in its pin
-// thread.  Every XDNA backward op then ran single-threaded (4x slower NIS
+// thread.  Every XDNA backward op then ran single-threaded (4x slower style-transfer
 // step).  Follow the width the user sets on the thread that loaded the
 // backend (the Python main thread) and apply it to every other thread
 // before host compute.  XDNA_HOST_THREADS=N pins the width instead.
@@ -716,7 +716,7 @@ XdnaAllocator g_xdna_allocator;
 // Many XDNA ops run a CPU kernel on aliases of XRT memory.  CPU kernels that
 // only exist functionally (convolution, convolution_backward, and anything in
 // the boxed fallback) allocate their result with the CPU allocator, which used
-// to cost a full copy into XDNA storage per output (~10% of a NIS step).
+// to cost a full copy into XDNA storage per output (~10% of a style-transfer step).
 // Inside an AdoptHostAllocations scope, large CPU allocations are served from
 // the XRT BO cache instead, so adopt_host_tensor() can hand the result over
 // to an XDNA tensor without copying.  Outside a scope, and for small or
@@ -888,7 +888,7 @@ struct XdnaGuardImpl final : c10::impl::DeviceGuardImplInterface {
     g_current_device = 0;
     // No sync_host_threads() here: DataLoader's pin thread sets the device
     // right after torch.set_num_threads(1), and widening it to the full
-    // intra-op width added a third spinning OpenMP team (+25% NIS step).
+    // intra-op width added a third spinning OpenMP team (+25% style-transfer step).
     // Host compute entry points (ScopedMappedCpu, fallback, dW workers)
     // apply the width where it is actually used.
   }
@@ -4753,7 +4753,7 @@ bool schema_type_has_tensor(const c10::TypePtr& type) {
 // XDNA storage is host-mapped XRT memory, so an operator without an XDNA
 // kernel can run its CPU kernel directly on CPU aliases of the XDNA
 // arguments.  at::native::cpu_fallback instead copies every input to CPU and
-// every output back (about half of the VGG-loss time in NIS style
+// every output back (about half of the VGG-loss time in style
 // transfer).  Returns false, with the stack untouched, for anything this
 // cannot express: view returns, device/factory arguments, non-Tensor
 // containers of tensors.

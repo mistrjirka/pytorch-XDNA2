@@ -2,7 +2,7 @@
 """View safety: XDNA must reject the same out-of-bounds / overlapping views as CPU,
 and view ops (unfold) must share storage with their base.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import sys
 

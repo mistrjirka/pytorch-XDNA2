@@ -280,7 +280,7 @@
     2115.66205
    ]
   ],
-  "package": "xdna_train from /home/jirka/programovani/magistr/nis/.venv/lib/python3.12/site-packages/xdna_train/__init__.py",
+  "package": "xdna_train from <local-path>",
   "round": 0
  },
  {
@@ -570,7 +570,7 @@
     1789.0351500000002
    ]
   ],
-  "package": "xdna_train from /home/jirka/programy/torch-xdna2/xdna_train/__init__.py",
+  "package": "xdna_train from <local-path>",
   "round": 0
  },
  {
@@ -860,7 +860,7 @@
     3636.2568
    ]
   ],
-  "package": "xdna_train from /home/jirka/programy/torch-xdna2/xdna_train/__init__.py",
+  "package": "xdna_train from <local-path>",
   "round": 0
  }
 ]

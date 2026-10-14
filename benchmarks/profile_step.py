@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Per-op profile of one training step, CPU vs XDNA, for finding backend overhead.
 
-Runs a model from benchmarks/model_zoo.py (default: nis_mynet with the NIS VGG
+Runs a model from benchmarks/model_zoo.py (default: style_full, StyleNet with the VGG
 perceptual loss) on fixed data, profiles a few steps with torch.profiler and
 prints self-time per op for each device side by side.  Ops whose XDNA self
 time exceeds CPU point at dispatch, allocation, copy or layout overhead.
 
     PYTHONPATH=/path/to/torch-xdna2 python benchmarks/profile_step.py
 
-The default model nis_full needs the NIS coursework code: set NIS_ROOT to the
-NIS lab02_cnn directory.  The script exits with a message if it is not set.
+The default model style_full is benchmarks/style_net.py (generator + VGG19/L1 loss).
 """
 from __future__ import annotations
 
@@ -25,15 +24,14 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
-def _nis_full():
-    """NIS MyNet(3,3,5) + the script's ImageGenLoss (VGG19 perceptual + L1)."""
-    sys.path.insert(0, os.environ["NIS_ROOT"])
-    from models import MyNet
-    from train import ImageGenLoss
+def _style_full():
+    """StyleNet(3,3,5) + StyleLoss (VGG19 perceptual + L1)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from style_net import StyleLoss, StyleNet
 
     def build(device):
-        model = MyNet(3, 3, 5)
-        loss = ImageGenLoss(4.0, 6.0, device=device)
+        model = StyleNet(3, 3, 5)
+        loss = StyleLoss(4.0, 6.0, device=device)
         return model, loss
     return build, lambda g: (torch.randn(40, 3, 36, 36, generator=g),
                              torch.rand(40, 3, 36, 36, generator=g))
@@ -47,8 +45,8 @@ def worker(model_name: str, device: str, steps: int) -> dict:
     dt = torch.bfloat16
     torch.manual_seed(0)
     gen = torch.Generator().manual_seed(1)
-    if model_name == "nis_full":
-        build, make_batch = _nis_full()
+    if model_name == "style_full":
+        build, make_batch = _style_full()
         model, loss_mod = build(device)
         model = model.to(device, dt)
         loss_mod = loss_mod.to(device, dt)
@@ -81,16 +79,12 @@ def worker(model_name: str, device: str, steps: int) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="nis_full")
+    ap.add_argument("--model", default="style_full")
     ap.add_argument("--steps", type=int, default=5)
     ap.add_argument("--top", type=int, default=30)
     ap.add_argument("--_worker", nargs=2)
     args = ap.parse_args()
     model_name = args._worker[0] if args._worker else args.model
-    if model_name == "nis_full":
-        nis_root = os.environ.get("NIS_ROOT", "")
-        if not nis_root or not os.path.isdir(nis_root):
-            sys.exit("this benchmark needs the NIS coursework code: set NIS_ROOT to the NIS lab02_cnn directory")
     if args._worker:
         print("PROFILE=" + json.dumps(worker(args._worker[0], args._worker[1], args.steps)))
         return

@@ -274,7 +274,7 @@
     1921.5441999999998
    ]
   ],
-  "package": "xdna_train from /home/jirka/programovani/magistr/nis/.venv/lib/python3.12/site-packages/xdna_train/__init__.py",
+  "package": "xdna_train from <local-path>",
   "round": 0
  },
  {
@@ -534,7 +534,7 @@
     3034.7331
    ]
   ],
-  "package": "xdna_train from /home/jirka/programy/torch-xdna2/xdna_train/__init__.py",
+  "package": "xdna_train from <local-path>",
   "round": 0
  }
 ]

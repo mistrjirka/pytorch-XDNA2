@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Chrome trace of one NIS-shaped training step with named phase spans.
+"""Chrome trace of one style-transfer training step with named phase spans.
 
 SYNTHETIC PROBE: fixed random inputs/targets (B40, 36x36), Adam without the
 application's weight decay, no data loader, scheduler, logging, validation or
-checkpointing.  It reproduces the shape of the NIS step (MyNet(3,3,5) + VGG19/L1
-loss, BF16), not the exact real-data application.
+checkpointing.  It reproduces the shape of the step (StyleNet(3,3,5) + VGG19/L1
+loss, BF16, benchmarks/style_net.py), not a real-data application.
 
 Settings are explicit and saved next to the trace (<out>.meta.json):
 
@@ -16,7 +16,7 @@ Wall time is measured on separate, unprofiled steps (profiling with
 record_shapes slows the step and keeps tensor references), so quote
 `wall_ms_median` from the meta file, not the span of the trace.
 
-    NIS_ROOT=.../lab02_cnn XDNA_CONV3X3W_SYNC_BUILD=1 \\
+    XDNA_CONV3X3W_SYNC_BUILD=1 \\
         python benchmarks/step_timeline.py out.trace.json --mode 2
 
 Phase spans in the trace: step:generator_fwd, step:loss_fwd, step:backward,
@@ -44,16 +44,12 @@ def main() -> None:
     ap.add_argument("--wall-steps", type=int, default=20)
     ap.add_argument("--no-trace", action="store_true", help="only the unprofiled wall time")
     ap.add_argument("--fuse-bn-act", action="store_true",
-                    help="pair each BatchNorm2d with its activation (benchmarks/nis_adapters.py)")
+                    help="pair each BatchNorm2d with its activation (benchmarks/style_adapters.py)")
     ap.add_argument("--fuse-loss", action="store_true",
                     help="route the perceptual loss through xdna_train.regions (opt-in region)")
     a = ap.parse_args()
-    nis_root = os.environ.get("NIS_ROOT", "")
-    if not os.path.isdir(nis_root):
-        sys.exit("set NIS_ROOT to the NIS lab02_cnn directory")
-    sys.path.insert(0, nis_root)
-    from models import MyNet
-    from train import ImageGenLoss
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from style_net import StyleLoss, StyleNet
 
     import xdna_train
     from torch.profiler import ProfilerActivity, profile, record_function
@@ -65,12 +61,12 @@ def main() -> None:
         xdna_train.set_npu_mode(int(a.mode))
     dt, dev = torch.bfloat16, "xdna"
     torch.manual_seed(0)
-    model = MyNet(3, 3, 5).to(dev, dt)
-    loss_fn = ImageGenLoss(4.0, 6.0, device=dev).to(dev, dt)
+    model = StyleNet(3, 3, 5).to(dev, dt)
+    loss_fn = StyleLoss(4.0, 6.0, device=dev).to(dev, dt)
     n_bn = 0
     if a.fuse_bn_act:
-        from nis_adapters import fuse_nis_norm_act
-        n_bn = fuse_nis_norm_act(model)
+        from style_adapters import fuse_style_net_norm_act
+        n_bn = fuse_style_net_norm_act(model)
         assert n_bn > 0, "no norm/activation pair found"
     fused = False
     if a.fuse_loss:
@@ -124,7 +120,7 @@ def main() -> None:
     except OSError:
         commit = ""
     meta = {
-        "probe": "synthetic NIS-shaped step (fixed random B40 36x36, Adam without weight decay)",
+        "probe": "synthetic style-transfer step (fixed random B40 36x36, Adam without weight decay)",
         "commit": commit, "torch": torch.__version__, "threads": a.threads,
         "fuse_loss": fused, "fused_norm_act_pairs": n_bn, "first_losses": losses[:3], "last_loss": losses[-1],
         "requested_mode": a.mode, "npu_mode_now": xdna_train.npu_mode(),

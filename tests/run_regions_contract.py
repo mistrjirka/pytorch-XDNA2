@@ -11,7 +11,7 @@ activations, a changed slope.
     conv attributes, hooks and subclasses make the loss fall back to the eager method;
   * fused BN+ReLU passes gradients for NaN activations like eager ReLU (LeakyReLU does not).
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import copy
 import sys

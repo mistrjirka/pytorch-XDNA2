@@ -3,7 +3,7 @@
 not read X / dY after backward returned: mutating either afterwards must not
 change the returned gradient.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import os
 import sys

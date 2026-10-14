@@ -11,7 +11,7 @@
 Each check asserts that the hazard was actually set up (same address reused,
 NPU kernel ran), so it cannot pass vacuously.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import os
 import sys

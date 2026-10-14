@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """set_(Storage) must preserve a pending gradient when it grows that storage.
 
-Run with the NIS venv Python and PYTHONPATH=<repo>. The reference and the
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>. The reference and the
 resize_ control retain their XDNA allocations, so the failing path cannot
 accidentally recycle their already-correct gradient buffers.
 """

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Precision gate: does BFP16 NPU conv arithmetic hurt NIS training?
+"""Precision gate: does BFP16 NPU conv arithmetic hurt style-transfer training?
 
-Trains NIS MyNet (+ the script's VGG perceptual loss) on CPU twice from the same
+Trains StyleNet (+ the VGG perceptual loss, benchmarks/style_net.py) on CPU twice from the same
 seed and data: plain BF16, and with every eligible 3x3 stride-1 conv replaced
 by an exact emulation of the tall-skinny ATB NPU kernel:
   * activations quantized to bfp16ebs8 (blocks of 8 channels, round-to-nearest,
@@ -13,10 +13,10 @@ Forward and input gradient (dX) use the emulation; dW stays exact (--dw exact)
 or uses single-pass BFP16 with fp32 sums (--dw bfp1).  Prints both loss
 curves and their relative gap.
 
-    NIS_ROOT=/path/to/nis/lab02_cnn python benchmarks/bfp16_training_gate.py --steps 300
+    python benchmarks/bfp16_training_gate.py --steps 300
+    python benchmarks/bfp16_training_gate.py --steps 300 --input-dir A/ --target-dir B/
 
-NIS_ROOT must be set to the NIS lab02_cnn directory (the script exits with a
-message otherwise).  The dataset is read from data/ under NIS_ROOT.
+Without --input-dir/--target-dir the data are synthetic image pairs.
 """
 import argparse
 import os
@@ -26,7 +26,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-NIS = os.environ.get("NIS_ROOT", "")
+HERE = os.path.dirname(os.path.abspath(__file__))
+INPUT_DIR = TARGET_DIR = None
 
 
 def bfp_quant(x: torch.Tensor, dim: int) -> torch.Tensor:
@@ -118,22 +119,17 @@ def patch(module):
 
 
 def run(emulate: bool, steps: int, seed: int):
-    sys.path.insert(0, NIS)
-    os.chdir(NIS)
-    from models import MyNet
-    from train import ImageGenLoss
-    from data import DatasetPatches
+    sys.path.insert(0, HERE)
+    from style_net import StyleLoss, StyleNet, make_dataset
     torch.manual_seed(seed)
     dt = torch.bfloat16
-    model = MyNet(3, 3, 5).to(dt)
-    loss_fn = ImageGenLoss(4.0, 6.0).to(dt)
+    model = StyleNet(3, 3, 5).to(dt)
+    loss_fn = StyleLoss(4.0, 6.0).to(dt)
     if emulate:
         print("emulated convs:", patch(model), "+", patch(loss_fn), "(VGG)")
     opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    vid = "VID20261009180405"
     g = torch.Generator().manual_seed(seed)
-    data = DatasetPatches(f"data/{vid}/train/input", f"data/{vid}/train/target",
-                          patch_size=36, num_patches=steps * 40)
+    data = make_dataset(36, steps * 40, INPUT_DIR, TARGET_DIR)
     loader = torch.utils.data.DataLoader(data, batch_size=40, shuffle=True, generator=g)
     losses = []
     for i, (x, y) in enumerate(loader):
@@ -153,10 +149,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dw", choices=["exact", "bfp1"], default="exact",
                     help="dW arithmetic in the emulated run (exact = CPU)")
+    ap.add_argument("--input-dir", default=None, help="folder of input images (paired by file name)")
+    ap.add_argument("--target-dir", default=None, help="folder of target images")
     args = ap.parse_args()
-    if not NIS or not os.path.isdir(NIS):
-        sys.exit("this benchmark needs the NIS coursework code: set NIS_ROOT to the NIS lab02_cnn directory")
-    global DW_MODE
+    global DW_MODE, INPUT_DIR, TARGET_DIR
+    INPUT_DIR, TARGET_DIR = args.input_dir, args.target_dir
     DW_MODE = args.dw
     base = run(False, args.steps, args.seed)
     emul = run(True, args.steps, args.seed)

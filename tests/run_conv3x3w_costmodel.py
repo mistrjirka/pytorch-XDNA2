@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """conv3x3w cost model: which shapes go to the NPU (fwd and dX) and which stay on the CPU.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.  The decision is read from
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.  The decision is read from
 the `npu_conv3x3w.{fwd,dx}.run` mapped-CPU phases.  dX of a conv is the conv of
 dY with swapped channels, so e.g. 64->3 (dX = 3-channel output) must stay on CPU.
 """

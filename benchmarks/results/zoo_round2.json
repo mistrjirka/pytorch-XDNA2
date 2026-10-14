@@ -495,7 +495,7 @@
   "status": "ok"
  },
  {
-  "model": "nis_mynet",
+  "model": "style_net",
   "cpu": {
    "median_ms": 148.12440799960314,
    "losses": [

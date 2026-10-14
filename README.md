@@ -75,7 +75,7 @@ forward, loss, backward and optimizer calls remain the same.
 ## Faster training with a perceptual loss (optional)
 
 If your loss runs a frozen VGG-style feature network (`Conv2d`/`ReLU`/`MaxPool2d` layers), one line
-fuses it on the CPU and removes about 13 ms from the NIS step (107 to 93 ms):
+fuses it on the CPU and removes about 12 ms from a style-transfer training step (107 to 95 ms in `benchmarks/step_timeline.py`):
 
 ```python
 from xdna_train import regions
@@ -93,8 +93,8 @@ measured **1.21x CPU BF16 throughput on average** (geometric mean), with individ
 results from 0.97x to 2.03x. It used AC power and 10 CPU threads (the PyTorch default on this machine). Gains include CPU
 execution improvements; they do not all come from NPU computation.
 
-On the style-transfer training step used in the benchmark (MyNet with a VGG19 perceptual loss, batch 40,
-36x36 patches, Adam) the backend runs about 9 it/s with no code changes, against 4.7 it/s on CPU BF16.
+On a style-transfer training script (a residual encoder-decoder generator with a VGG19 perceptual loss, batch 40,
+36x36 patches, Adam; `benchmarks/style_net.py` has the same network) the backend ran about 9 it/s with no code changes, against 4.7 it/s on CPU BF16.
 The opt-in loss region below raises that to about 10.6 it/s.
 
 NPU acceleration covers selected BF16 3x3 convolutions and fixed matrix shapes.

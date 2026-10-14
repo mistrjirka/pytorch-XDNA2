@@ -27,7 +27,7 @@ per-round medians and includes forward, loss, backward and the optimizer step.
 | 1-D conv audio classifier | 16000 samples (16) | 26.1 | 24.6 | 1.06x |
 | Conv autoencoder | 3x128x128 (16) | 27.3 | 27.2 | 1.01x |
 | Embedding + MLP | 64 tokens (128) | 5.5 | 2.7 | 2.03x |
-| NIS style-transfer net (MyNet) | 3x36x36 (40) | 145.3 | 93.0 | 1.56x |
+| style-transfer net (StyleNet) | 3x36x36 (40) | 145.3 | 93.0 | 1.56x |
 
 The geometric mean of CPU-time / XDNA-time over all 12 workloads is **1.21x**.
 Ratios above 1 favor XDNA. The MobileNet result is slower in this measurement;
@@ -35,7 +35,7 @@ a few percent difference in a short laptop run does not establish a reliable
 advantage for either backend. Power state, temperature and background load can
 change the result.
 
-The MyNet row uses synthetic data, L1 loss and AdamW. It is separate from the real
+The StyleNet row uses synthetic data, L1 loss and AdamW. It was measured with the author's implementation of this network; one single-round rerun with `benchmarks/style_net.py` gave 167 ms (CPU) and 80 ms (XDNA), 2.09x. It is separate from the real
 style-transfer application with VGG perceptual loss below. These short training
 runs check loss agreement; they do not establish final model quality or accuracy.
 
@@ -61,7 +61,7 @@ not imply that every operation ran on the NPU.
 
 General NPU convolutions use BF16 activations with BFP16 weights/operands. Previous
 numerical tests measured roughly 1% relative error against FP32, compared with
-roughly 0.2% for CPU BF16. A 300-step NIS comparison is recorded by
+roughly 0.2% for CPU BF16. A 300-step style-transfer comparison is recorded by
 [`bfp16_training_gate.py`](../benchmarks/bfp16_training_gate.py) and its
 [results](../benchmarks/results/bfp16_gate.log). Validate numerical behavior for
 your own model and loss.
@@ -72,16 +72,22 @@ The previous README recorded these separately from the model-zoo run:
 
 | Application | CPU BF16 | XDNA BF16 | Measurement |
 |---|---:|---:|---|
-| NIS style transfer, 2026-10-10 | 171.8 ms/step | 128.8 ms/step | Training step with VGG loss and Adam |
-| NIS style transfer, 2026-10-13 | 187.7 ms/step | 135.5 ms/step | One comparison round, VGG loss and Adam |
+| style-transfer, 2026-10-10 | 171.8 ms/step | 128.8 ms/step | Training step with VGG loss and Adam |
+| style-transfer, 2026-10-13 | 187.7 ms/step | 135.5 ms/step | One comparison round, VGG loss and Adam |
 | DRIVE segmentation, earlier full-frame checkpoint | 0.151 to 0.155 it/s | 0.210 to 0.212 it/s | Training plus validation |
 
-The style-transfer runs use batch 40 and 36x36 patches. The
-[NIS harness](../benchmarks/nis_style_transfer.py) depends on the NIS coursework
-scripts and data outside this repository (set `NIS_ROOT` to its `lab02_cnn`
-directory); it cannot be reproduced from a fresh clone alone.
+The style-transfer runs use batch 40 and 36x36 patches with a generator of the
+`StyleNet` architecture and a VGG19 perceptual loss. The 2026-10-10 and 2026-10-13 rows were measured with the
+author's own training script (not part of this repository); the equivalent in-repo step is
+[`step_timeline.py`](../benchmarks/step_timeline.py) with
+[`style_net.py`](../benchmarks/style_net.py). Measured on 2026-10-14 (AC power, 10 threads, NPU mode 2, ABBA order): the author's
+step took 103 ms with the early weight-gradient start alone and 90 ms with `regions.fuse_perceptual_loss`
+(see [usage](usage.md#fused-regions)); their training script ran at about 9.0 it/s without and 10.6 it/s
+with the region, against 4.7 it/s on CPU BF16 measured earlier. The in-repo `step_timeline.py` step
+(a slightly different implementation of the same network) measured 107 and 108 ms without and 95 and 96 ms with the
+region in two rounds.
 
-The DRIVE measurement uses `MyNet(3,1,7)`, batch 4 and 584x564 images. It predates
+The DRIVE measurement uses `StyleNet(3,1,7)`, batch 4 and 584x564 images. It predates
 the 2026-10-12 cleanup and has not been rerun since that cleanup. For historical
 optimization notes, see the [optimization log](OPTIMIZATION_LOG.md).
 
@@ -103,12 +109,11 @@ PYTHONPATH=. python benchmarks/model_zoo.py \
 
 Use the keys in [model_zoo.py](../benchmarks/model_zoo.py) to select other models.
 The table was measured with 10 threads, the PyTorch default on that machine; pass
-the thread count your machine uses. The `nis_mynet` row imports `MyNet` from the NIS
-coursework outside this repository. Set `NIS_ROOT` to its `lab02_cnn` directory to
-include it; without `NIS_ROOT` it is left out of the default list and the other 11
-rows run. The application benchmarks (`nis_style_transfer.py`,
-`bfp16_training_gate.py`, `profile_step.py` with the NIS model) also need `NIS_ROOT`,
-`NIS_PYTHON` (a Python with the coursework dependencies) and the coursework's data.
+the thread count your machine uses. The `style_net` row is the generator from [style_net.py](../benchmarks/style_net.py). The application
+benchmarks (`step_timeline.py`, `loss_curve_compare.py`, `profile_step.py`, `bfp16_training_gate.py`) use the same
+network and loss with synthetic data; `loss_curve_compare.py` and `bfp16_training_gate.py` also accept
+`--input-dir`/`--target-dir` with paired images. The VGG19 weights are random unless `STYLE_NET_PRETRAINED=1`
+is set (timing does not depend on them). They need `torchvision`.
 
 Use AC power and record the power profile, hardware/software versions, thread
 counts, input shapes and environment overrides. Run hardware benchmarks serially.

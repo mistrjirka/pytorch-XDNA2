@@ -16,11 +16,11 @@ Opt in: `regions.fuse_perceptual_loss(loss_module)` (duck-typed on `perceptual_v
 `.feature_layers`, `.norm`).  Eligibility is semantic (op types, bf16, XDNA device, frozen weights,
 x requires grad); otherwise the module's own method runs.  `XDNA_REGIONS=0` disables.
 
-Contract, numerics and saved state are in the module docstring.  Nothing is NIS or
-B40 specific; the NIS adapter lives in `benchmarks/step_timeline.py --fuse-loss`
+Contract, numerics and saved state are in the module docstring.  Nothing is style-transfer or
+B40 specific; the style-transfer adapter lives in `benchmarks/step_timeline.py --fuse-loss`
 and `benchmarks/loss_curve_compare.py --fuse-loss`.
 
-## Measurements (AC, mode 2, 10 threads, synthetic NIS-shaped probe, wall time unprofiled)
+## Measurements (AC, mode 2, 10 threads, synthetic style-transfer-shaped probe, wall time unprofiled)
 
 | Variant | Step ms (median of paired runs) |
 |---|---|
@@ -49,7 +49,7 @@ it is harmless; do not quote it as a win.
 
 ## Training-quality check
 
-`benchmarks/loss_curve_compare.py`, real NIS patches, 400 steps, same seeds and data order:
+`benchmarks/loss_curve_compare.py`, real style-transfer patches, 400 steps, same seeds and data order:
 two eager runs are bit-identical (loss per step); the fused curve is within 0.1% in every
 40-step window (32.806 vs 32.837 ... 11.223 vs 11.213 final window).  First losses equal.
 This is a short run, not a convergence study.
@@ -64,10 +64,10 @@ This is a short run, not a convergence study.
 ## Fused training BatchNorm + LeakyReLU (`regions.fuse_norm_activation`, 2026-10-13)
 
 Explicit pairing API in the style of `torch.ao.quantization.fuse_modules`: the caller declares that the
-activation is applied directly to the norm output.  A module walk cannot know that: in MyNet's `ResNetBlock`
+activation is applied directly to the norm output.  A module walk cannot know that: in StyleNet's `ResBlock`
 `norm2` goes through an add before the activation, and a blind pairing would apply LeakyReLU twice (slope
-0.2 twice is not 0.2).  The NIS declarations live in `benchmarks/nis_adapters.py` (norm in ConvBlock /
-UpsampleConvBlock, `norm1` in ResNetBlock; the shared `relu` module is safe because it only passes through
+0.2 twice is not 0.2).  The style-transfer declarations live in `benchmarks/style_adapters.py` (norm in ConvBlock /
+UpsampleConvBlock, `norm1` in ResBlock; the shared `relu` module is safe because it only passes through
 tensors the fused norm produced).  Both modules keep parameters, buffers and state_dict keys.
 
 Native kernels (`region_kernels.cpp`): per-(n,c) plane mean and sum of squared deviations in fp32, planes merged
@@ -119,12 +119,12 @@ All five reproduced before the fix:
 Not changed (documented): pickling a whole fused module with `torch.save(model)` is not supported (bound methods in
 the instance dict); save `state_dict()` instead.
 
-## Using the fusions in the real NIS script
+## Using the fusions in a training script
 
-The unchanged coursework `style_transfer.py` defaults to CPU and calls neither adapter; the benchmarks switch them on
-explicitly.  After `model.to('xdna', bf16)` and building the loss on XDNA the script would need, for example:
+Nothing is fused unless the script asks; the benchmarks switch the fusions on explicitly.  After
+`model.to('xdna', bf16)` and building the loss on XDNA a script would need, for example:
 
     from xdna_train import regions
-    regions.fuse_perceptual_loss(loss_fn)            # loss_fn = ImageGenLoss(...) on xdna
-    sys.path.insert(0, '<repo>/benchmarks'); from nis_adapters import fuse_nis_norm_act
-    fuse_nis_norm_act(model)                         # optional; gain not established
+    regions.fuse_perceptual_loss(loss_fn)            # loss_fn = StyleLoss(...) on xdna
+    sys.path.insert(0, '<repo>/benchmarks'); from style_adapters import fuse_style_net_norm_act
+    fuse_style_net_norm_act(model)                         # optional; gain not established

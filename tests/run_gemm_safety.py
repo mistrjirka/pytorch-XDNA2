@@ -9,7 +9,7 @@
 The 256x768 @ 768x3072 GEMM is one of the shapes the NPU GEMM family handles;
 the script checks that no mm fell back to the CPU, so it cannot pass vacuously.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import os
 import sys

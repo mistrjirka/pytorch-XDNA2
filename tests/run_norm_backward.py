@@ -6,7 +6,7 @@ for BatchNorm2d(affine=False) and InstanceNorm, no input gradient when the
 input does not require grad.  Backward must work and match the CPU for every
 mask, in BF16 and FP32.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import os
 import sys

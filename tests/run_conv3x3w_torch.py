@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """conv3x3w through PyTorch: forward and dX on XDNA vs an FP32 CPU reference.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.  Sets
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.  Sets
 XDNA_CONV3X3W_SYNC_BUILD=1 so missing streams are compiled before the first
 call instead of falling back to the CPU; checks that the NPU path ran.
 """

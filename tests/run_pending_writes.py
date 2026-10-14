@@ -8,7 +8,7 @@
 3. Freeing a conv weight gradient whose deferred dW failed (or never ran) must
    not abort the process; a never-read gradient must not dispatch its dW.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.  Case 3 runs in
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.  Case 3 runs in
 subprocesses (`--child <scenario>`), so an abort shows up as a failed case.
 """
 import hashlib

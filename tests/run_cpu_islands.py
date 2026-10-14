@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CPU islands (xdna_train/cpu_islands.py): LSTM / GRU on XDNA match CPU, incl. gradients.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import copy
 import sys

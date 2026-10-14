@@ -819,7 +819,7 @@
   "status": "ok"
  },
  {
-  "model": "nis_mynet",
+  "model": "style_net",
   "cpu": {
    "median_ms": 150.78957750120026,
    "losses": [

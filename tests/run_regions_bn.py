@@ -7,7 +7,7 @@ XDNA and with an fp32 CPU reference.  Gate: the fused error vs fp32 must be at
 most 1.5x the eager error plus a small floor.  Also: fallbacks, the pairing
 guard, several steps of running statistics.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import copy
 import sys

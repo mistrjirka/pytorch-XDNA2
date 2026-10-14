@@ -15,7 +15,7 @@ or crash only loses that shape (timeout 300 s per subprocess).  Per shape it rec
     XdnaConv3x3wRuntime::cost_model_prefers_npu, and with the 2048-row group rounding).
 Shapes with real MACs < 20e6 are skipped (below the family's default threshold).
 
-usage (repo root, NIS venv python):
+usage (repo root, a Python with PyTorch 2.14):
   PYTHONPATH=. XDNA_IRON_PYTHON=<mlir-aie python> python benchmarks/conv_shape_sweep.py \
       [--grid priority|full] [--shapes 128,128,18,32 ...] [--resume] [--iters 12]
 Needs AC power (battery throttles the CPU and makes the comparison meaningless).

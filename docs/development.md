@@ -69,15 +69,15 @@ proof that hardware initialization succeeded.
 ## Training coverage
 
 The installed coverage command trains smaller MLP, residual CNN, U-Net-like,
-Transformer, depthwise, embedding and NIS-style motifs:
+Transformer, depthwise, embedding and style-transfer motifs:
 
 ```bash
 torch-xdna2-coverage --motif all --steps 2 --threads 8
-torch-xdna2-coverage --motif nis-mini --steps 5 --threads 16
+torch-xdna2-coverage --motif style-mini --steps 5 --threads 16
 torch-xdna2-coverage --motif transformer --json
 ```
 
-`nis-mini` keeps the NIS graph while reducing its image size to 72x68. Many
+`style-mini` keeps the style-transfer graph while reducing its image size to 72x68. Many
 convolutions then run on the CPU, so it checks compatibility at that size rather
 than reproducing full-frame acceleration. The command reports whole-step timing,
 CPU fallback operations and mapped-CPU handlers.
@@ -97,9 +97,7 @@ numerical agreement and dispatch counts as well as wall time. See
 The main implementation lives in [device.py](../xdna_train/device.py),
 [torch_xdna_device.cpp](../xdna_train/_native/torch_xdna_device.cpp) and
 [conv_pack.cpp](../xdna_train/_native/conv_pack.cpp). Kernel generators are in
-[_designs](../xdna_train/_designs/). The older
-[agent handoff](AGENT_HANDOFF_2026-10-10.md) records local research paths and
-historical state; check current source before relying on its settings.
+[_designs](../xdna_train/_designs/).
 
 For a contribution, include a small regression test for changed behavior and
 reproducible full-step measurements for performance changes. Report failures with

@@ -32,7 +32,7 @@ The experiments in this repository established several constraints:
    otherwise sub-millisecond kernels.
 2. A mapped XRT BO exposed directly as PyTorch storage is measurably faster than
    copying NPU outputs into fresh CPU tensors.
-3. Large rectangular GEMMs and selected NIS convolutions beat CPU when run as
+3. Large rectangular GEMMs and selected style-transfer convolutions beat CPU when run as
    resident NPU programs.
 4. Small/unfavourable operations should stay on CPU.
 5. Packing and conservative host/device synchronization erase much of the raw
@@ -210,9 +210,9 @@ training step.
 The scheduler cost model must include resident-program state, not only
 hw_context identity.
 
-## NIS-specific fusion opportunities that should generalize
+## style-transfer-specific fusion opportunities that should generalize
 
-The NIS model repeatedly uses:
+The style-transfer model repeatedly uses:
 
     Conv -> BatchNorm -> LeakyReLU
 
@@ -224,7 +224,7 @@ Also eliminate materialized:
 - nearest-neighbor upsample before Conv;
 - concat immediately consumed by Conv.
 
-These are graph/layout optimizations, not NIS hard-coding.
+These are graph/layout optimizations, not style-transfer hard-coding.
 
 ## Optimizer
 
@@ -271,7 +271,7 @@ Gate: PrivateUse1 Conv/GEMM latency <= 1.05x direct-XRT latency.
 - fusion;
 - AIE-program-aware scheduling.
 
-### Phase 4: NIS graph coverage
+### Phase 4: style-transfer graph coverage
 
 - Conv/BN/LeakyReLU regions;
 - concat and nearest upsample elimination;
@@ -283,8 +283,8 @@ Gate: PrivateUse1 Conv/GEMM latency <= 1.05x direct-XRT latency.
 1. XDNA device Conv <= 1.05x the corresponding direct XRT Conv.
 2. Rectangular Linear fwd+dX+dW <= about 2.3 ms, targeting the direct
    1.94-2.12 ms result.
-3. Preserve >=1.22-1.27x speedup on the profitable NIS decoder Conv shapes.
-4. Whole NIS patch-training step >1.15x CPU.
+3. Preserve >=1.22-1.27x speedup on the profitable style-transfer decoder Conv shapes.
+4. Whole style-transfer patch-training step >1.15x CPU.
 5. After residency/fusion, target >1.3x CPU, with 1.5x+ as a stretch goal.
 
 Every optimization should be evaluated against end-to-end training as well as

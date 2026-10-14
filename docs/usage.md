@@ -230,7 +230,7 @@ per 40-step window). `XDNA_REGIONS=0` disables them.
   `compute_perceptual_loss` runs `getattr(loss_module, features_attr).model.features` (a `Sequential` of
   `Conv2d`, `ReLU`, `MaxPool2d(2)`), compares the layers listed in `.feature_layers` and uses frozen weights.
   Every call re-checks the layers (exact types, conv attributes, hooks, parametrizations, parameter identity,
-  `requires_grad`); anything that no longer matches runs the module's own method. Measured: NIS step 107 to 93 ms.
+  `requires_grad`); anything that no longer matches runs the module's own method. Measured: a style-transfer training step 107 to 93 ms (`benchmarks/step_timeline.py --fuse-loss`: about 107 to 95 ms).
 - `regions.fuse_norm_activation(bn, act)`: declare that `act` (`nn.ReLU` or `nn.LeakyReLU`) is applied directly
   to the output of `bn` (`nn.BatchNorm2d`). Used only above 4 MB per tensor (`XDNA_REGION_NORM_ACT_MIN_BYTES`).
   More accurate than eager BF16 on large layers; the full-step gain is small (about 1-3 ms, within noise).

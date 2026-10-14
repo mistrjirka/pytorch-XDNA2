@@ -6,7 +6,7 @@ must not dispatch the NPU dW program (its program switch made such steps 20-45 %
 slower), and one above it (B40 192->128 36x36, 5.1 GMAC) must.  DW_MIN_MACS is
 deliberately left at its default.  Counts only, no timing.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import os
 import sys

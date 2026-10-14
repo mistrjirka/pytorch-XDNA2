@@ -31,16 +31,16 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 
 | Family | Shapes it handles | Reached at default? | Artifacts | Category | Evidence | Verdict |
 |---|---|---|---|---|---|---|
-| conv3x3w fwd + dX (`_designs/conv3x3w.py`) | 3x3/s1/p1, any batch/H/C, W tiled to <= 34 columns; cost model | **Yes**, all of NIS (upconv2/upconv1/conv11 fwd+dX), lab02 seg/style patch, all inference | built on demand into `~/.cache/torch-xdna2/conv3x3w/<hash>` (needs IRON python or a warm cache) | core | `OPTIMIZATION_LOG.md` (166 -> ~129 ms/step), `nis_round4_ac.json`, tests | KEEP |
-| conv3x3w_dw (NPU dW, deferred) | dW >= 1 GMAC | **Yes** (NIS: 256->128 @18/36, 195->64) | same cache | core | log: 171 -> 148 ms, bfp16 gate | KEEP |
-| Patch conv (`conv_runtime_slot`, `XdnaConvRuntime`, 9e1a5de:1501-1950, 4884-4898, 5155-5165) | B40, 256->128, 18x18 and 36x36 only | **No**: shadowed by conv3x3w (`try_forward`/`plan` are tried first). 0 hits in NIS, lab02 seg/style patch, style7 | `conv3x3_patch40_128` (1.1 MB) | dead at default | Warm cache: NIS 131.5/138.2 ms with it vs 139/137 ms with `XDNA_ENABLE_PATCH_CONV=0`. Without conv3x3w (no IRON, the only case where it runs): 198.7/200.0 ms with it vs 190.7/190.9 ms with no NPU conv at all, i.e. it is now slower than the CPU conv (the 517 vs 710 ms README number predates the CPU-side fixes) | REMOVE |
-| Full-frame legacy fwd (`fullframe_conv_runtime_slot`, fwd292 / fwd584) | B4, 256->128 @ 292x282 and 584x564 | **Yes** (lab02 seg full) | `fullframe_strix_b4_m96` | core | README: 0.200 -> 0.2038 it/s with the q4 family; `XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_CONV=0`: +7 % step time here | KEEP |
+| conv3x3w fwd + dX (`_designs/conv3x3w.py`) | 3x3/s1/p1, any batch/H/C, W tiled to <= 34 columns; cost model | **Yes**, all of style-transfer (upconv2/upconv1/conv11 fwd+dX), segmentation and style patch, all inference | built on demand into `~/.cache/torch-xdna2/conv3x3w/<hash>` (needs IRON python or a warm cache) | core | `OPTIMIZATION_LOG.md` (166 -> ~129 ms/step), `style_round4_ac.json`, tests | KEEP |
+| conv3x3w_dw (NPU dW, deferred) | dW >= 1 GMAC | **Yes** (style-transfer: 256->128 @18/36, 195->64) | same cache | core | log: 171 -> 148 ms, bfp16 gate | KEEP |
+| Patch conv (`conv_runtime_slot`, `XdnaConvRuntime`, 9e1a5de:1501-1950, 4884-4898, 5155-5165) | B40, 256->128, 18x18 and 36x36 only | **No**: shadowed by conv3x3w (`try_forward`/`plan` are tried first). 0 hits in style-transfer, segmentation and style patch, style7 | `conv3x3_patch40_128` (1.1 MB) | dead at default | Warm cache: style-transfer 131.5/138.2 ms with it vs 139/137 ms with `XDNA_ENABLE_PATCH_CONV=0`. Without conv3x3w (no IRON, the only case where it runs): 198.7/200.0 ms with it vs 190.7/190.9 ms with no NPU conv at all, i.e. it is now slower than the CPU conv (the 517 vs 710 ms README number predates the CPU-side fixes) | REMOVE |
+| Full-frame legacy fwd (`fullframe_conv_runtime_slot`, fwd292 / fwd584) | B4, 256->128 @ 292x282 and 584x564 | **Yes** (segmentation full-frame) | `fullframe_strix_b4_m96` | core | README: 0.200 -> 0.2038 it/s with the q4 family; `XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_CONV=0`: +7 % step time here | KEEP |
 | Full-frame legacy res146 / dX292 / dX584 streams (same runtime) | B4, 128->128 @146x141 fwd, dX @292/584 | **No**: the q4-resident family below is tried before them for exactly the same shapes | same dir (res146.bin, dx292.bin, dx584s73.bin, ~5.7 MB; allocates ~150 MB of staging BOs) | superseded | README: legacy 0.2008 vs q4 resident 0.2038 it/s; counters: all dX / res146 calls go to `fast_dx584` | REMOVE |
 | Fast full-frame (q4 resident; `fast_dx584_runtime_slot`) | B4: res146 fwd, dX 292 and 584 stripes | **Yes** | `fullframe_q4_resident_k1152_m96` | core | README ABBA +2.8 %; `XDNA_ENABLE_FAST_FULLFRAME=0`: +7 % step time | KEEP-BUT-DOCUMENT (kill switch) |
 | `configure_fast_dx584` (single-stream variant of the above) | dX584 only | No: only chosen when the fast artifact dir has no `res146.bin`; the bundled one has | none | dead | -- | REMOVE |
 | Fast conv11 dX (`fast_conv11_runtime_slot`) | B4, 195->64 @ 584x564 dX | **Yes** | `conv11_dx_q4_resident_k576_m96` | core | README +3.6 %; `XDNA_ENABLE_FAST_CONV11=0`: +7 % step time | KEEP-BUT-DOCUMENT (kill switch) |
 | Full-frame dW (`XdnaFullFrameDwRuntime`, 9e1a5de:3611-3809, 5187-5199, 5466-5469) | B4, 256->128 @ 584x564 | No: needs `XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_DW=1` **and** `_artifacts/fullframe_dw_unbundled`, which does not exist in the repo | missing | dead | initial commit only, no measurement anywhere | REMOVE |
-| GEMM family (`gemm_runtime_slot`, `mm_xdna`) | `mm` of exactly 256x768x3072, 256x3072x768, 3072x256x768, bf16 contiguous | Only for those shapes (none of the NIS/lab/zoo workloads) | `train_gemm_64x32x96` | core (narrow) | micro-benchmark here: 0.64 vs 0.87 ms (fwd), 0.61 vs 0.70 (dX), 0.95 vs 0.85 (dW, with readback); `tests/run_gemm_safety.py`, `test_device_physical.py` | KEEP-BUT-DOCUMENT |
+| GEMM family (`gemm_runtime_slot`, `mm_xdna`) | `mm` of exactly 256x768x3072, 256x3072x768, 3072x256x768, bf16 contiguous | Only for those shapes (none of the style-transfer/lab/zoo workloads) | `train_gemm_64x32x96` | core (narrow) | micro-benchmark here: 0.64 vs 0.87 ms (fwd), 0.61 vs 0.70 (dX), 0.95 vs 0.85 (dW, with readback); `tests/run_gemm_safety.py`, `test_device_physical.py` | KEEP-BUT-DOCUMENT |
 | Fused cat2 + upsample2 fwd (`forward_cat2_upsample2`) | B4 full-frame decoder, only when `XDNA_LAZY_DECODER_VALUES=1` produced a virtual value | No (opt-in) | uses the legacy full-frame stream | experiment | see lazy decoder values | REMOVE |
 | CPU islands (`cpu_islands.py`) | `lstm.input`, `gru.input` | Yes | -- | core | log: LSTM 48 -> 18.5-20.8 ms | KEEP |
 | Step autotuner / `npu_mode` 2-1-0 | whole model | Yes | -- | core | log: UNet 67 -> 54 ms | KEEP |
@@ -64,14 +64,14 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 | `XDNA_BO_ARENA_MB` | 0 (off) | carve tensors from large sub-buffer arenas | cpp:231, 253-307 | experiment | `docs/xdna-device-architecture.md` "Rejected experiment: one large XRT sub-buffer arena": 0.09805 vs 0.10194 it/s; README design rule says not to do it | REMOVE | removed |
 | `XDNA_TENSOR_BO_FLAG` | host_only | BO flag for tensor storage: host_only / cacheable / normal | cpp:194 | experiment | nothing records a benefit; docs say the other flags fail mmap or break coherency assumptions (flush logic assumes host-only BOs) | REMOVE | removed |
 | `XDNA_HOST_THREADS` | follow caller | pin the intra-op width of host compute | cpp:144 | tuning | log: 6 ~ 10, 20 is 2x worse | KEEP-BUT-DOCUMENT | kept |
-| `XDNA_CONV_PACK_THREADS` | 12 | OpenMP width of full-frame pack/unpack (read 4x) | cpp:1669,3093,3151,3652 | tuning | AGENTS.md (4 under load) | MERGE/SIMPLIFY (one helper) | merged |
+| `XDNA_CONV_PACK_THREADS` | 12 | OpenMP width of full-frame pack/unpack (read 4x) | cpp:1669,3093,3151,3652 | tuning | project notes (4 under load) | MERGE/SIMPLIFY (one helper) | merged |
 | `XDNA_IRON_PYTHON` | auto-detect | python of the mlir-aie env; empty disables on-demand builds | device.py:113 | core config | README | KEEP | kept |
 | `XDNA_CONV3X3W_DIR`, `XDNA_CONV3X3W_DW_DIR` (name built as `XDNA_{NAME}_DIR`) | cache dir | directory with xclbin + streams | device.py:152 | debug | used when testing other builds | KEEP-BUT-DOCUMENT | kept |
 | `XDNA_CONV3X3W_MIN_MACS`, `XDNA_CONV3X3W_DW_MIN_MACS` (built as `XDNA_{NAME}_MIN_MACS`) | 20e6 / 3e9 | size floor | device.py:153 | tuning | README; tests set 0 | KEEP | kept |
 | `XDNA_CONV3X3W_SYNC_BUILD` | 0 | build streams before the first call | device.py:153 | debug | README, tests | KEEP | kept |
 | `XDNA_CONV3X3W` | 1 | `0` disables the family | device.py:219 | debug | README, `quick_check`, sweep | KEEP | kept |
 | `XDNA_CONV3X3W_DW` | 1 | `0` keeps every dW on the CPU | device.py:228 | debug | README | KEEP | kept |
-| `XDNA_ASYNC_DW` | 1 | `0` starts deferred NPU dW only at the first reader; `1` starts them on a helper thread after the K-th dX call once two steps agree on K (`xdna_train.async_dw_stats()`) | -- | core | NIS step 122.6 -> 110.5 ms (ABBA, AC, 2026-10-13); tests/run_async_dw.py | KEEP | new |
+| `XDNA_ASYNC_DW` | 1 | `0` starts deferred NPU dW only at the first reader; `1` starts them on a helper thread after the K-th dX call once two steps agree on K (`xdna_train.async_dw_stats()`) | -- | core | style-transfer step 122.6 -> 110.5 ms (ABBA, AC, 2026-10-13); tests/run_async_dw.py | KEEP | new |
 | `XDNA_CONV3X3W_FORCE` | 0 | bypass the cost model | device.py:222; cpp:2309 | debug | tests | KEEP | kept |
 | `XDNA_CONV3X3W_NPU_OVERHEAD_MS`, `_NPU_GMACS`, `_HOST_GBS`, `_CPU_GMACS`, `_MARGIN` | 0.5, 5.5, 20, 0.9, 0.8 | cost-model constants | cpp:2313-2326 | tuning | log (cost model rows), `run_conv3x3w_costmodel.py` | KEEP | kept |
 | `XDNA_CONV3X3W_PIECES` | auto (1/2/4) | pipelined piece count | cpp:2484 | tuning | log: pipelined dispatch 147 -> 129 ms | KEEP-BUT-DOCUMENT | kept |
@@ -79,7 +79,7 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 | `XDNA_CONV3X3W_WEIGHT_CACHE` | 1 | `0` disables the weight cache | cpp:2413 | debug | `tests/run_conv3x3w_torch.py` | KEEP | kept |
 | `XDNA_ENABLE_PATCH_CONV` | 1 | register the patch conv family | device.py:207 | dead at default | see family table | REMOVE | removed |
 | `XDNA_PATCH_CONV_ARTIFACT_DIR` | bundled | alternative artifact dir | device.py:202 | dead | -- | REMOVE | removed |
-| `XDNA_CONV_OUTPUT_NCHW` | 1 | patch conv only: `0` returns the raw [Y,X,B,C] layout | cpp:1908 | dead (patch conv only) | AGENTS.md: NCHW is +15 % (598 -> 510 ms) | REMOVE | removed |
+| `XDNA_CONV_OUTPUT_NCHW` | 1 | patch conv only: `0` returns the raw [Y,X,B,C] layout | cpp:1908 | dead (patch conv only) | project notes: NCHW is +15 % (598 -> 510 ms) | REMOVE | removed |
 | `XDNA_ENABLE_EXPERIMENTAL_FULLFRAME_CONV` | 1 | `0` disables the legacy full-frame fwd streams | device.py:239 | debug (misnamed "experimental") | README; `=0`: +7 % here | KEEP-BUT-DOCUMENT | kept |
 | `XDNA_FULLFRAME_ARTIFACT_DIR` | bundled | alternative artifact dir | device.py:234 | debug | used to try new kernels | KEEP-BUT-DOCUMENT | kept |
 | `XDNA_ENABLE_FAST_FULLFRAME` | 1 | `0` disables the q4 resident family | device.py:280 | debug | README, `=0`: +7 % | KEEP-BUT-DOCUMENT | kept |
@@ -95,7 +95,7 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 | `XDNA_CPU_ISLANDS` | 1 | LSTM/GRU as oneDNN CPU kernels | device.py:371; cpu_islands.py:113 | core/debug | log: 48 -> 19 ms | KEEP | kept |
 | `XDNA_CPU_DW_BATCH_CHUNK` | 1 for B4, else 0 | split CPU dW by batch chunk | cpp:5382 | tuning | README: +2.4 % ABBA; here `=0`: +4.5 % step time; `test_device_physical.py` | KEEP-BUT-DOCUMENT | kept |
 | `XDNA_DISABLE_CPU_DW_OVERLAP` | 0 | `1` runs CPU dW after NPU dX | cpp:5218 | debug (A/B control of a core feature) | plan doc: 0.1218 -> 0.1315 it/s; here `=1`: +30 % | KEEP-BUT-DOCUMENT | kept |
-| `XDNA_DEFER_CPU_DW` | 0 | queue CPU dW on a worker, return gradient storage immediately | cpp:5222 | experiment | `fullframe-conv-backward-plan.md` "Rejected experiment": 0.1117 vs 0.1377 it/s; log: "unproven", net 0-3 ms on NIS; here +50 % step time | REMOVE | removed |
+| `XDNA_DEFER_CPU_DW` | 0 | queue CPU dW on a worker, return gradient storage immediately | cpp:5222 | experiment | `fullframe-conv-backward-plan.md` "Rejected experiment": 0.1117 vs 0.1377 it/s; log: "unproven", net 0-3 ms on style-transfer; here +50 % step time | REMOVE | removed |
 | `XDNA_DEFER_CPU_DW_WINDOW` | 2 | queue depth of the worker | cpp:568 | experiment | same (window=1 also lost) | REMOVE | removed |
 | `XDNA_HOLD_CPU_DW` | 1 (only matters with DEFER) | hold queued CPU dW until the NPU dW starts | cpp:582 | experiment | log only | REMOVE | removed |
 | `XDNA_LAZY_DECODER_VALUES` | 0 | keep cat/upsample results virtual and fuse them into the next conv | cpp:1013,4176 | experiment | README: "gain smaller and more variable"; here `=1`: 3762/4245 vs 3660/4159 ms (+2 %, i.e. no gain); source of the recent set_(Storage)/view audit bugs | REMOVE | removed |
@@ -121,19 +121,19 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 ## 4. Evidence and method
 
 * Reachability: temporary counters on every conv dispatch decision, run with
-  `XDNA_NPU_MODE=2 XDNA_PROFILE_MAPPED_CPU=1` on NIS (`nis_phases.py`, N=20), and on
-  `nis_labs.py` `lab02_seg_patch`, `lab02_style`, `lab04_style7`, `lab02_seg_full`,
-  `lab02_seg_infer`, `lab02_style_infer`. conv3x3w took every B40 and every B1 inference
+  `XDNA_NPU_MODE=2 XDNA_PROFILE_MAPPED_CPU=1` on style-transfer (`style_phases.py`, N=20), and on
+  `style_labs.py` `seg_patch`, `style`, `style7`, `seg_full`,
+  `seg_infer`, `style_infer`. conv3x3w took every B40 and every B1 inference
   conv that is NPU-eligible; the patch family took none. The full-frame workload used
   `fast_full` (res146 fwd), `full` (fwd292/584), `fast_dx584` (all dX of 146/292/584) and
   `fast_conv11`. VGG convs, 3->64, 64->1 and the 9x9 resnet convs stay on the CPU (cost model).
-* Toggle A/B on `lab02_seg_full` (B4 584x564, `XDNA_NPU_MODE=2`), ABBA over nine
+* Toggle A/B on `seg_full` (B4 584x564, `XDNA_NPU_MODE=2`), ABBA over nine
   configurations (18 runs). The machine switched from battery to AC power during the
   series and run-to-run drift was ~14 % (default: 3660 ms first, 4159 ms last), so only
   gaps larger than that are meaningful: fast full-frame off +7 %, conv11 off +7 %,
   legacy full-frame off +7 %, CPU dW chunking off +4.5 %, CPU dW overlap off +30 %,
   deferred CPU dW +50 %, lazy values +2 % (noise), lazy values + lazy dW +8 %.
-* Patch conv scenarios (`nis_phases.py`, N=40, `XDNA_NPU_MODE=2`, AC, ABBA): see the
+* Patch conv scenarios (`style_phases.py`, N=40, `XDNA_NPU_MODE=2`, AC, ABBA): see the
   family table.
 * GEMM micro-benchmark: `mm` of the three shapes, NPU vs CPU bf16, 60 samples each.
 * History: `git log -S<name>`: all removed experiments except `HOLD_CPU_DW` come from the

@@ -5,7 +5,7 @@ Regression for: complex matmul gradients lost their conjugation (the CPU alias o
 an XDNA tensor dropped the lazy-conjugate flag), and any op on a conj / neg view
 crashed the process.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import sys
 

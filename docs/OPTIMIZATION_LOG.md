@@ -1,10 +1,10 @@
 # Optimization log: what was tried, what was kept, what was rejected
 
-Target: `lab02_cnn/style_transfer.py` (B40, 36x36, MyNet(3,3,5) + VGG19 perceptual loss) on
+Target: `the style-transfer training script` (B40, 36x36, StyleNet(3,3,5) + VGG19 perceptual loss) on
 the XDNA2 NPU, compared against **CPU BF16** (not FP32). Laptop, run-to-run noise ±5-8 %,
-so decisions need >= 2 ABBA rounds (`benchmarks/nis_style_transfer.py --quick --rounds 2`).
+so decisions need >= 2 ABBA rounds (`benchmarks/style_app.py --quick --rounds 2`).
 **Benchmark only on AC power**: on battery the CPU drops to ~1-2 GHz and CPU-bf16 became
-842 ms/step instead of ~172 (`benchmarks/results/nis_ab_battery_invalid_2026-10-10.json`).
+842 ms/step instead of ~172 (`benchmarks/results/style_ab_battery_invalid_2026-10-10.json`).
 
 Evidence column: file in `benchmarks/results/`, test in `tests/`, or a debug flag you can rerun.
 
@@ -12,11 +12,11 @@ Evidence column: file in `benchmarks/results/`, test in `tests/`, or a debug fla
 
 | Stage | CPU | XDNA | Speed-up | Evidence |
 |---|---|---|---|---|
-| Starting point (old conv path) | ~233 | ~519 | 0.45x | AGENTS.md "Verified" |
-| conv3x3w fwd + dX | 171 | ~166 | 1.03x | `nis_conv3x3w_ac.json` |
-| + NPU dW (bfp16) | 171.4 | 147.7 | 1.16x | `nis_conv3x3w_dw_ac.json` |
-| + cost model, packed-input reuse, fast cat/upsample | 175.6 | 147.2 | 1.19x | `nis_round3_ac.json` |
-| + pipelined piecewise dispatch | 171.8 | 128.8 | **1.33x** | `nis_round4_ac.json` |
+| Starting point (old conv path) | ~233 | ~519 | 0.45x | project notes "Verified" |
+| conv3x3w fwd + dX | 171 | ~166 | 1.03x | `style_conv3x3w_ac.json` |
+| + NPU dW (bfp16) | 171.4 | 147.7 | 1.16x | `style_conv3x3w_dw_ac.json` |
+| + cost model, packed-input reuse, fast cat/upsample | 175.6 | 147.2 | 1.19x | `style_round3_ac.json` |
+| + pipelined piecewise dispatch | 171.8 | 128.8 | **1.33x** | `style_round4_ac.json` |
 
 ## Kept (with proof)
 
@@ -29,7 +29,7 @@ Evidence column: file in `benchmarks/results/`, test in `tests/`, or a debug fla
 | Cost model (padded MACs/5.5e9 + 0.15 ms + bytes/20e6 vs real MACs/0.9e9) | RGB 3-channel convs were 5x slower on NPU (padding) | `tests/run_conv3x3w_costmodel.py` |
 | dW reuses forward/dX packed inputs | Saves ~6.4 ms/step of repacking | phase profile (`XDNA_PROFILE_MAPPED_CPU=1`) |
 | Fast `cat` / `upsample_nearest2d` (+backward) | upsample 5.6 -> 1.2 ms/step | `tests/run_fast_layout_ops.py` |
-| Pipelined piecewise dispatch (<= 4 pieces, device sub-buffers, async start) | Host pack of piece i+1 / unpack of i-1 overlap NPU piece i | `nis_round4_ac.json` |
+| Pipelined piecewise dispatch (<= 4 pieces, device sub-buffers, async start) | Host pack of piece i+1 / unpack of i-1 overlap NPU piece i | `style_round4_ac.json` |
 | Dedicated, flushed NPU output buffers | NPU DMA is not cache coherent; dirty CPU lines in recycled buffers were written back over NPU results (1-70 % wrong first dW) | bug reproduced then fixed; research note |
 | `posix_spawn` for compiler launches | `fork`/`std::system` marks pinned DMA pages copy-on-write | research note |
 | SSE 8x8 transposes in pack/unpack | Fewer instructions; bit-exact | `tests/run_conv3x3w_pack.py` (pack 1.36 -> 1.33 ms standalone, unpack 0.42 -> 0.32 ms; in-situ pack 7.2 -> 6.2 ms/step, unpack unchanged) |
@@ -48,10 +48,10 @@ Evidence column: file in `benchmarks/results/`, test in `tests/`, or a debug fla
 | More host threads for pack/unpack | Rejected | `XDNA_HOST_THREADS=20`: 288 ms/step; 6 ≈ 10 |
 | `xrt::runlist` batching | Deferred | Open reliability reports (research note); dispatch overhead is ~0.15 ms |
 | 10 resnet 9x9 convs: dedicated handling | Break-even only | Trace: 0.49 ms total per op, 0.32 ms NPU wait, ~0.15 ms compute; CPU 0.48 ms |
-| Fixed-shape patch conv family (B40 256->128 @ 18/36, `XDNA_ENABLE_PATCH_CONV`) | **Removed** (see `MODES_AUDIT.md`): shadowed by conv3x3w; as the only NPU conv family it ran NIS at 199 ms vs 191 ms with no NPU conv | `ab_patch` runs in `MODES_AUDIT.md` |
+| Fixed-shape patch conv family (B40 256->128 @ 18/36, `XDNA_ENABLE_PATCH_CONV`) | **Removed** (see `MODES_AUDIT.md`): shadowed by conv3x3w; as the only NPU conv family it ran style-transfer at 199 ms vs 191 ms with no NPU conv | `ab_patch` runs in `MODES_AUDIT.md` |
 | `XDNA_BO_ARENA_MB` sub-buffer arena | **Removed**: 0.09805 vs 0.10194 it/s | `docs/xdna-device-architecture.md` |
-| `XDNA_LAZY_DECODER_VALUES` / `_DW` (virtual cat + upsample fed to the next conv) | **Removed**: no gain on `lab02_seg_full` (+2 % / +8 % step time, noise-level), large correctness surface | `MODES_AUDIT.md` |
-| `XDNA_DEFER_CPU_DW=1` (CPU dW queued on a worker, held until NPU dW starts) | **Removed** (see `MODES_AUDIT.md`): full-frame ABBA 0.1117 vs 0.1377 it/s, +50 % step time on `lab02_seg_full`; NIS phase timing was bwd 63 -> 56 ms but fwd +3 and opt +1.5 ms, net 0-3 ms, within noise |
+| `XDNA_LAZY_DECODER_VALUES` / `_DW` (virtual cat + upsample fed to the next conv) | **Removed**: no gain on `seg_full` (+2 % / +8 % step time, noise-level), large correctness surface | `MODES_AUDIT.md` |
+| `XDNA_DEFER_CPU_DW=1` (CPU dW queued on a worker, held until NPU dW starts) | **Removed** (see `MODES_AUDIT.md`): full-frame ABBA 0.1117 vs 0.1377 it/s, +50 % step time on `seg_full`; style-transfer phase timing was bwd 63 -> 56 ms but fwd +3 and opt +1.5 ms, net 0-3 ms, within noise |
 
 ## Hang / correctness root causes (do not repeat)
 
@@ -73,7 +73,7 @@ upsample, mul) ~25-30 ms. Profile is flat; remaining wins are each 1-3 %.
 - Older NPU conv families still write outputs into recycled allocator memory (same coherency bug risk).
 - `w.data.add_` does not bump the version counter (weight cache may go stale; optimizers are fine).
 - Global `set_swap_module_params_on_conversion(True)` breaks LSTM `load_state_dict`; LSTM cell unoptimized (0.29x in model zoo).
-- NIS venv still imports the old installed package; reinstall needs user approval.
+- project venv still imports the old installed package; reinstall needs user approval.
 - Re-run `benchmarks/model_zoo.py` for regressions with the new conv paths.
 
 ## Generalization work (2026-10-10, branch `conv3x3w-tiling`)
@@ -103,14 +103,14 @@ upsample, mul) ~25-30 ms. Profile is flat; remaining wins are each 1-3 %.
 
 ## Universality round (2026-10-12): every model at least as fast as CPU BF16
 
-Starting point (`zoo_round3_ac.json`, CPU first then XDNA): geomean **0.68x**, with only NIS
+Starting point (`zoo_round3_ac.json`, CPU first then XDNA): geomean **0.68x**, with only style-transfer
 (1.59x) and the transformer (1.09x) faster than CPU, and the MLP at 0.33x and the LSTM at
 0.26x. The losses came almost entirely from the host side, not from the NPU.
 
 | Change | Why it works | Proof |
 |---|---|---|
-| Backward on the calling thread (`torch.autograd.set_multithreading_enabled(False)` in `register_xdna_device`) | PyTorch runs a non-CPU device's backward on its own worker thread with its own OpenMP pool; the forward pool's spinning threads compete with it | `a*2 .sum() .backward()` 131 -> 46 us (CPU 43); MLP 8.0 -> 3.8 ms (CPU 3.8), embedding 11.3 -> 5.9 (5.3), mobilenet 60 -> 49; NIS proxy neutral (95-100 ms both) |
-| Step autotuner (`device._StepAutotuner`, global optimizer step hook) | Per-op cost models cannot see per-step costs: NPU dW lives in a second xclbin, 2 x ~2.6 ms switches per step. UNet: 67-74 ms with NPU convs, 56-59 without NPU dW, 51-53 CPU only (CPU 56) | UNet picks CPU only (53.8 ms); NIS picks all NPU (2 of 2 runs, `nis_round5_ac.json` style runs: 122.5 / 123.2 ms vs 125.5 / 127.2 old behaviour) |
+| Backward on the calling thread (`torch.autograd.set_multithreading_enabled(False)` in `register_xdna_device`) | PyTorch runs a non-CPU device's backward on its own worker thread with its own OpenMP pool; the forward pool's spinning threads compete with it | `a*2 .sum() .backward()` 131 -> 46 us (CPU 43); MLP 8.0 -> 3.8 ms (CPU 3.8), embedding 11.3 -> 5.9 (5.3), mobilenet 60 -> 49; style-transfer proxy neutral (95-100 ms both) |
+| Step autotuner (`device._StepAutotuner`, global optimizer step hook) | Per-op cost models cannot see per-step costs: NPU dW lives in a second xclbin, 2 x ~2.6 ms switches per step. UNet: 67-74 ms with NPU convs, 56-59 without NPU dW, 51-53 CPU only (CPU 56) | UNet picks CPU only (53.8 ms); style-transfer picks all NPU (2 of 2 runs, `style_round5_ac.json` style runs: 122.5 / 123.2 ms vs 125.5 / 127.2 old behaviour) |
 | ABBA order inside the tuner | First version measured modes in a fixed order; the mode measured last looked 30 % slower (resnet18 CPU-only 65 ms vs 47-54 in fixed-mode runs) | fixed-mode A/B runs |
 | CPU islands for `aten::lstm.input` / `gru.input` (`xdna_train/cpu_islands.py`) | CPU picks the fused oneDNN RNN only for CPU tensors; on XDNA the op decomposed into ~5000 per-timestep ops per step | `tests/run_cpu_islands.py` (bit-identical outputs and all gradients vs CPU); LSTM 48 -> 18.5-20.8 ms (CPU 17.2-18.3) |
 | Fused optimizer default (`_prefer_fused_optimizer`) | PyTorch defaults PrivateUse1 optimizers to `foreach` (~10 CPU-fallback list ops per step); the fused kernel runs through the zero-copy fallback | MLP 3.7-4.2 -> 2.9-3.5 ms; transformer fused 75-80 vs 78-100 ms |
@@ -122,7 +122,7 @@ Measured and not adopted:
 |---|---|---|
 | `OMP_WAIT_POLICY=PASSIVE` instead of the thread fix | Rejected: slows the CPU itself | LSTM CPU 19.7 -> 31.8 ms, `a*2` bwd CPU 43 -> 103 us |
 | Better per-op NPU rate in the cost model for 1-chunk (Cin <= 64) convs | Not the UNet problem | standalone NPU rate 3.8 GMAC/ms at 1 chunk vs 4.6-7.7 at 2-4 chunks (`rate.py`, B16 32x32, 10 groups); UNet's dX waited 3.3 ms in situ vs ~0.9 ms standalone = context switch |
-| Channels-last for the CPU baseline | Note, not a backend change | CPU BF16 with `channels_last`: UNet 57 -> 49, resnet18 53 -> 47, NIS proxy 155 -> 133 ms. XDNA's CPU conv fallback already gets this (UNet NPU-off 49.6 ms with a contiguous model) |
+| Channels-last for the CPU baseline | Note, not a backend change | CPU BF16 with `channels_last`: UNet 57 -> 49, resnet18 53 -> 47, style-transfer proxy 155 -> 133 ms. XDNA's CPU conv fallback already gets this (UNet NPU-off 49.6 ms with a contiguous model) |
 
 ### What the documentation offers for small shapes (not yet implemented)
 
@@ -152,9 +152,9 @@ Candidates still on the slow path: `nn.MultiheadAttention`'s fused CPU path
 
 **Result** (`benchmarks/results/zoo_round5_ac.json`, ABBA, 2 rounds, AC): geomean **1.24x**, every model
 >= 1.04x: resnet18 1.14, mobilenet_v3 1.04, unet 1.13, transformer 1.05, mlp 1.16, lstm 1.21,
-conv1d_audio 1.18, conv_autoencoder 1.20, embedding 1.78, nis_mynet 1.72. First losses are identical
-to CPU. Last losses can drift slightly because the fused optimizer rounds differently in bf16 (NIS proxy after 34
-steps: 0.5195 CPU vs 0.5625 XDNA, within the zoo's 10 % check). The real NIS script: 122.5-123.2 ms/step
+conv1d_audio 1.18, conv_autoencoder 1.20, embedding 1.78, style_net 1.72. First losses are identical
+to CPU. Last losses can drift slightly because the fused optimizer rounds differently in bf16 (style-transfer proxy after 34
+steps: 0.5195 CPU vs 0.5625 XDNA, within the zoo's 10 % check). The real style-transfer script: 122.5-123.2 ms/step
 vs CPU BF16 184 ms.
 
 ## 2026-10-12: modes cleanup (removals)
@@ -172,7 +172,7 @@ Each removal is its own commit on the pruning branch (`9e1a5de..HEAD`):
 
 ## 2026-10-13: early start of the NPU weight gradients
 
-Timeline. In the profiled NIS step (126 ms) the last NPU dX call ends at 81 ms. The
+Timeline. In the profiled style-transfer step (126 ms) the last NPU dX call ends at 81 ms. The
 CPU then works alone for 31 ms (five 9x9 residual blocks and the encoder convolutions)
 while the NPU idles. The six dW passes (11.9 ms) started only at the optimizer, at 112 ms.
 
@@ -184,7 +184,7 @@ job itself if the helper has not started it. The first two steps, and models who
 count per step is unstable, keep the lazy behaviour. `XDNA_ASYNC_DW=0` turns the feature
 off. The default is on.
 
-Measurement. Ryzen AI 9 365 on AC power. NIS style-transfer training step: MyNet(3,3,5),
+Measurement. Ryzen AI 9 365 on AC power. style-transfer training step: StyleNet(3,3,5),
 batch 40, 36x36, BF16, Adam, 10 CPU threads. Four runs per setting, in ABBA order, on the
 same tree. Both settings give the same loss (22.9).
 

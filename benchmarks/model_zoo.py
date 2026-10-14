@@ -11,9 +11,7 @@ this whole matrix, not on one network.
     python benchmarks/model_zoo.py --models resnet18,lstm --steps 10
     python benchmarks/model_zoo.py --xdna-only --rounds 2   # A/B of an XDNA setting
 
-The nis_mynet model needs the NIS coursework code: set NIS_ROOT to the NIS
-lab02_cnn directory.  Without NIS_ROOT it is left out of the default model
-list and skipped if named explicitly with --models.
+The style_net model is benchmarks/style_net.py (an image-to-image generator).
 """
 from __future__ import annotations
 
@@ -163,19 +161,11 @@ def _embedding():
                                    torch.randint(0, 20, (128,), generator=g)), F.cross_entropy
 
 
-NIS_ROOT = os.environ.get("NIS_ROOT", "")
-NIS_SKIP_MSG = "nis_mynet skipped: set NIS_ROOT to the NIS lab02_cnn directory"
-
-
-def _nis_available() -> bool:
-    return bool(NIS_ROOT) and os.path.isdir(NIS_ROOT)
-
-
-def _nis_mynet():
-    sys.path.insert(0, NIS_ROOT)
-    from models import MyNet
-    return MyNet(3, 3, 5), lambda g: (torch.randn(40, 3, 36, 36, generator=g),
-                                      torch.rand(40, 3, 36, 36, generator=g)), F.l1_loss
+def _style_net():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from style_net import StyleNet
+    return StyleNet(3, 3, 5), lambda g: (torch.randn(40, 3, 36, 36, generator=g),
+                                         torch.rand(40, 3, 36, 36, generator=g)), F.l1_loss
 
 
 MODELS = {
@@ -190,7 +180,7 @@ MODELS = {
     "conv1d_audio": _conv1d_audio,
     "conv_autoencoder": _conv_autoencoder,
     "embedding": _embedding,
-    "nis_mynet": _nis_mynet,
+    "style_net": _style_net,
 }
 
 
@@ -257,8 +247,7 @@ def _combine(results: list[dict]) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", default=None,
-                    help="comma-separated model names (default: all, except nis_mynet "
-                         "unless NIS_ROOT is set)")
+                    help="comma-separated model names (default: all)")
     ap.add_argument("--steps", type=int, default=10)
     # 24 warmup steps on both devices: the XDNA step autotuner (device.py) needs
     # ~21 steps to pick its NPU mode, like cudnn.benchmark.
@@ -282,19 +271,13 @@ def main() -> None:
         print("ZOO_RESULT=" + json.dumps(res), flush=True)
         return
 
-    nis_ok = _nis_available()
     if args.models is None:
-        names = [m for m in MODELS if m != "nis_mynet" or nis_ok]
-        if not nis_ok:
-            print(NIS_SKIP_MSG, flush=True)
+        names = list(MODELS)
     else:
         names = args.models.split(",")
     rows = []
     print(f"{'model':18s} {'cpu ms':>9s} {'xdna ms':>9s} {'speedup':>8s}  {'loss cpu→xdna (first / last)':34s} status")
     for name in names:
-        if name == "nis_mynet" and not nis_ok:
-            print(NIS_SKIP_MSG, flush=True)
-            continue
         runs = {"cpu": [], "xdna": []}
         for r in range(args.rounds):
             for dev in (("cpu", "xdna") if r % 2 == 0 else ("xdna", "cpu")):

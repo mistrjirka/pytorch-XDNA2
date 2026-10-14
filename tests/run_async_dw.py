@@ -16,7 +16,7 @@ The result must not depend on that:
 
 The parent process never touches the NPU (quick_check already holds it and a
 third process would exhaust the hardware contexts); every run is a child.
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import os
 import subprocess

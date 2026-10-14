@@ -2,7 +2,7 @@
 """Tensor semantics: XDNA must behave like CPU for autograd version checks in CPU
 islands (LSTM/GRU), resize_/set_ metadata, out= resizing and out= overlap.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import warnings
 

@@ -7,7 +7,7 @@ with a UserWarning ("An output with one or more elements was resized ...").
 CPU users never see it.  Every loss below must produce the same number of
 warnings on XDNA as on the CPU (none), and the same values and gradients.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import os
 import sys

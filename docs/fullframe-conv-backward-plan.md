@@ -2,7 +2,7 @@
 
 ## Goal
 
-Accelerate the actual NIS full-frame training workload, not proxy patch geometry.
+Accelerate the actual style-transfer full-frame training workload, not proxy patch geometry.
 The target call is ordinary PyTorch:
 
     model.to("xdna")
@@ -126,7 +126,7 @@ synchronization) improved from ~1.55 s serial to ~1.04 s overlapped, with the
 same BF16 numerical error as the serial path. This is close to the expected
 `max(NPU dX, CPU dW)` bound.
 
-Unprofiled exact NIS epoch ABBA-style results on the performance profile:
+Unprofiled exact style-transfer epoch ABBA-style results on the performance profile:
 
 - serial XDNA: 0.121792 and 0.123024 it/s;
 - overlapped XDNA: 0.131510 and 0.131079 it/s;

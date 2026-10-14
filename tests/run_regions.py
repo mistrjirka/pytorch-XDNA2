@@ -8,7 +8,7 @@ eager bf16 path (times 1.5 plus a small floor), and close to the eager result.
 Also checks the max-pool/ReLU kernels bit-exactly against torch, the fallbacks,
 and that backward can run twice (retain_graph).
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import sys
 

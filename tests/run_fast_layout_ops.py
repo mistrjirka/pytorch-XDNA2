@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fast cat / nearest-2x upsample (+backward) vs CPU ATen.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.  cat and upsample forward
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.  cat and upsample forward
 are pure copies: exact.  upsample backward sums each 2x2 block in fp32 in
 ATen's order (start at 0, raster order) and rounds once: bit-exact too.
 """

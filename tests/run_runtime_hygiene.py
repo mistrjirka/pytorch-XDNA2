@@ -3,7 +3,7 @@
 each op once (RNG and partial writes), out= resize still works, and removed
 env vars are reported instead of silently ignored.
 
-Run with the NIS venv python and PYTHONPATH=<repo>.
+Run with a Python with PyTorch 2.14 and PYTHONPATH=<repo>.
 """
 import json
 import os
