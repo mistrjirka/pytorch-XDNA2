@@ -86,11 +86,35 @@
       "expect": "pass",
       "min_npu_runs": 0
     },
+    "convnext_tiny/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "convnext_tiny/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
     "cumsum_state_scan/bf16": {
       "expect": "pass",
       "min_npu_runs": 0
     },
     "cumsum_state_scan/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "deeplabv3_mobilenet/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "deeplabv3_mobilenet/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "densenet121/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "densenet121/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -103,6 +127,14 @@
       "min_npu_runs": 0
     },
     "diffusion_norm_time/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "efficientnet_b0/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "efficientnet_b0/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -152,6 +184,14 @@
       "expect": "pass",
       "min_npu_runs": 0
     },
+    "fcn_resnet50/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "fcn_resnet50/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
     "fourier_operator_complex/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
@@ -165,6 +205,14 @@
       "min_npu_runs": 0
     },
     "gnn_index_add/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "googlenet/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "googlenet/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -240,6 +288,14 @@
       "expect": "pass",
       "min_npu_runs": 0
     },
+    "lraspp_mobilenet/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "lraspp_mobilenet/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
     "lstm_bidirectional/bf16": {
       "expect": "pass",
       "min_npu_runs": 0
@@ -248,11 +304,35 @@
       "expect": "pass",
       "min_npu_runs": 0
     },
+    "maxvit_t/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "maxvit_t/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "mc3_18_video/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "mc3_18_video/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
     "mlp_gelu/bf16": {
       "expect": "pass",
       "min_npu_runs": 0
     },
     "mlp_gelu/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "mnasnet0_5/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "mnasnet0_5/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -269,6 +349,22 @@
       "note": "Same near-zero pre-BN bias-gradient cancellation as the bf16 case (max_abs ~5e-5).",
       "stage": null,
       "status": "numeric_mismatch"
+    },
+    "mobilenet_v2/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "mobilenet_v2/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "mobilenet_v3_small/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "mobilenet_v3_small/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
     },
     "moe_top2_routing/bf16": {
       "expect": "pass",
@@ -318,11 +414,59 @@
       "expect": "pass",
       "min_npu_runs": 0
     },
+    "r2plus1d_18_video/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "r2plus1d_18_video/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "r3d_18_video/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "r3d_18_video/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "regnet_y_400mf/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "regnet_y_400mf/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
     "resize_bilinear/bf16": {
       "expect": "pass",
       "min_npu_runs": 0
     },
     "resize_bilinear/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "resnet18/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "resnet18/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "resnet50/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "resnet50/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "resnext50_32x4d/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "resnext50_32x4d/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -378,6 +522,14 @@
       "expect": "pass",
       "min_npu_runs": 0
     },
+    "shufflenet_v2_x1_0/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "shufflenet_v2_x1_0/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
     "sparse_graph_mm/bf16": {
       "expect": "known_failure",
       "issue": "XDNA-COV-3",
@@ -400,11 +552,27 @@
       "expect": "pass",
       "min_npu_runs": 0
     },
+    "squeezenet1_1/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "squeezenet1_1/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
     "ssm_selective_scan/bf16": {
       "expect": "pass",
       "min_npu_runs": 0
     },
     "ssm_selective_scan/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "swin_t/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "swin_t/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -432,6 +600,22 @@
       "expect": "pass",
       "min_npu_runs": 0
     },
+    "vgg11_bn/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "vgg11_bn/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "vit_b_16_small/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "vit_b_16_small/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
     "vit_encoder/bf16": {
       "expect": "pass",
       "min_npu_runs": 0
@@ -441,6 +625,14 @@
       "min_npu_runs": 0
     },
     "vmap_pointwise": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "wide_resnet50_2/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "wide_resnet50_2/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     }

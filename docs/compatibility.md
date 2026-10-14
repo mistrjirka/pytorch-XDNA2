@@ -120,6 +120,18 @@ XDNA 110 to 138 ms (about 1.7x) and XDNA with `fuse_perceptual_loss` 93 to 105 m
 `--autocast` (FP32 master weights) XDNA was 1.4x faster than CPU autocast. The spread comes from the laptop
 heating up between rounds; the gate defaults require 1.2x, 1.4x (fused) and 1.1x (autocast).
 
+## Standard architectures (torchvision)
+
+`tests/coverage/torchvision_models.py` runs one training step (train mode, random weights, small inputs,
+dropout and stochastic depth off) of 24 architectures on XDNA and compares output, input gradient and every
+parameter gradient with CPU: ResNet-18/50, Wide-ResNet-50, ResNeXt-50, VGG-11-BN, DenseNet-121, SqueezeNet,
+ShuffleNetV2, MobileNetV2/V3, MNASNet, EfficientNet-B0, RegNetY, ConvNeXt-T, GoogLeNet, a small ViT, Swin-T,
+MaxViT-T, DeepLabV3-MobileNet, FCN-ResNet50, LRASPP-MobileNet and the video models R3D-18, MC3-18 and R(2+1)D-18.
+All 48 runs (FP32 and BF16) pass. FP32 must match CPU to 0.5% on every gradient; BF16 is judged against an
+FP32 CPU reference (XDNA may be at most twice as far from it as CPU BF16 is, since BF16 gradients that are zero in
+exact arithmetic, such as a bias in front of a BatchNorm, hold only rounding noise). The inputs are small, so the
+cost model keeps these steps on the CPU: this is correctness coverage, not acceleration.
+
 ## Numerical qualifications
 
 Sparse tensors have no XDNA layout: sparse gradients and sparse graph products fail loudly (`Sparsexdna`). For recommenders, keep the table on the CPU with `xdna_train.cpu_sparse.CpuSparseEmbedding` / `CpuSparseEmbeddingBag` (sparse gradients, `SparseAdam`) and send only the looked-up rows to the XDNA model; `module.to("xdna")` leaves the table in place (`tests/run_cpu_sparse.py`). BF16 AvgPool3D, which PyTorch's own CPU backend lacks, is computed in FP32 and rounded on XDNA (`tests/run_avgpool3d.py`); the matrix keeps `conv3d_volume/bf16` as a known failure only because its CPU reference cannot run. Convolution-only BF16 3D and InstanceNorm3D probes passed.
