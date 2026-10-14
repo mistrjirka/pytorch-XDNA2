@@ -72,6 +72,20 @@ For an existing model, move its parameters and inputs to `xdna` and use BF16 for
 floating-point inputs. Keep class labels and token indices integer. The normal
 forward, loss, backward and optimizer calls remain the same.
 
+## Faster training with a perceptual loss (optional)
+
+If your loss runs a frozen VGG-style feature network (`Conv2d`/`ReLU`/`MaxPool2d` layers), one line
+fuses it on the CPU and removes about 13 ms from the NIS step (107 to 93 ms):
+
+```python
+from xdna_train import regions
+regions.fuse_perceptual_loss(loss_fn)   # loss_fn.perceptual_vgg.model.features / .feature_layers
+```
+
+The region is approximate BF16 arithmetic and falls back to your own loss method whenever its
+assumptions stop holding (trainable feature weights, other layer types, hooks, changed layers).
+Details and the exact module pattern are in [usage](docs/usage.md#fused-regions).
+
 ## Performance and limits
 
 The [recorded 12-workload benchmark](docs/performance.md) on Ryzen AI 9 365
@@ -79,11 +93,20 @@ measured **1.21x CPU BF16 throughput on average** (geometric mean), with individ
 results from 0.97x to 2.03x. It used AC power and 10 CPU threads (the PyTorch default on this machine). Gains include CPU
 execution improvements; they do not all come from NPU computation.
 
+On the style-transfer training step used in the benchmark (MyNet with a VGG19 perceptual loss, batch 40,
+36x36 patches, Adam) the backend runs about 9 it/s with no code changes, against 4.7 it/s on CPU BF16.
+The opt-in loss region below raises that to about 10.6 it/s.
+
 NPU acceleration covers selected BF16 3x3 convolutions and fixed matrix shapes.
 Small operations, attention, recurrent layers and most other matrix shapes use
 the CPU. Measure your own workload after compilation and warmup.
 
-- FP32 uses CPU paths. FP16 training and inference speed are not validated.
+- Supported scope: real-valued dense BF16 training with first-order gradients. FP32 uses CPU paths.
+  Sparse tensors and `torch.autocast("xdna")` are not implemented (they raise an error); FP16 is not validated.
+- Operands of NPU convolutions should be finite. NaN and Inf inputs give NaN outputs for the windows they touch
+  (CPU gives signed infinities for Inf).
+- Complex tensors run on the CPU. `x.conj()` returns a copy, not a view, on `xdna`.
+  See [compatibility](docs/compatibility.md) for what was tested.
 - General NPU convolutions use block floating-point arithmetic (BFP16), so results
   differ from CPU BF16. Check loss and gradients for your model.
 - Concurrent NPU processes can exhaust hardware contexts and fail to initialize.
@@ -96,6 +119,7 @@ When benchmarking, include `optimizer.step()` or explicitly read the gradients.
 ## Documentation and help
 
 - [Usage and troubleshooting](docs/usage.md): setup, CPU fallback, tuning and runtime behavior.
+- [Compatibility](docs/compatibility.md): tested network families, known gaps and numerical limits.
 - [Performance](docs/performance.md): all measurements, tested workloads and reproduction commands.
 - [Development](docs/development.md): tests, local builds and backend architecture.
 

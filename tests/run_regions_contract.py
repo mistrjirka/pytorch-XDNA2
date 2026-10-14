@@ -6,7 +6,10 @@ activations, a changed slope.
   * feature weights that become trainable after fusing must still get gradients
     (the region has to fall back, not silently drop them);
   * a fused norm's "already activated" mark covers exactly one activation call;
-  * the activation slope is read at call time.
+  * the activation slope is read at call time;
+  * a feature chain parsed once is re-validated on every call: replaced layers, changed
+    conv attributes, hooks and subclasses make the loss fall back to the eager method;
+  * fused BN+ReLU passes gradients for NaN activations like eager ReLU (LeakyReLU does not).
 
 Run with the NIS venv python and PYTHONPATH=<repo>.
 """
@@ -144,6 +147,88 @@ regions.fuse_norm_activation(b2.norm, b2.relu)
 b2.relu.negative_slope = 0.5
 t2.relu.negative_slope = 0.5
 report("a changed negative_slope is used", rel(b2(x), t2(x)) < 0.03, f"rel {rel(b2(x), t2(x)):.4f}")
+
+# ---- model surgery after the chain was built ------------------------------------
+def fresh_fused_loss():
+    lm = Loss().to("xdna", torch.bfloat16)
+    regions.fuse_perceptual_loss(lm)
+    xw = torch.randn(2, 3, 8, 8).bfloat16().to("xdna").requires_grad_()
+    lm.compute_perceptual_loss(xw, tg)  # builds and caches the chain
+    return lm
+
+
+def same_as_eager(name, lm, mutate):
+    mutate(lm)
+    xa = torch.randn(2, 3, 8, 8, generator=torch.Generator().manual_seed(5)).bfloat16().to("xdna").requires_grad_()
+    xb = xa.detach().clone().requires_grad_()
+    got = lm.compute_perceptual_loss(xa, tg)
+    want = type(lm).compute_perceptual_loss(lm, xb, tg)
+    got.backward()
+    want.backward()
+    ok = abs(float(got) - float(want)) <= 0.03 * abs(float(want)) + 1e-6 and rel(xa.grad, xb.grad) < 0.05
+    report(name, ok, f"loss {float(got):.5f} vs eager {float(want):.5f}, dx rel {rel(xa.grad, xb.grad):.4f}")
+
+
+def set_layer(lm, i, mod):
+    lm.perceptual_vgg.model.features[i] = mod
+
+
+same_as_eager("surgery: ReLU replaced by Sigmoid", fresh_fused_loss(), lambda lm: set_layer(lm, 1, nn.Sigmoid()))
+same_as_eager("surgery: ReLU replaced by MaxPool2d", fresh_fused_loss(), lambda lm: set_layer(lm, 1, nn.MaxPool2d(2, 2)))
+same_as_eager("surgery: conv stride changed", fresh_fused_loss(),
+              lambda lm: setattr(lm.perceptual_vgg.model.features[0], "stride", (2, 2)))
+same_as_eager("surgery: conv padding changed", fresh_fused_loss(),
+              lambda lm: setattr(lm.perceptual_vgg.model.features[0], "padding", (0, 0)))
+same_as_eager("surgery: conv dilation changed", fresh_fused_loss(),
+              lambda lm: setattr(lm.perceptual_vgg.model.features[2], "dilation", (2, 2)))
+same_as_eager("surgery: forward hook that changes the output", fresh_fused_loss(),
+              lambda lm: lm.perceptual_vgg.model.features[0].register_forward_hook(lambda m, i, o: o * 3.0))
+same_as_eager("surgery: forward pre-hook", fresh_fused_loss(),
+              lambda lm: lm.perceptual_vgg.model.features[2].register_forward_pre_hook(lambda m, i: (i[0] * 2.0,)))
+
+
+class ScaledConv(nn.Conv2d):
+    def forward(self, input):
+        return super().forward(input) * 3.0
+
+
+def to_subclass(lm):
+    lm.perceptual_vgg.model.features[0].__class__ = ScaledConv
+
+
+same_as_eager("surgery: Conv2d subclass with its own forward", fresh_fused_loss(), to_subclass)
+same_as_eager("surgery: instance-level forward", fresh_fused_loss(),
+              lambda lm: setattr(lm.perceptual_vgg.model.features[0], "forward",
+                                 lambda v, m=lm.perceptual_vgg.model.features[0]: nn.Conv2d.forward(m, v) * 3.0))
+same_as_eager("surgery: new conv weights (a different Parameter)", fresh_fused_loss(),
+              lambda lm: setattr(lm.perceptual_vgg.model.features[0], "weight",
+                                 nn.Parameter(lm.perceptual_vgg.model.features[0].weight.detach() * 2.0, requires_grad=False)))
+
+# ---- NaN activation: fused BN + ReLU / LeakyReLU gradients match eager -----------
+def nan_bias_grads(act_cls, fuse):
+    torch.manual_seed(3)
+    bn = nn.BatchNorm2d(4).to("xdna", torch.bfloat16)
+    act = act_cls()
+    with torch.no_grad():
+        bn.bias.copy_(torch.tensor([float("nan"), 0.1, -0.2, 0.3]))
+    if fuse:
+        regions.fuse_norm_activation(bn, act)
+    xn = torch.randn(3, 4, 9, 9).bfloat16().to("xdna").requires_grad_()
+    gn = torch.randn(3, 4, 9, 9).bfloat16().to("xdna")
+    act(bn(xn)).backward(gn)
+    return xn.grad.float().cpu(), bn.bias.grad.float().cpu()
+
+
+for cls, nm in ((nn.ReLU, "ReLU"), (lambda: nn.LeakyReLU(0.2), "LeakyReLU")):
+    dxf, dbf = nan_bias_grads(cls, True)
+    dxe, dbe = nan_bias_grads(cls, False)
+    same_nan = torch.equal(torch.isnan(dxf), torch.isnan(dxe)) and torch.equal(torch.isnan(dbf), torch.isnan(dbe))
+    fin = ~torch.isnan(dxe)
+    finb = ~torch.isnan(dbe)
+    ok = same_nan and (dxf[fin] - dxe[fin]).abs().max() < 0.05 * dxe[fin].abs().max().clamp_min(1e-3) \
+        and (dbf[finb] - dbe[finb]).abs().max() < 0.05 * dbe[finb].abs().max().clamp_min(1e-3)
+    report(f"NaN bias + fused BN + {nm}: gradients match eager", ok,
+           f"|dbias| fused {dbf.abs().max():.3f} eager {dbe.abs().max():.3f}")
 
 print("ALL OK" if ok_all else "FAILED")
 sys.exit(0 if ok_all else 1)

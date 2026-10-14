@@ -1,0 +1,32 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The NPU tests need an XDNA2 machine (run `python tests/quick_check.py` there).
+# This job checks what any runner can: the sources compile and the wheel is complete.
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile
+        run: python -m compileall -q xdna_train tests benchmarks
+      - name: Build wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel --outdir dist
+      - name: Wheel contains the native and design sources
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist()
+          for need in ("xdna_train/_native/torch_xdna_device.cpp", "xdna_train/_native/region_kernels.cpp",
+                       "xdna_train/_native/conv_pack.cpp", "xdna_train/_designs/conv3x3w.py",
+                       "xdna_train/regions.py"):
+              assert need in names, need
+          PY

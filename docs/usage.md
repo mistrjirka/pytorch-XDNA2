@@ -219,6 +219,25 @@ Successful registration also changes these behaviors:
   This also affects unrelated backward calls on that thread. Set
   `XDNA_AUTOGRAD_THREAD=1` before import to retain PyTorch's default threading.
 
+## Fused regions
+
+Optional host-side fusions that remove CPU passes and intermediate tensors. Convolutions still dispatch
+through the normal backend (NPU or CPU), the fused part is native CPU code. They compute in BF16 with fewer
+rounding steps than the eager graph, so results differ slightly (loss curves over 400 real steps matched within 0.1%
+per 40-step window). `XDNA_REGIONS=0` disables them.
+
+- `regions.fuse_perceptual_loss(loss_module, features_attr="perceptual_vgg")`: for a loss whose
+  `compute_perceptual_loss` runs `getattr(loss_module, features_attr).model.features` (a `Sequential` of
+  `Conv2d`, `ReLU`, `MaxPool2d(2)`), compares the layers listed in `.feature_layers` and uses frozen weights.
+  Every call re-checks the layers (exact types, conv attributes, hooks, parametrizations, parameter identity,
+  `requires_grad`); anything that no longer matches runs the module's own method. Measured: NIS step 107 to 93 ms.
+- `regions.fuse_norm_activation(bn, act)`: declare that `act` (`nn.ReLU` or `nn.LeakyReLU`) is applied directly
+  to the output of `bn` (`nn.BatchNorm2d`). Used only above 4 MB per tensor (`XDNA_REGION_NORM_ACT_MIN_BYTES`).
+  More accurate than eager BF16 on large layers; the full-step gain is small (about 1-3 ms, within noise).
+
+A fused model can be `copy.deepcopy`'d (copy a paired norm and activation together) and its `state_dict` is
+unchanged; `torch.save(model)` of the whole object is not supported. The regions are once-differentiable.
+
 ## Deferred gradients and timing
 
 NPU convolution weight gradients can be returned before their computation runs.

@@ -317,7 +317,8 @@ void xdna_region_maxpool2_bwd_bf16(const uint16_t* x, const uint16_t* g, uint16_
 // activation once (after BN and LeakyReLU); eager rounds the BN output to bf16
 // first.  Backward uses y > 0 as the LeakyReLU mask (slope > 0, so y > 0 iff the
 // pre-activation is > 0; a pre-activation of exactly 0 takes the slope branch
-// like PyTorch's leaky_relu_backward).
+// like PyTorch's leaky_relu_backward).  For ReLU (relu != 0) a NaN activation
+// passes its gradient, as PyTorch's relu backward does.
 // ---------------------------------------------------------------------------
 
 extern "C++" {
@@ -391,7 +392,7 @@ void xdna_region_bn_fwd_bf16(const uint16_t* x, const uint16_t* w, const uint16_
 void xdna_region_bn_bwd_bf16(const uint16_t* dy, const uint16_t* y, const uint16_t* x,
                              const uint16_t* w, const float* mean, const float* invstd,
                              uint16_t* dx, uint16_t* dw_out, uint16_t* db_out, int64_t N,
-                             int64_t C, int64_t HW, float slope, int threads) {
+                             int64_t C, int64_t HW, float slope, int relu, int threads) {
   float* ps = new float[size_t(N * C) * 2];
   float* pt = ps + N * C;
 #pragma omp parallel for num_threads(threads) schedule(static)
@@ -405,7 +406,10 @@ void xdna_region_bn_bwd_bf16(const uint16_t* dy, const uint16_t* y, const uint16
 #pragma omp simd reduction(+ : s1, s2)
     for (int64_t i = 0; i < HW; ++i) {
       const float g = bf2f(dyp[i]);
-      const float dz = bf2f(yp[i]) > 0.0f ? g : g * slope;
+      const float yv = bf2f(yp[i]);
+      // ReLU passes the gradient for NaN (threshold_backward: !(y <= 0)); LeakyReLU
+      // sends NaN to the slope branch (y > 0).  Equal for every other value.
+      const float dz = ((yv > 0.0f) | (relu & (yv != yv))) ? g : g * slope;
       s1 += dz;
       s2 += dz * ((bf2f(xp[i]) - mc) * is);
     }
@@ -441,7 +445,10 @@ void xdna_region_bn_bwd_bf16(const uint16_t* dy, const uint16_t* y, const uint16
 #pragma omp simd
       for (int64_t i = 0; i < HW; ++i) {
         const float g = bf2f(dyp[i]);
-        const float dz = bf2f(yp[i]) > 0.0f ? g : g * slope;
+        const float yv = bf2f(yp[i]);
+      // ReLU passes the gradient for NaN (threshold_backward: !(y <= 0)); LeakyReLU
+      // sends NaN to the slope branch (y > 0).  Equal for every other value.
+      const float dz = ((yv > 0.0f) | (relu & (yv != yv))) ? g : g * slope;
         const float xhat = (bf2f(xp[i]) - mc) * is;
         dxp[i] = f2bf(ws * (dz - k1 - xhat * k2));
       }

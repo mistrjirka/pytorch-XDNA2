@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
+from torch.nn.modules import module as _modmod
+from torch.nn.utils import parametrize
 import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
 
@@ -125,6 +127,36 @@ class _Placer:
         return out, dt, C.conv3x3w_npu_runs() > before
 
 
+def _plain(m, cls) -> bool:
+    """m is exactly ``cls`` with nothing around its forward that the region would skip
+    (hooks, an instance-level forward, parametrizations)."""
+    if type(m) is not cls or "forward" in m.__dict__:
+        return False
+    if (m._forward_hooks or m._forward_pre_hooks or m._backward_hooks or m._backward_pre_hooks):
+        return False
+    if _modmod._global_forward_hooks or _modmod._global_forward_pre_hooks:
+        return False
+    return not parametrize.is_parametrized(m)
+
+
+def _layer_sig(m):
+    """Everything the parsed chain depends on for one layer, or None if the layer is
+    not supported.  Compared on every call, so model surgery after the chain was
+    built (a replaced activation, a changed stride, a new hook) is never missed."""
+    if _plain(m, nn.Conv2d):
+        if m.padding_mode != "zeros" or isinstance(m.padding, str):
+            return None
+        return ("conv", id(m.weight), id(m.bias), tuple(m.stride), tuple(m.padding),
+                tuple(m.dilation), m.groups)
+    if _plain(m, nn.ReLU):
+        return ("relu",)
+    if (_plain(m, nn.MaxPool2d) and m.kernel_size in (2, (2, 2)) and m.stride in (2, (2, 2))
+            and m.padding in (0, (0, 0)) and m.dilation in (1, (1, 1)) and not m.ceil_mode
+            and not m.return_indices):
+        return ("maxpool2",)
+    return None
+
+
 @dataclass
 class _Op:
     kind: str  # "conv" | "relu" | "maxpool2"
@@ -142,6 +174,7 @@ class FrozenFeatureChain:
     taps: tuple[int, ...]  # op indices whose output is compared (after the op)
     _tapset: frozenset = field(init=False)
     placer: "_Placer" = field(init=False)
+    sig: tuple = field(init=False, default=())
 
     def __post_init__(self):
         self._tapset = frozenset(self.taps)
@@ -155,25 +188,24 @@ class FrozenFeatureChain:
         if not taps or taps[0] < 0 or taps[-1] >= len(layers):
             return None
         ops: list[_Op] = []
+        sigs = []
         for m in layers[: taps[-1] + 1]:
-            if isinstance(m, nn.Conv2d):
-                if m.padding_mode != "zeros" or isinstance(m.padding, str):
-                    return None
+            sig = _layer_sig(m)
+            if sig is None:
+                return None
+            sigs.append(sig)
+            if sig[0] == "conv":
                 if m.weight.requires_grad or (m.bias is not None and m.bias.requires_grad):
                     return None
                 ops.append(_Op("conv", m.weight, m.bias, tuple(m.stride), tuple(m.padding),
                                tuple(m.dilation), m.groups))
-            elif isinstance(m, nn.ReLU):
-                ops.append(_Op("relu"))
-            elif (isinstance(m, nn.MaxPool2d) and m.kernel_size in (2, (2, 2))
-                  and m.stride in (2, (2, 2)) and m.padding in (0, (0, 0))
-                  and m.dilation in (1, (1, 1)) and not m.ceil_mode and not m.return_indices):
-                ops.append(_Op("maxpool2"))
             else:
-                return None
+                ops.append(_Op(sig[0]))
         if ops[0].kind != "conv":
             return None  # keep the contract simple: the first op reads the image
-        return cls(ops, taps)
+        chain = cls(ops, taps)
+        chain.sig = tuple(sigs)
+        return chain
 
     def eligible(self, x: torch.Tensor, target: torch.Tensor) -> bool:
         if not enabled() or x.device.type != "xdna" or target.device.type != "xdna":
@@ -328,10 +360,8 @@ def _loss_chain(loss_module):
     layers = list(feats)[: max(taps) + 1] if len(taps) else []
     chain = loss_module.__dict__.get("_xdna_chain")
     if chain is not None:
-        convs = [m for m in layers if isinstance(m, nn.Conv2d)]
-        cur = [op for op in chain.ops if op.kind == "conv"]
-        if (len(convs) != len(cur) or chain.taps != tuple(sorted(set(int(t) for t in taps)))
-                or any(m.weight is not op.weight or m.bias is not op.bias for m, op in zip(convs, cur))):
+        want = tuple(sorted(set(int(t) for t in taps)))
+        if (chain.taps != want or chain.sig != tuple(_layer_sig(m) for m in layers)):
             chain = None
     if chain is None:
         chain = FrozenFeatureChain.from_sequential(layers, taps)
@@ -404,7 +434,7 @@ class _BatchNormAct(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, bias, running_mean, running_var, eps, slope, factor):
+    def forward(ctx, x, weight, bias, running_mean, running_var, eps, slope, factor, relu):
         C = _native()
         y = torch.empty_like(x)
         mean = torch.empty(x.shape[1], dtype=torch.float32, device=x.device)
@@ -413,6 +443,7 @@ class _BatchNormAct(torch.autograd.Function):
                         eps, slope, factor, True)
         ctx.save_for_backward(x, y, weight, mean, invstd)
         ctx.slope = slope
+        ctx.relu = relu
         return y
 
     @staticmethod
@@ -426,8 +457,8 @@ class _BatchNormAct(torch.autograd.Function):
         dx = torch.empty_like(x) if need_x else None
         dw = torch.empty_like(weight) if need_w else None
         db = torch.empty_like(weight) if need_b else None
-        C.region_bn_bwd(dy, y, x, weight, mean, invstd, dx, dw, db, ctx.slope)
-        return dx, dw, db, None, None, None, None, None
+        C.region_bn_bwd(dy, y, x, weight, mean, invstd, dx, dw, db, ctx.slope, ctx.relu)
+        return dx, dw, db, None, None, None, None, None, None
 
 
 # Below this size the eager BatchNorm + activation is as fast as the fused op (the
@@ -455,9 +486,10 @@ def _norm_act_eligible(bn: nn.BatchNorm2d, x: torch.Tensor) -> bool:
 
 
 def _act_slope(act):
-    if isinstance(act, nn.LeakyReLU):
+    # exact types: a subclass may override forward, which the fused op would skip
+    if type(act) is nn.LeakyReLU:
         return float(act.negative_slope)
-    if isinstance(act, nn.ReLU):
+    if type(act) is nn.ReLU:
         return 0.0
     return None
 
@@ -471,7 +503,7 @@ def _fused_bn_forward(self, x):
         return type(self).forward(self, x)
     self.num_batches_tracked.add_(1)
     y = _BatchNormAct.apply(x, self.weight, self.bias, self.running_mean, self.running_var,
-                            float(self.eps), slope, float(self.momentum))
+                            float(self.eps), slope, float(self.momentum), type(act) is nn.ReLU)
     y._xdna_act_for = weakref.ref(act)
     return y
 

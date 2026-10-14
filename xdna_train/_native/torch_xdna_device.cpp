@@ -83,7 +83,7 @@ extern "C" void xdna_region_bn_fwd_bf16(
     float*, int64_t, int64_t, int64_t, float, float, float, int, int);
 extern "C" void xdna_region_bn_bwd_bf16(
     const uint16_t*, const uint16_t*, const uint16_t*, const uint16_t*, const float*, const float*,
-    uint16_t*, uint16_t*, uint16_t*, int64_t, int64_t, int64_t, float, int);
+    uint16_t*, uint16_t*, uint16_t*, int64_t, int64_t, int64_t, float, int, int);
 extern "C" void xdna_region_maxpool2_bwd_bf16(
     const uint16_t*, const uint16_t*, uint16_t*, int64_t, int64_t, int64_t, int);
 extern "C" void xdna_pack_conv3x3_halo_padded_bf16(
@@ -529,12 +529,18 @@ at::Tensor cpu_alias_unchecked(const at::Tensor& t) {
   auto options = at::TensorOptions()
                      .dtype(t.scalar_type())
                      .device(c10::DeviceType::CPU);
-  return at::from_blob(
+  auto alias = at::from_blob(
       const_cast<void*>(t.const_data_ptr()),
       t.sizes(),
       t.strides(),
       [](void*) {},
       options);
+  // Lazy conjugate / negative views share storage with their base and differ
+  // only in a flag.  The alias must carry the flag, or every CPU kernel reads
+  // the physical values (complex gradients lost their conjugation).
+  if (t.is_conj()) alias = at::_conj(alias);
+  if (t.is_neg()) alias = at::_neg_view(alias);
+  return alias;
 }
 
 void wait_pending_host_write(XdnaAllocation* allocation) {
@@ -1210,7 +1216,8 @@ void host_storage_copy(
     return;
   }
   if (src.scalar_type() == dst.scalar_type() &&
-      src.is_contiguous() && dst.is_contiguous()) {
+      src.is_contiguous() && dst.is_contiguous() &&
+      !src.is_conj() && !src.is_neg() && !dst.is_conj() && !dst.is_neg()) {
     std::memcpy(
         dst.mutable_data_ptr(),
         src.const_data_ptr(),
@@ -4034,7 +4041,8 @@ at::Tensor mm_xdna(
       lhs.scalar_type() == at::ScalarType::BFloat16 &&
       rhs.scalar_type() == at::ScalarType::BFloat16 &&
       lhs.is_contiguous() &&
-      rhs.is_contiguous()) {
+      rhs.is_contiguous() &&
+      !lhs.is_neg() && !rhs.is_neg()) {
     const int64_t m = lhs.size(0);
     const int64_t k = lhs.size(1);
     const int64_t n = rhs.size(1);
@@ -4048,6 +4056,43 @@ at::Tensor mm_xdna(
     }
   }
   return cpu_mm_xdna(lhs, rhs);
+}
+
+// torch.conj() / torch._neg_view() normally return views that only set a flag.
+// PyTorch's lazy-view fallback crashes on XDNA tensors (any op on such a view
+// died with a bad size array), so the flag never reaches the backend:
+// these two ops return a materialised tensor instead.  The result is not a
+// view of its input (writing through x.conj() does not modify x).
+at::Tensor materialize_lazy_view_xdna(const at::Tensor& self, bool conj) {
+  TORCH_CHECK(self.device().type() == kXdnaType, "expected an XDNA tensor");
+  if (conj ? !self.is_complex() : false) {
+    return self;
+  }
+  ensure_host_current(self);
+  auto src = cpu_alias_unchecked(self);
+  auto out = empty_memory_format(
+      self.sym_sizes(),
+      self.scalar_type(),
+      at::Layout::Strided,
+      c10::Device(kXdnaType, 0),
+      false,
+      at::MemoryFormat::Contiguous);
+  auto dst = cpu_alias_unchecked(out);
+  if (conj) {
+    at::conj_physical_out(dst, src);
+  } else {
+    at::neg_out(dst, src);
+  }
+  mark_host_dirty(out);
+  return out;
+}
+
+at::Tensor conj_xdna(const at::Tensor& self) {
+  return materialize_lazy_view_xdna(self, true);
+}
+
+at::Tensor neg_view_xdna(const at::Tensor& self) {
+  return materialize_lazy_view_xdna(self, false);
 }
 
 at::Tensor xdna_from_cpu(const at::Tensor& cpu) {
@@ -4632,6 +4677,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("set_.source_Tensor", TORCH_FN(set_source_tensor_xdna_));
   m.impl("set_", TORCH_FN(set_empty_xdna_));
   m.impl("mm", TORCH_FN(mm_xdna));
+  m.impl("_conj", TORCH_FN(conj_xdna));
+  m.impl("_neg_view", TORCH_FN(neg_view_xdna));
   m.impl("leaky_relu", TORCH_FN(leaky_relu_xdna));
   m.impl("leaky_relu_backward", TORCH_FN(leaky_relu_backward_xdna));
   m.impl("add.Tensor", TORCH_FN(add_tensor_xdna));
@@ -5096,7 +5143,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                const std::optional<at::Tensor>& w, const at::Tensor& mean,
                                const at::Tensor& invstd, const std::optional<at::Tensor>& dx,
                                const std::optional<at::Tensor>& dw, const std::optional<at::Tensor>& db,
-                               double slope) {
+                               double slope, bool relu) {
       TORCH_CHECK(x.dim() == 4 && dy.sizes().equals(x.sizes()) && y.sizes().equals(x.sizes()),
                   "region_bn_bwd: shape mismatch");
       const int64_t N = x.size(0), C = x.size(1), HW = x.size(2) * x.size(3);
@@ -5113,7 +5160,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       {
         py::gil_scoped_release release;
         xdna_region_bn_bwd_bf16(pdy, py, px, pw, pmean, pinv, pdx, pdw, pdb, N, C, HW,
-                                float(slope), t);
+                                float(slope), relu ? 1 : 0, t);
       }
       if (dx) mark_host_dirty(*dx);
       if (dw) mark_host_dirty(*dw);
