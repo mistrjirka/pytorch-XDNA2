@@ -1,0 +1,397 @@
+{
+  "baseline": "135e262f44ee90a5c0380435a48c07ec438ea445",
+  "description": "Expected outcomes for tests/coverage/network_matrix.py and training_interfaces.py. Keys are case/dtype (matrix) or case (interfaces). known_failure entries carry an issue id, the expected status and stage; fixing one makes the gate fail until the entry is promoted to pass.",
+  "entries": {
+    "autocast_xdna": {
+      "expect": "known_failure",
+      "issue": "XDNA-COV-4",
+      "note": "No AutocastPrivateUse1 registration; torch.autocast(\"xdna\") cannot dispatch aten::linear (roadmap C1).",
+      "stage": null,
+      "status": "error"
+    },
+    "batchnorm_affine_False/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "batchnorm_affine_False/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "batchnorm_affine_True/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "batchnorm_affine_True/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "batchnorm_channels_last/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "batchnorm_channels_last/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "batchnorm_transposed/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "batchnorm_transposed/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "checkpoint_nonreentrant_dense": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "compile_frontend_eager_backend": {
+      "expect": "pass",
+      "ok_statuses": [
+        "runs"
+      ]
+    },
+    "complex_linear/complex64": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "conv1d_temporal/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "conv1d_temporal/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "conv3d_volume/bf16": {
+      "expect": "known_failure",
+      "issue": "XDNA-COV-1",
+      "note": "BF16 AvgPool3D is unimplemented in upstream CPU too; fix is roadmap C4 (FP32 decomposition).",
+      "stage": "forward",
+      "status": "reference_unsupported"
+    },
+    "conv3d_volume/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "cumsum_state_scan/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "cumsum_state_scan/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "diffusion_norm_time/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "diffusion_norm_time/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "embedding_dense/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "embedding_dense/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "embedding_sparse/bf16": {
+      "expect": "known_failure",
+      "issue": "XDNA-COV-3",
+      "note": "Sparse COO gradient layout unsupported on the device (roadmap C3).",
+      "stage": "backward",
+      "status": "xdna_error"
+    },
+    "embedding_sparse/fp32": {
+      "expect": "known_failure",
+      "issue": "XDNA-COV-3",
+      "note": "Sparse COO gradient layout unsupported on the device (roadmap C3).",
+      "stage": "backward",
+      "status": "xdna_error"
+    },
+    "embeddingbag_max/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "embeddingbag_max/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "embeddingbag_mean/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "embeddingbag_mean/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "embeddingbag_sum/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "embeddingbag_sum/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "gnn_index_add/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "gnn_index_add/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "grid_sample_warp/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "grouped_dilated_conv/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "grouped_dilated_conv/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "gru_bidirectional/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "gru_bidirectional/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "higher_order_pointwise": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "instancenorm1d_affine_False/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "instancenorm1d_affine_False/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "instancenorm1d_affine_True/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "instancenorm1d_affine_True/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "instancenorm2d_affine_False/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "instancenorm2d_affine_False/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "instancenorm2d_affine_True/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "instancenorm2d_affine_True/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "jvp_pointwise": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "layer_norm/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "layer_norm/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "linalg_cholesky/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "lstm_bidirectional/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "lstm_bidirectional/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "mlp_gelu/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "mlp_gelu/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "mobile_depthwise_se/bf16": {
+      "expect": "known_failure",
+      "issue": "XDNA-COV-2",
+      "note": "Conv bias gradient before BatchNorm cancels to ~0; relative error on a near-zero reference gradient (roadmap section 4). Needs reference-aware tolerance, not widening.",
+      "stage": null,
+      "status": "numeric_mismatch"
+    },
+    "mobile_depthwise_se/fp32": {
+      "expect": "known_failure",
+      "issue": "XDNA-COV-2",
+      "note": "Same near-zero pre-BN bias-gradient cancellation as the bf16 case (max_abs ~5e-5).",
+      "stage": null,
+      "status": "numeric_mismatch"
+    },
+    "optimizer_Adagrad": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "optimizer_Adam": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "optimizer_AdamW": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "optimizer_RMSprop": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "optimizer_SGD": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "packed_sequence_lstm_fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "pixel_shuffle/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "pixel_shuffle/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "resize_bilinear/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "resize_bilinear/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "rms_norm/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "rms_norm/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sdpa_bool_mask/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sdpa_bool_mask/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sdpa_causal/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sdpa_causal/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sdpa_float_mask/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sdpa_float_mask/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sdpa_fully_masked/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sdpa_fully_masked/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sdpa_gqa/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sdpa_gqa/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "serialize_tensor_to_cpu": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "sparse_graph_mm/bf16": {
+      "expect": "known_failure",
+      "issue": "XDNA-COV-3",
+      "note": "SparseTensorImpl has no strided storage; sparse-dense matmul unsupported (roadmap C3).",
+      "stage": "forward",
+      "status": "xdna_error"
+    },
+    "sparse_graph_mm/fp32": {
+      "expect": "known_failure",
+      "issue": "XDNA-COV-3",
+      "note": "SparseTensorImpl has no strided storage; sparse-dense matmul unsupported (roadmap C3).",
+      "stage": "forward",
+      "status": "xdna_error"
+    },
+    "spectral_fft/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "transpose2d_decoder/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "transpose2d_decoder/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "transpose3d_decoder/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "transpose3d_decoder/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "unfold_fold/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "unfold_fold/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "vit_encoder/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "vit_encoder/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "vmap_pointwise": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    }
+  },
+  "schema": 1
+}

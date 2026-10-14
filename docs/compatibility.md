@@ -122,14 +122,26 @@ PYTHONPATH=. XDNA_AUTO_SETUP=0 python tests/coverage/network_matrix.py --out /tm
 PYTHONPATH=. XDNA_AUTO_SETUP=0 python tests/coverage/training_interfaces.py --out /tmp/interface-results.json
 ```
 
-The scripts collect failures rather than aborting the full matrix. Their exit 0
-is not an all-tests-pass signal: inspect each JSON status. Do not run multiple
-NPU test processes at once.
+The scripts collect failures rather than aborting the full matrix, so their exit 0
+is not an all-tests-pass signal. The verdict comes from the gate, which compares
+the JSON results with the checked-in expectations in
+[`tests/coverage/manifest.json`](../tests/coverage/manifest.json):
 
-Raw evidence is provided in the accompanying review archive under `results/`.
-This documentation and the scripts were prepared in an isolated worktree and
-have not been committed or pushed. The machine-readable matrix is
-[network_kernel_coverage.json](network_kernel_coverage.json).
+```bash
+python tests/coverage/gate.py /tmp/network-results.json /tmp/interface-results.json
+```
+
+It exits non-zero for an unexpected failure, a changed failure stage/status, a
+known failure that now passes (promote the manifest entry to `pass`), a result
+the manifest does not list, a dropped case, or fewer NPU runs than recorded.
+Each known failure carries an issue id. Bootstrap or refresh entries with
+`--init`, then triage by hand; never widen a tolerance just to turn a case green.
+The gate's logic is unit-tested without hardware (`tests/test_coverage_gate.py`)
+and runs in CI; the hardware matrix itself needs an XDNA2 machine. Do not run
+multiple NPU test processes at once.
+
+The manifest was generated from a run on `135e262` and covers 78 network-matrix
+results and 13 interface probes. Raw outputs are not tracked in the repository.
 
 ### Primary references
 

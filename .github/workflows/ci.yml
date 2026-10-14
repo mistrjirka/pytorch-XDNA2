@@ -16,6 +16,18 @@ jobs:
           python-version: "3.12"
       - name: Byte-compile
         run: python -m compileall -q xdna_train tests benchmarks
+      - name: Coverage gate logic and manifest
+        run: |
+          python -m unittest tests/test_coverage_gate.py
+          python - <<'PY'
+          import json
+          m = json.load(open("tests/coverage/manifest.json"))
+          assert m["schema"] == 1
+          for key, e in m["entries"].items():
+              assert e["expect"] in ("pass", "known_failure"), key
+              if e["expect"] == "known_failure":
+                  assert e.get("issue") and e["issue"] != "UNTRIAGED", key
+          PY
       - name: Build wheel
         run: |
           python -m pip install build
