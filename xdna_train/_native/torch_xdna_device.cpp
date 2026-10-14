@@ -3683,6 +3683,24 @@ at::Tensor cat_xdna(
   TORCH_CHECK(
       first.device().type() == kXdnaType,
       "XDNA cat expects XDNA tensors");
+  // Mixed dtypes promote like CPU torch.cat (autocast: BF16 activations next to
+  // an FP32 input).  Autograd casts the gradient back to each input's dtype.
+  at::ScalarType common = first.scalar_type();
+  bool mixed = false;
+  for (const auto& tensor : tensors) {
+    if (tensor.scalar_type() != common) {
+      common = at::promoteTypes(common, tensor.scalar_type());
+      mixed = true;
+    }
+  }
+  if (mixed) {
+    std::vector<at::Tensor> converted;
+    for (const auto& tensor : tensors) {
+      converted.push_back(
+          tensor.scalar_type() == common ? tensor : tensor.to(common));
+    }
+    return cat_xdna(at::ITensorListRef(converted), dim);
+  }
   const int64_t ndim = first.dim();
   dim = c10::maybe_wrap_dim(dim, ndim);
   const auto dtype = first.scalar_type();

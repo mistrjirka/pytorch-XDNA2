@@ -106,6 +106,20 @@ with fake quantization and EMA observers. All pass; they run on CPU fallback, `n
 This found and fixed a silent bug: `torch.view_as_real` had no XDNA view kernel, so Adam/AdamW/RMSprop updates of
 complex parameters were applied to a copy and lost.
 
+## End-to-end feature models and speed
+
+`tests/coverage/feature_models.py` trains one model per newer feature until it has learned its task and compares
+it with the reference: an autocast CNN classifier (FP32 master weights, BF16 compute), the benchmark generator under
+autocast (its convolutions run on the NPU: forward, dX and dW), a 3-D CNN with BF16 AvgPool3d, a recommender with
+CPU-resident sparse embeddings, and a Fourier operator with complex weights. All reach the same accuracy or loss as
+the CPU run. Only the generator uses the NPU; the others run on CPU fallback.
+
+`benchmarks/end_to_end_speed.py` is the speed gate for a whole training step (generator + VGG19 loss, BF16, batch 40,
+Adam, ABBA order, separate processes, default settings): on 2026-10-14 it measured CPU 187 to 239 ms,
+XDNA 110 to 138 ms (about 1.7x) and XDNA with `fuse_perceptual_loss` 93 to 105 ms (1.8x to 2.3x); with
+`--autocast` (FP32 master weights) XDNA was 1.4x faster than CPU autocast. The spread comes from the laptop
+heating up between rounds; the gate defaults require 1.2x, 1.4x (fused) and 1.1x (autocast).
+
 ## Numerical qualifications
 
 Sparse tensors have no XDNA layout: sparse gradients and sparse graph products fail loudly (`Sparsexdna`). For recommenders, keep the table on the CPU with `xdna_train.cpu_sparse.CpuSparseEmbedding` / `CpuSparseEmbeddingBag` (sparse gradients, `SparseAdam`) and send only the looked-up rows to the XDNA model; `module.to("xdna")` leaves the table in place (`tests/run_cpu_sparse.py`). BF16 AvgPool3D, which PyTorch's own CPU backend lacks, is computed in FP32 and rounded on XDNA (`tests/run_avgpool3d.py`); the matrix keeps `conv3d_volume/bf16` as a known failure only because its CPU reference cannot run. Convolution-only BF16 3D and InstanceNorm3D probes passed.

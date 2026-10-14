@@ -2,6 +2,14 @@
   "baseline": "135e262f44ee90a5c0380435a48c07ec438ea445",
   "description": "Expected outcomes for tests/coverage/network_matrix.py and training_interfaces.py. Keys are case/dtype (matrix) or case (interfaces). known_failure entries carry an issue id, the expected status and stage; fixing one makes the gate fail until the entry is promoted to pass.",
   "entries": {
+    "autocast_cnn_classifier/bf16-autocast": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "autocast_style_net/bf16-autocast": {
+      "expect": "pass",
+      "min_npu_runs": 1
+    },
     "autocast_xdna": {
       "expect": "pass",
       "min_npu_runs": 0,
@@ -60,6 +68,10 @@
       "min_npu_runs": 0
     },
     "conv1d_temporal/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "conv3d_avgpool_video/bf16": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -141,6 +153,10 @@
       "min_npu_runs": 0
     },
     "fourier_operator_complex/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "fourier_operator_learning/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -375,6 +391,10 @@
       "note": "SparseTensorImpl has no strided storage; sparse-dense matmul unsupported (roadmap C3).",
       "stage": "forward",
       "status": "xdna_error"
+    },
+    "sparse_recommender/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
     },
     "spectral_fft/fp32": {
       "expect": "pass",

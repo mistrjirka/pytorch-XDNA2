@@ -216,6 +216,17 @@ with warnings.catch_warnings():
         od_ = lin(a)
 check("bare autocast('xdna') uses bf16", od_.dtype == BF16, str(od_.dtype))
 
+# 9. torch.cat promotes mixed dtypes like CPU (BF16 activations next to an FP32 input)
+a_bf = torch.randn(2, 3, 4).bfloat16().to("xdna").requires_grad_()
+b_fp = torch.randn(2, 5, 4).to("xdna").requires_grad_()
+cat = torch.cat([a_bf, b_fp], dim=1)
+check("cat of bf16 and fp32 promotes to fp32", cat.dtype == torch.float32 and cat.shape == (2, 8, 4), str(cat.dtype))
+cat.sum().backward()
+check("cat gradients return in each input's dtype",
+      a_bf.grad.dtype == torch.bfloat16 and b_fp.grad.dtype == torch.float32)
+cat_cpu = torch.cat([a_bf.detach().cpu(), b_fp.detach().cpu()], dim=1)
+check("cat values match CPU", torch.equal(cat.detach().cpu(), cat_cpu))
+
 print()
 print("FAILED:" if failures else "ALL OK", failures if failures else "")
 sys.exit(1 if failures else 0)
