@@ -227,6 +227,28 @@ check("cat gradients return in each input's dtype",
 cat_cpu = torch.cat([a_bf.detach().cpu(), b_fp.detach().cpu()], dim=1)
 check("cat values match CPU", torch.equal(cat.detach().cpu(), cat_cpu))
 
+# 10. NPU weight gradient + autocast: the FP32 cast of the BF16 dW must not force the
+# deferred NPU job (that ended its overlap with backward); values stay right.
+conv_x = (torch.randn(40, 256, 18, 18) * 0.1)
+conv_ref = nn.Conv2d(256, 128, 3, padding=1, bias=False)
+conv_dev = copy.deepcopy(conv_ref).to("xdna")
+xdna_train.reset_mapped_cpu_stats()
+for _ in range(4):  # >= 3 steps so the async policy has learned the step structure
+    conv_dev.weight.grad = None
+    with ac("xdna"):
+        out_ = conv_dev(conv_x.to("xdna"))
+    out_.float().square().mean().backward()
+    conv_dev.weight.grad.cpu()  # the reader (optimizer step) pays the wait
+dw_runs = xdna_train.mapped_cpu_stats().get("npu_conv3x3w.dw.run", {}).get("calls", 0)
+conv_ref.weight.grad = None
+with ac("cpu"):
+    out_c = conv_ref(conv_x)
+out_c.float().square().mean().backward()
+check("conv dW ran on the NPU under autocast", dw_runs >= 4, f"dw runs={dw_runs}")
+check("deferred FP32 weight gradient matches CPU autocast",
+      close(conv_dev.weight.grad, conv_ref.weight.grad, 0.04) and conv_dev.weight.grad.dtype == torch.float32,
+      f"rel={rel(conv_dev.weight.grad, conv_ref.weight.grad):.4f}")
+
 print()
 print("FAILED:" if failures else "ALL OK", failures if failures else "")
 sys.exit(1 if failures else 0)

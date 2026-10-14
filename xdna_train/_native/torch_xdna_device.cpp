@@ -1203,19 +1203,68 @@ at::Tensor cpu_alias(const at::Tensor& t) {
   return cpu_alias_unchecked(t);
 }
 
+// A copy (typically a dtype cast, e.g. autocast turning the BF16 weight gradient
+// into the FP32 parameter gradient) whose source is still a pending deferred
+// write (an NPU dW) must not force that job: the cast would end the overlap of the
+// dW with the rest of backward.  The copy becomes a deferred job on the
+// destination that runs behind the source's job; whoever reads the destination
+// first (normally the optimizer) pays the wait.  Returns false when not applicable.
+bool defer_copy_behind_pending_write(const at::Tensor& src, const at::Tensor& dst) {
+  if (src.device().type() != kXdnaType || dst.device().type() != kXdnaType ||
+      src.numel() == 0 || !async_dw_enabled()) {
+    return false;
+  }
+  auto* src_alloc = allocation_from_tensor(src);
+  auto* dst_alloc = allocation_from_tensor(dst);
+  if (src_alloc == dst_alloc) return false;
+  std::shared_ptr<DeferredHostJob> src_job;
+  {
+    std::lock_guard<std::mutex> guard(src_alloc->pending_mutex);
+    src_job = src_alloc->pending_host_write;
+  }
+  if (!src_job) return false;
+  {
+    std::lock_guard<std::mutex> lock(src_job->m);
+    if (src_job->state == DeferredHostJob::State::Done ||
+        src_job->state == DeferredHostJob::State::Dropped) {
+      return false;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> guard(dst_alloc->pending_mutex);
+    if (dst_alloc->pending_host_write) return false;
+  }
+  // Views without any waiting: the memory of both allocations is fixed.  The job
+  // keeps the source tensor alive; the destination is protected by the allocator,
+  // which drops an unstarted job or awaits a running one before freeing it.
+  auto src_view = cpu_alias_unchecked(src);
+  auto dst_view = cpu_alias_unchecked(dst);
+  auto job = std::make_shared<DeferredHostJob>(
+      [src_job, keep = src, src_view, dst_view]() mutable {
+        src_job->run_or_wait();
+        dst_view.copy_(src_view, false);
+      });
+  set_pending_host_write(dst, job);
+  DeferredJobLauncher::instance().add(job);
+  return true;
+}
+
 void host_storage_copy(
     const at::Tensor& src,
     const at::Tensor& dst) {
   // dst is written: a pending host write (a deferred gradient) must finish
   // first, or it would overwrite this copy when it runs.
   ensure_host_current(dst);
-  ensure_host_current(src);
   TORCH_CHECK(
       src.sizes().equals(dst.sizes()),
       "XDNA copy requires identical shapes, got ",
       src.sizes(),
       " and ",
       dst.sizes());
+  if (defer_copy_behind_pending_write(src, dst)) {
+    return;
+  }
+  ensure_host_current(src);
   if (src.numel() == 0) {
     return;
   }
