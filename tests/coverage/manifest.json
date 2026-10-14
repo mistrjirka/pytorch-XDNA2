@@ -3,11 +3,11 @@
   "description": "Expected outcomes for tests/coverage/network_matrix.py and training_interfaces.py. Keys are case/dtype (matrix) or case (interfaces). known_failure entries carry an issue id, the expected status and stage; fixing one makes the gate fail until the entry is promoted to pass.",
   "entries": {
     "autocast_xdna": {
-      "expect": "known_failure",
-      "issue": "XDNA-COV-4",
-      "note": "No AutocastPrivateUse1 registration; torch.autocast(\"xdna\") cannot dispatch aten::linear (roadmap C1).",
-      "stage": null,
-      "status": "error"
+      "expect": "pass",
+      "min_npu_runs": 0,
+      "ok_statuses": [
+        "runs"
+      ]
     },
     "batchnorm_affine_False/bf16": {
       "expect": "pass",

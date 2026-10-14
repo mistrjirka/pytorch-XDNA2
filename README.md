@@ -102,7 +102,8 @@ Small operations, attention, recurrent layers and most other matrix shapes use
 the CPU. Measure your own workload after compilation and warmup.
 
 - Supported scope: real-valued dense BF16 training with first-order gradients. FP32 uses CPU paths.
-  Sparse tensors and `torch.autocast("xdna")` are not implemented (they raise an error); FP16 is not validated.
+  Sparse tensors are not implemented (they raise an error); FP16 is not validated.
+  `torch.autocast("xdna")` works with BF16 (parameters stay FP32).
 - Operands of NPU convolutions should be finite. NaN and Inf inputs give NaN outputs for the windows they touch
   (CPU gives signed infinities for Inf).
 - Complex tensors run on the CPU. `x.conj()` returns a copy, not a view, on `xdna`.

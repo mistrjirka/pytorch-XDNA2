@@ -32,6 +32,7 @@
 #include <ATen/ops/native_batch_norm.h>
 #include <ATen/ops/native_batch_norm_backward.h>
 #include <ATen/CPUGeneratorImpl.h>
+#include <ATen/autocast_mode.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/Allocator.h>
 #include <c10/core/CPUAllocator.h>
@@ -3857,6 +3858,22 @@ at::Tensor batch_norm_layout_safe(const at::Tensor& t) {
   return t.contiguous();
 }
 
+// Mixed-precision BatchNorm (autocast: BF16 activations, FP32 affine weights and
+// running stats).  CPU keeps the saved statistics and the weight/bias gradients
+// in the *parameter* dtype and only the activation in the input dtype; the out=
+// kernels reject buffers of any other dtype.  Parameter dtype = weight, else the
+// running statistics, else the input.
+at::ScalarType batch_norm_param_dtype(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& running_mean) {
+  if (weight.has_value() && weight->defined()) return weight->scalar_type();
+  if (running_mean.has_value() && running_mean->defined()) {
+    return running_mean->scalar_type();
+  }
+  return input.scalar_type();
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> native_batch_norm_xdna(
     const at::Tensor& input,
     const std::optional<at::Tensor>& weight,
@@ -3880,8 +3897,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_batch_norm_xdna(
   std::vector<c10::SymInt> stat_shape = training
       ? std::vector<c10::SymInt>{c10::SymInt(channels)}
       : std::vector<c10::SymInt>{c10::SymInt(0)};
-  auto save_mean = xdna_empty_like_shape(stat_shape, input.scalar_type());
-  auto save_invstd = xdna_empty_like_shape(stat_shape, input.scalar_type());
+  const auto stat_dtype = batch_norm_param_dtype(input, weight, running_mean);
+  auto save_mean = xdna_empty_like_shape(stat_shape, stat_dtype);
+  auto save_invstd = xdna_empty_like_shape(stat_shape, stat_dtype);
 
   auto out_cpu = cpu_alias(out);
   auto save_mean_cpu = cpu_alias(save_mean);
@@ -3952,6 +3970,9 @@ native_batch_norm_backward_xdna(
   // computed; those autograd did not ask for go to throwaway CPU tensors.  The
   // weight and bias gradients are cheap reductions the kernel needs anyway.
   const int64_t channels = input.size(1);
+  const auto grad_param_dtype = (weight.has_value() && weight->defined())
+      ? weight->scalar_type()
+      : batch_norm_param_dtype(input, std::nullopt, save_mean);
   at::Tensor gi;
   at::Tensor gw;
   at::Tensor gb;
@@ -3966,16 +3987,16 @@ native_batch_norm_backward_xdna(
     gi_cpu = at::empty_like(input_cpu);
   }
   if (output_mask[1]) {
-    gw = xdna_empty_like_shape({c10::SymInt(channels)}, input.scalar_type());
+    gw = xdna_empty_like_shape({c10::SymInt(channels)}, grad_param_dtype);
     gw_cpu = cpu_alias(gw);
   } else {
-    gw_cpu = at::empty({channels}, input_cpu.options());
+    gw_cpu = at::empty({channels}, input_cpu.options().dtype(grad_param_dtype));
   }
   if (output_mask[2]) {
-    gb = xdna_empty_like_shape({c10::SymInt(channels)}, input.scalar_type());
+    gb = xdna_empty_like_shape({c10::SymInt(channels)}, grad_param_dtype);
     gb_cpu = cpu_alias(gb);
   } else {
-    gb_cpu = at::empty({channels}, input_cpu.options());
+    gb_cpu = at::empty({channels}, input_cpu.options().dtype(grad_param_dtype));
   }
 
   at::native_batch_norm_backward_out(
@@ -4934,6 +4955,50 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
   m.fallback(
       torch::CppFunction::makeFromBoxedFunction<&xdna_cpu_fallback>());
 }
+
+// ---------------------------------------------------------------------------
+// Automatic mixed precision (torch.autocast("xdna", dtype=torch.bfloat16)).
+//
+// Every op not listed below falls through to the normal XDNA/CPU-fallback
+// path. The listed ops reuse PyTorch's own per-op precision policy lists (the
+// ones CPU/CUDA/XPU autocast use), so numerically sensitive reductions, losses
+// and normalizations stay FP32 and matmul/convolution family ops run in the
+// autocast dtype. Inputs are cast with ordinary differentiable copies, so
+// gradients flow back in each parameter's original dtype; the cast cache is
+// cleared by torch.autocast on exit of the outermost context.
+// ---------------------------------------------------------------------------
+namespace xdna_autocast {
+// PyTorch's autocast op-list macros spell these types unqualified.
+using at::IntArrayRef;
+using at::Scalar;
+using at::ScalarType;
+using at::Tensor;
+
+TORCH_LIBRARY_IMPL(_, AutocastPrivateUse1, m) {
+  m.fallback(torch::CppFunction::makeFallthrough());
+}
+
+#define XDNA_AUTOCAST_LOWER_PRECISION(...) \
+  KERNEL_PRIVATEUSEONE(__VA_ARGS__, lower_precision_fp)
+#define XDNA_AUTOCAST_FP32(...) KERNEL_PRIVATEUSEONE(__VA_ARGS__, fp32)
+#define XDNA_AUTOCAST_FP32_SET_OPT_DTYPE(...) \
+  KERNEL_PRIVATEUSEONE(__VA_ARGS__, fp32_set_opt_dtype)
+#define XDNA_AUTOCAST_PROMOTE(...) KERNEL_PRIVATEUSEONE(__VA_ARGS__, promote)
+
+TORCH_LIBRARY_IMPL(aten, AutocastPrivateUse1, m) {
+  AT_FORALL_LOWER_PRECISION_FP(XDNA_AUTOCAST_LOWER_PRECISION)
+  AT_FORALL_FP32(XDNA_AUTOCAST_FP32)
+  AT_FORALL_FP32_SET_OPT_DTYPE(XDNA_AUTOCAST_FP32_SET_OPT_DTYPE)
+  AT_FORALL_DIFFERENT_REDISPATCH_SIGNATURE(
+      KERNEL_DIFFERENT_REDISPATCH_SIGNATURE_PRIVATEUSEONE)
+  AT_FORALL_PROMOTE(XDNA_AUTOCAST_PROMOTE)
+}
+
+#undef XDNA_AUTOCAST_LOWER_PRECISION
+#undef XDNA_AUTOCAST_FP32
+#undef XDNA_AUTOCAST_FP32_SET_OPT_DTYPE
+#undef XDNA_AUTOCAST_PROMOTE
+}  // namespace xdna_autocast
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   init_host_threads();

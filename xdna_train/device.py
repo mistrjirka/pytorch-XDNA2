@@ -312,6 +312,10 @@ def register_xdna_device() -> None:
         for_module=True,
         for_storage=False,
     )
+    # torch.autocast("xdna") with no dtype would otherwise pick float16, which
+    # this backend does not support (get_amp_supported_dtype), and silently
+    # disable itself.  An explicit dtype= still takes precedence.
+    torch.set_autocast_dtype("xdna", torch.bfloat16)
     _install_scoped_param_swap()
     if os.environ.get("XDNA_CPU_ISLANDS", "1") == "1":
         from . import cpu_islands

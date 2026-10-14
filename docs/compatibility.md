@@ -88,13 +88,17 @@ recomputation of stateful training BatchNorm needs a separate test.
 `torch.compile(..., backend="eager", fullgraph=True)` executed a small training
 example. This checks the tracing frontend only; it does **not** validate Inductor,
 AOT-export, an optimized XDNA graph backend or compiled fused-region gradients.
-`torch.autocast("xdna")` failed at Linear because the Autocastxdna dispatch path
-was missing. Use explicit supported dtypes until a proper autocast policy exists;
-manual `.bfloat16()` is not a replacement claim for AMP support.
+`torch.autocast("xdna")` is implemented (bare `torch.autocast("xdna")` selects BF16;
+FP16 is not supported). It reuses PyTorch's own per-op policy lists, so matmul and
+convolution family ops run in BF16 and losses, reductions and normalizations stay
+FP32. Parameters, gradients and optimizer state stay FP32 and track CPU autocast
+(`tests/run_autocast.py`). Mixed-precision BatchNorm (BF16 activations, FP32 affine
+parameters) keeps its saved statistics and weight gradients in the parameter dtype.
+`torch.cuda.amp.GradScaler` style loss scaling is unnecessary for BF16 and untested here.
 
 ## Numerical qualifications
 
-Sparse gradients fail loudly (`Sparsexdna`); `torch.autocast("xdna")` is not implemented. BF16 AvgPool3D is unavailable in the tested
+Sparse gradients fail loudly (`Sparsexdna`). BF16 AvgPool3D is unavailable in the tested
 CPU reference as well, so it is a shared dtype limitation, not an XDNA-only bug.
 Convolution-only BF16 3D and InstanceNorm3D follow-up probes passed.
 
