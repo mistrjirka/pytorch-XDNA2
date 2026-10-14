@@ -7,6 +7,7 @@
 #include <ATen/native/Resize.h>
 #include <ATen/ops/set_native.h>
 #include <ATen/ops/unfold_native.h>
+#include <ATen/native/ComplexHelper.h>
 #include <ATen/ops/convolution_ops.h>
 #include <ATen/ops/convolution_backward_ops.h>
 #include <ATen/ops/mm_ops.h>
@@ -26,6 +27,8 @@
 #include <ATen/ops/add.h>
 #include <ATen/ops/cat.h>
 #include <ATen/ops/leaky_relu.h>
+#include <ATen/ops/avg_pool3d.h>
+#include <ATen/ops/avg_pool3d_backward.h>
 #include <ATen/ops/leaky_relu_backward.h>
 #include <ATen/ops/upsample_nearest2d.h>
 #include <ATen/ops/upsample_nearest2d_backward.h>
@@ -3134,6 +3137,65 @@ at::Tensor leaky_relu_backward_xdna(
   return out;
 }
 
+// avg_pool3d has no BF16/FP16 CPU kernel in PyTorch ("avg_pool3d_out_frame" is
+// not implemented for 'BFloat16'), so XDNA computes it in FP32 and rounds the
+// result back.  The cast is part of the op, so autograd sees one avg_pool3d.
+bool low_precision_float(at::ScalarType t) {
+  return t == at::ScalarType::BFloat16 || t == at::ScalarType::Half;
+}
+
+at::Tensor avg_pool3d_xdna(
+    const at::Tensor& self,
+    at::IntArrayRef kernel_size,
+    at::IntArrayRef stride,
+    at::IntArrayRef padding,
+    bool ceil_mode,
+    bool count_include_pad,
+    std::optional<int64_t> divisor_override) {
+  ScopedMappedCpu mapped_phase("aten::avg_pool3d");
+  ensure_host_current(self);
+  auto in = cpu_alias(self);
+  const auto dtype = self.scalar_type();
+  const bool low = low_precision_float(dtype);
+  auto res = at::avg_pool3d(
+      low ? in.to(at::kFloat) : in,
+      kernel_size,
+      stride,
+      padding,
+      ceil_mode,
+      count_include_pad,
+      divisor_override);
+  return xdna_from_cpu(low ? res.to(dtype) : res);
+}
+
+at::Tensor avg_pool3d_backward_xdna(
+    const at::Tensor& grad_output,
+    const at::Tensor& self,
+    at::IntArrayRef kernel_size,
+    at::IntArrayRef stride,
+    at::IntArrayRef padding,
+    bool ceil_mode,
+    bool count_include_pad,
+    std::optional<int64_t> divisor_override) {
+  ScopedMappedCpu mapped_phase("aten::avg_pool3d_backward");
+  ensure_host_current(grad_output);
+  ensure_host_current(self);
+  auto go = cpu_alias(grad_output);
+  auto in = cpu_alias(self);
+  const auto dtype = self.scalar_type();
+  const bool low = low_precision_float(dtype);
+  auto res = at::avg_pool3d_backward(
+      low ? go.to(at::kFloat) : go,
+      low ? in.to(at::kFloat) : in,
+      kernel_size,
+      stride,
+      padding,
+      ceil_mode,
+      count_include_pad,
+      divisor_override);
+  return xdna_from_cpu(low ? res.to(dtype) : res);
+}
+
 at::Tensor add_tensor_xdna(
     const at::Tensor& self,
     const at::Tensor& other,
@@ -4691,6 +4753,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_reshape_alias", TORCH_FN(reshape_alias_xdna));
   m.impl("view", TORCH_FN(view_xdna));
   m.impl("unfold", TORCH_FN(at::native::unfold));
+  // Real views of complex storage (and back): the CPU fallback would hand back a
+  // copy, and in-place updates through it (Adam on complex parameters) were lost.
+  m.impl("view_as_real", TORCH_FN(at::native::view_as_real));
+  m.impl("view_as_complex", TORCH_FN(at::native::view_as_complex));
   m.impl("resize_", TORCH_FN(resize_xdna_));
   m.impl("set_.source_Storage", TORCH_FN(set_source_storage_xdna_));
   m.impl(
@@ -4698,6 +4764,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("set_.source_Tensor", TORCH_FN(set_source_tensor_xdna_));
   m.impl("set_", TORCH_FN(set_empty_xdna_));
   m.impl("mm", TORCH_FN(mm_xdna));
+  m.impl("avg_pool3d", TORCH_FN(avg_pool3d_xdna));
+  m.impl("avg_pool3d_backward", TORCH_FN(avg_pool3d_backward_xdna));
   m.impl("_conj", TORCH_FN(conj_xdna));
   m.impl("_neg_view", TORCH_FN(neg_view_xdna));
   m.impl("leaky_relu", TORCH_FN(leaky_relu_xdna));

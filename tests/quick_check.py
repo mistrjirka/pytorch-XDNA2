@@ -110,7 +110,7 @@ for name in ("run_view_safety.py", "run_gemm_safety.py", "run_tensor_semantics.p
              "run_runtime_hygiene.py", "run_dw_floor.py", "run_autotune_builds.py",
              "run_norm_backward.py", "run_loss_warnings.py",
              "run_async_dw.py", "run_regions.py", "run_regions_bn.py",
-             "run_regions_contract.py", "run_complex_views.py", "run_autocast.py"):
+             "run_regions_contract.py", "run_complex_views.py", "run_autocast.py", "run_avgpool3d.py", "run_cpu_sparse.py"):
     ok &= script(name)
 print("QUICK CHECK OK" if ok else "QUICK CHECK FAILED")
 sys.exit(0 if ok else 1)

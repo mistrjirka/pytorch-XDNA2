@@ -96,11 +96,19 @@ FP32. Parameters, gradients and optimizer state stay FP32 and track CPU autocast
 parameters) keeps its saved statistics and weight gradients in the parameter dtype.
 `torch.cuda.amp.GradScaler` style loss scaling is unnecessary for BF16 and untested here.
 
+## Whole-model workloads
+
+`tests/coverage/model_workloads.py` trains complete small models for six optimizer steps on CPU and on XDNA
+from identical weights and data, then compares the loss trajectory and final parameters (and buffers):
+a selective state-space scan, a top-2 routed mixture of experts (one expert receives no tokens), a Fourier
+operator layer with complex trainable weights, a detection head with ROI Align, and quantization-aware training
+with fake quantization and EMA observers. All pass; they run on CPU fallback, `npu_runs` shows no NPU work.
+This found and fixed a silent bug: `torch.view_as_real` had no XDNA view kernel, so Adam/AdamW/RMSprop updates of
+complex parameters were applied to a copy and lost.
+
 ## Numerical qualifications
 
-Sparse gradients fail loudly (`Sparsexdna`). BF16 AvgPool3D is unavailable in the tested
-CPU reference as well, so it is a shared dtype limitation, not an XDNA-only bug.
-Convolution-only BF16 3D and InstanceNorm3D follow-up probes passed.
+Sparse tensors have no XDNA layout: sparse gradients and sparse graph products fail loudly (`Sparsexdna`). For recommenders, keep the table on the CPU with `xdna_train.cpu_sparse.CpuSparseEmbedding` / `CpuSparseEmbeddingBag` (sparse gradients, `SparseAdam`) and send only the looked-up rows to the XDNA model; `module.to("xdna")` leaves the table in place (`tests/run_cpu_sparse.py`). BF16 AvgPool3D, which PyTorch's own CPU backend lacks, is computed in FP32 and rounded on XDNA (`tests/run_avgpool3d.py`); the matrix keeps `conv3d_volume/bf16` as a known failure only because its CPU reference cannot run. Convolution-only BF16 3D and InstanceNorm3D probes passed.
 
 MobileNet-like conv biases immediately preceding training BN produced large
 relative gradient differences because their ideal FP64 gradients were nearzero.

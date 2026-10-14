@@ -66,7 +66,7 @@
     "conv3d_volume/bf16": {
       "expect": "known_failure",
       "issue": "XDNA-COV-1",
-      "note": "BF16 AvgPool3D is unimplemented in upstream CPU too; fix is roadmap C4 (FP32 decomposition).",
+      "note": "BF16 AvgPool3D is unimplemented in upstream CPU, so the CPU reference cannot run. XDNA computes it in FP32 (C4, tests/run_avgpool3d.py); this entry stays until the matrix gets an FP32-pooled reference.",
       "stage": "forward",
       "status": "reference_unsupported"
     },
@@ -79,6 +79,10 @@
       "min_npu_runs": 0
     },
     "cumsum_state_scan/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "detector_roi_head/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -133,6 +137,10 @@
       "min_npu_runs": 0
     },
     "embeddingbag_sum/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "fourier_operator_complex/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -246,6 +254,14 @@
       "stage": null,
       "status": "numeric_mismatch"
     },
+    "moe_top2_routing/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "moe_top2_routing/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
     "optimizer_Adagrad": {
       "expect": "pass",
       "min_npu_runs": 0
@@ -275,6 +291,14 @@
       "min_npu_runs": 0
     },
     "pixel_shuffle/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "qat_fake_quant/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "qat_fake_quant/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },
@@ -353,6 +377,14 @@
       "status": "xdna_error"
     },
     "spectral_fft/fp32": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "ssm_selective_scan/bf16": {
+      "expect": "pass",
+      "min_npu_runs": 0
+    },
+    "ssm_selective_scan/fp32": {
       "expect": "pass",
       "min_npu_runs": 0
     },

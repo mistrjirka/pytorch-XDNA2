@@ -78,5 +78,29 @@ b = torch.randn(4, 4).bfloat16()
 check("neg view in mm", torch.allclose((torch._neg_view(a.to("xdna")) @ b.to("xdna")).cpu().float(),
                                        -(a @ b).float(), atol=0.1))
 
+# view_as_real / view_as_complex are true views: in-place updates reach the base
+# (Adam on complex parameters updates through view_as_real and silently lost them).
+zc = torch.tensor([1 + 2j, 3 - 4j, 5 + 6j], dtype=torch.complex64)
+zv = zc.to("xdna")
+rv = torch.view_as_real(zv)
+check("view_as_real values", torch.equal(rv.cpu(), torch.view_as_real(zc)))
+rv[0, 1] = 100.0
+check("write through view_as_real reaches the complex base", zv.cpu()[0] == 1 + 100j)
+check("view_as_complex round trip", torch.equal(torch.view_as_complex(torch.view_as_real(zv)).cpu(), zv.cpu()))
+for name, mk in (("SGD", lambda q: torch.optim.SGD(q, lr=0.1)), ("Adam", lambda q: torch.optim.Adam(q, lr=5e-3)),
+                 ("AdamW", lambda q: torch.optim.AdamW(q, lr=5e-3)), ("RMSprop", lambda q: torch.optim.RMSprop(q, lr=5e-3))):
+    torch.manual_seed(1)
+    w0 = torch.randn(3, 3, dtype=torch.complex64)
+    gr = torch.randn(3, 3, dtype=torch.complex64)
+    got = {}
+    for dev in ("cpu", "xdna"):
+        q = torch.nn.Parameter(w0.clone().to(dev))
+        q.grad = gr.clone().to(dev)
+        o = mk([q])
+        for _ in range(3):
+            o.step()
+        got[dev] = q.detach().cpu()
+    check(f"{name} on a complex parameter matches CPU", close(got["xdna"], got["cpu"], 1e-5))
+
 print("ALL OK" if not failures else f"FAILED: {failures}")
 sys.exit(1 if failures else 0)

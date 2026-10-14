@@ -33,8 +33,26 @@ def _device_index(device=None, optional: bool = False) -> int:
     return index
 
 
+class _DeviceContext:
+    """``with torch.xdna.device(i):`` -- torch.load and similar code enter it."""
+
+    def __init__(self, device):
+        self.index = _device_index(device)
+        self.prev = 0
+
+    def __enter__(self):
+        self.prev = int(_C.current_device())
+        _C.set_device(self.index)
+        return self
+
+    def __exit__(self, *exc):
+        _C.set_device(self.prev)
+        return False
+
+
 class _XdnaDeviceModule:
     _utils = SimpleNamespace(_get_device_index=_device_index)
+    device = _DeviceContext
 
     @staticmethod
     def is_available() -> bool:
