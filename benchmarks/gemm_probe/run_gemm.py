@@ -2,7 +2,7 @@
 
 System Python with pyxrt and numpy (python3.14 on Arch):
     python3.14 run_gemm.py X.xclbin X.bin M K N [iters] [f32]
-
+"""
 import sys, time
 import numpy as np
 import pyxrt
