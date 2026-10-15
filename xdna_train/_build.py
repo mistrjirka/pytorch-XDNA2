@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -48,7 +49,17 @@ def build_native():
     build_dir.mkdir(parents=True, exist_ok=True)
 
     include_paths = [str(_SHIM), str(xrt_include)]
-    return load(
+    # ninja rebuilds when a source is newer than the library (e.g. after a
+    # package update touched the files), so check that instead of only whether
+    # the library exists: print only when a compile really is about to happen.
+    library = build_dir / f"{module_name}.so"
+    compiling = (not library.is_file()
+                 or any(p.stat().st_mtime > library.stat().st_mtime for p in hash_inputs))
+    started = time.monotonic()
+    if compiling:
+        print("torch-xdna2: compiling native extension (first run after install/update; "
+              "takes about a minute)...", file=sys.stderr, flush=True)
+    module = load(
         name=module_name,
         sources=[str(p) for p in sources],
         extra_include_paths=include_paths,
@@ -62,6 +73,10 @@ def build_native():
         build_directory=str(build_dir),
         verbose=os.environ.get("TORCH_XDNA2_BUILD_VERBOSE") == "1",
     )
+    if compiling:
+        print(f"torch-xdna2: native extension compiled in {time.monotonic() - started:.0f} s.",
+              file=sys.stderr, flush=True)
+    return module
 
 
 def main() -> None:

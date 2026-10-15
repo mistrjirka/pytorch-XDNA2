@@ -113,11 +113,16 @@ def _setup_lock(base: Path, timeout: float = SETUP_TIMEOUT) -> Iterator[None]:
     base.mkdir(parents=True, exist_ok=True)
     with (base / "setup.lock").open("a") as lock:
         deadline = time.monotonic() + timeout
+        waiting = False
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
+                if not waiting:
+                    waiting = True
+                    print("torch-xdna2: another process is setting up the NPU kernel compiler; "
+                          "waiting for it to finish...", file=sys.stderr, flush=True)
                 if time.monotonic() >= deadline:
                     raise SetupError(f"Another compiler setup is still running; see {base / 'setup.log'}")
                 time.sleep(0.1)
@@ -222,9 +227,12 @@ def ensure_toolchain(*, retry: bool = False) -> Path:
             shutil.rmtree(venv)
         (base / "ready.json").unlink(missing_ok=True)
         _atomic_json(owner, {"id": toolchain_id()})
-        print(f"torch-xdna2: preparing a private IRON compiler (~410 MB download on a cold cache).\n"
-              f"  The training environment is unchanged. Log: {base / 'setup.log'}\n"
-              "  Set XDNA_AUTO_SETUP=0 before import to disable automatic downloads.", file=sys.stderr, flush=True)
+        started = time.monotonic()
+        print("torch-xdna2: setting up the NPU kernel compiler (first run only: ~410 MB download "
+              "and install, can take several minutes)...\n"
+              f"  It lives in a private cache; the training environment is unchanged. Log: {base / 'setup.log'}\n"
+              "  Set XDNA_AUTO_SETUP=0 before import to disable automatic downloads.",
+              file=sys.stderr, flush=True)
         try:
             with (base / "setup.log").open("a") as log:
                 print(f"\nSetup started {time.strftime('%Y-%m-%dT%H:%M:%S%z')}", file=log)
@@ -240,7 +248,8 @@ def ensure_toolchain(*, retry: bool = False) -> Path:
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             _atomic_json(base / "failed.json", {"time": time.time(), "error": str(exc)})
             raise SetupError(f"IRON setup failed: {exc}") from exc
-        print("torch-xdna2: private IRON compiler is ready.", file=sys.stderr, flush=True)
+        print(f"torch-xdna2: NPU kernel compiler is ready (set up in {time.monotonic() - started:.0f} s).",
+              file=sys.stderr, flush=True)
         return venv / "bin/python"
 
 

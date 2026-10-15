@@ -161,6 +161,25 @@ Entries such as `npu_conv3x3w.fwd.run`, `.dx.run` and `.dw.run` show actual
 convolution dispatches. Other entries report work done on the CPU. Profiling can
 add overhead, so disable it for final timing runs.
 
+## First run after an install or update: compiling NPU kernel programs
+
+The 3x3 convolution programs are compiled on demand, once per shape, and cached
+under `~/.cache/torch-xdna2/` (the key covers the kernel sources and the compiler,
+so an update of either recompiles them). Everything you wait for is announced on
+stderr with the prefix `torch-xdna2:` (compiler download, native extension,
+kernel programs); a warm cache prints nothing.
+
+Shapes are discovered while the first training step runs, which uses the CPU for
+convolutions whose program does not exist yet. At the end of that step (the
+optimizer step) training pauses until all requested programs are compiled, then
+continues on the NPU. Shapes that first appear later are handled the same way at
+the next optimizer step. Up to `XDNA_BUILD_JOBS` programs compile at once (default
+`min(4, max(1, cpus // 4))`). `xdna_train.wait_for_builds()` does the same wait on
+demand (useful in scripts without an optimizer). Set `XDNA_WAIT_FOR_BUILDS=0` to
+keep the old behaviour (train on the CPU while programs compile in the background;
+the progress messages still appear and the step autotuner waits for them).
+`XDNA_WAIT_FOR_BUILDS_MAX_S` (default 3600) caps one wait.
+
 ## Tuning
 
 The step autotuner measures the first optimizer using XDNA parameters and chooses
@@ -174,8 +193,9 @@ among these modes:
 
 Set `XDNA_AUTOTUNE_VERBOSE=1` to print its choice. `autotune_result()` returns
 `None` before a decision or when tuning is disabled. The current tuner discards
-measurements affected by pending builds and retries up to five times. It does not
-continually retune when a model or batch shape changes.
+measurements affected by pending builds: while a build is pending the mode stays
+at 2 and timing starts over once the builds are done. It does not continually
+retune when a model or batch shape changes.
 
 For a controlled comparison, choose a mode before starting the application:
 

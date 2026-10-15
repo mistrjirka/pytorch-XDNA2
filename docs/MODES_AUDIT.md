@@ -69,6 +69,9 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 | `XDNA_CONV3X3W_DIR`, `XDNA_CONV3X3W_DW_DIR` (name built as `XDNA_{NAME}_DIR`) | cache dir | directory with xclbin + streams | device.py:152 | debug | used when testing other builds | KEEP-BUT-DOCUMENT | kept |
 | `XDNA_CONV3X3W_MIN_MACS`, `XDNA_CONV3X3W_DW_MIN_MACS` (built as `XDNA_{NAME}_MIN_MACS`) | 20e6 / 3e9 | size floor | device.py:153 | tuning | README; tests set 0 | KEEP | kept |
 | `XDNA_CONV3X3W_SYNC_BUILD` | 0 | build streams before the first call | device.py:153 | debug | README, tests | KEEP | kept |
+| `XDNA_WAIT_FOR_BUILDS` | 1 | `0`: do not pause training at an optimizer step while NPU kernel programs compile (CPU fallback meanwhile) | device.py `_BuildWaiter` | core | docs/usage.md | KEEP | new |
+| `XDNA_WAIT_FOR_BUILDS_MAX_S` | 3600 | longest single wait for builds | device.py `_BuildWaiter` | tuning | -- | KEEP | new |
+| `XDNA_BUILD_JOBS` | `min(4, max(1, cpus/4))` | NPU kernel programs compiled at once | cpp `IronBuildReport` | tuning | cold build 19 programs: 132 s (1 job), 47 s (4 jobs) | KEEP | new |
 | `XDNA_CONV3X3W` | 1 | `0` disables the family | device.py:219 | debug | README, `quick_check`, sweep | KEEP | kept |
 | `XDNA_CONV3X3W_DW` | 1 | `0` keeps every dW on the CPU | device.py:228 | debug | README | KEEP | kept |
 | `XDNA_ASYNC_DW` | 1 | `0` starts deferred NPU dW only at the first reader; `1` starts them on a helper thread after the K-th dX call once two steps agree on K (`xdna_train.async_dw_stats()`) | -- | core | style-transfer step 122.6 -> 110.5 ms (ABBA, AC, 2026-10-13); tests/run_async_dw.py | KEEP | new |

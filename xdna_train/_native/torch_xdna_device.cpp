@@ -1525,21 +1525,167 @@ class ScopedMappedCpu {
 // One xclbin; an instruction stream per (groups, padded width, channel chunks),
 // compiled on first use by a background job and cached on disk.  Until a
 // stream exists the conv takes the next path (full-frame families or CPU), so
-// a new shape never blocks training.  Arithmetic: bf16 activations x bfp16
+// a new shape never blocks the op itself; the Python side pauses training at
+// the next optimizer step until the builds are done (device.py, XDNA_WAIT_FOR_BUILDS).
+// Arithmetic: bf16 activations x bfp16
 // weights with a bf16 running sum (~1.2% rel. RMS vs fp32; CPU bf16 ~0.2%).
-// Compiles IRON instruction streams in the background: one niced build at a
-// time, each key at most once per process.  `cmd` is the design script
-// invocation; a build appends "--out <dir> <args>" and must write <dir>/<key>.bin.
+// User-visible state of the background kernel builds, shared by all IRON
+// families (conv3x3w forward/dX and the dW programs).  A "batch" starts when
+// the first build is queued and ends when none is left.  Messages go to
+// stderr, prefixed "torch-xdna2:": a start line (once the shapes of the first
+// step have been collected, or when Python is about to wait), a progress line
+// every 20 s, and a done line.  Nothing is printed on a warm cache.
+struct IronBuildReport {
+  std::mutex m;
+  std::condition_variable cv;
+  int pending = 0, done = 0, failed = 0, total = 0;  // current batch
+  int running = 0;                                    // builds in flight
+  int jobs = 0;
+  bool announced = false;
+  bool thread_started = false;
+  std::chrono::steady_clock::time_point t0{}, last_print{};
+
+  // XDNA_BUILD_JOBS, default min(4, max(1, cpus / 4)): a build is mostly one
+  // single-threaded compiler process plus short parallel phases.
+  int max_jobs() {
+    if (jobs == 0) {
+      int n = 0;
+      if (const char* raw = std::getenv("XDNA_BUILD_JOBS")) n = std::atoi(raw);
+      if (n <= 0) {
+        const int cpus = static_cast<int>(std::thread::hardware_concurrency());
+        n = std::min(4, std::max(1, cpus / 4));
+      }
+      jobs = n;
+    }
+    return jobs;
+  }
+
+  static std::string duration(double seconds) {
+    const int s = static_cast<int>(seconds + 0.5);
+    char buf[32];
+    if (s < 60) std::snprintf(buf, sizeof buf, "%ds", s);
+    else std::snprintf(buf, sizeof buf, "%dm%02ds", s / 60, s % 60);
+    return buf;
+  }
+  double elapsed() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  }
+
+  // Callers hold `m`.
+  void announce_locked() {
+    if (announced || pending == 0) return;
+    announced = true;
+    last_print = std::chrono::steady_clock::now();
+    std::fprintf(stderr,
+        "torch-xdna2: compiling %d NPU kernel program%s (first run after an install or "
+        "update; cached afterwards)...\n", total, total == 1 ? "" : "s");
+    std::fflush(stderr);
+  }
+
+  void progress_loop() {
+    using namespace std::chrono;
+    std::unique_lock<std::mutex> lock(m);
+    for (;;) {
+      cv.wait(lock, [&] { return pending > 0; });
+      while (pending > 0) {
+        const auto now = steady_clock::now();
+        if (!announced) {
+          if (now - t0 >= seconds(2)) announce_locked();
+        } else if (now - last_print >= seconds(20)) {
+          last_print = now;
+          std::fprintf(stderr, "torch-xdna2: NPU kernel programs: %d/%d compiled, %s elapsed\n",
+                       done, total, duration(elapsed()).c_str());
+          std::fflush(stderr);
+        }
+        cv.wait_for(lock, seconds(1));
+      }
+    }
+  }
+
+  void add() {
+    std::lock_guard<std::mutex> lock(m);
+    if (pending == 0) {
+      done = failed = total = 0;
+      announced = false;
+      t0 = std::chrono::steady_clock::now();
+    }
+    ++pending;
+    ++total;
+    if (!thread_started) {
+      thread_started = true;
+      std::thread([this] { progress_loop(); }).detach();
+    }
+    cv.notify_all();
+  }
+
+  void finish(bool ok) {
+    std::lock_guard<std::mutex> lock(m);
+    ++done;
+    if (!ok) ++failed;
+    if (--pending == 0 && announced) {
+      if (failed > 0) {
+        std::fprintf(stderr,
+            "torch-xdna2: NPU kernel programs ready: %d compiled in %s, %d failed "
+            "(those convolutions use the CPU)\n",
+            done - failed, duration(elapsed()).c_str(), failed);
+      } else {
+        std::fprintf(stderr, "torch-xdna2: NPU kernel programs ready: %d compiled in %s\n",
+                     done, duration(elapsed()).c_str());
+      }
+      std::fflush(stderr);
+    }
+    cv.notify_all();
+  }
+
+  // At most max_jobs() builds run at once across all families.
+  void acquire_slot() {
+    std::unique_lock<std::mutex> lock(m);
+    const int limit = max_jobs();
+    cv.wait(lock, [&] { return running < limit; });
+    ++running;
+  }
+  void release_slot() {
+    std::lock_guard<std::mutex> lock(m);
+    --running;
+    cv.notify_all();
+  }
+
+  // Python: announce now (it is about to wait), then wait for the batch to end.
+  void announce() {
+    std::lock_guard<std::mutex> lock(m);
+    announce_locked();
+  }
+  int wait(double timeout_s) {
+    std::unique_lock<std::mutex> lock(m);
+    cv.wait_for(lock, std::chrono::duration<double>(timeout_s), [&] { return pending == 0; });
+    return pending;
+  }
+};
+
+IronBuildReport& iron_build_report() {
+  static auto* r = new IronBuildReport();
+  return *r;
+}
+
+// Compiles IRON instruction streams in the background, up to
+// XDNA_BUILD_JOBS at a time (shared by all families), each key at most once
+// per process.  `cmd` is the design script invocation; a build appends
+// "--out <dir> <args>" and must write <dir>/<key>.bin (atomically: the file
+// existing means it is complete).  Every build also tries to create the shared
+// <dir>/<xclbin> (rename of a per-key temp file, same content for every key),
+// so while that file is missing only one build runs.
 struct IronStreamBuilder {
   std::string dir;
   std::string cmd;  // empty: only streams already on disk are used
+  std::string xclbin;  // shared program file name inside dir
   bool sync = false;
 
   std::mutex m;
   std::condition_variable cv;
   std::deque<std::pair<std::string, std::string>> queue;  // key, args
   std::set<std::string> seen;
-  bool started = false;
+  int workers = 0;
+  int running = 0;                  // builds of this family in flight
   std::atomic<int> outstanding{0};  // queued or building (async mode)
 
   std::filesystem::path path(const std::string& key) const {
@@ -1560,12 +1706,26 @@ struct IronStreamBuilder {
     return result + "'";
   }
 
-  void build(const std::string& args) {
+  // Each build logs to its own file, then appends it to build.log in one piece
+  // so that parallel builds do not interleave.
+  void append_log(const std::string& key_log, const std::string& log, const std::string& key) {
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::ifstream in(key_log, std::ios::binary);
+    std::ofstream out(log, std::ios::binary | std::ios::app);
+    out << "== " << key << " ==\n" << in.rdbuf();
+    in.close();
+    std::error_code ec;
+    std::filesystem::remove(key_log, ec);
+  }
+
+  bool build(const std::string& key, const std::string& args) {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     const std::string log = dir + "/build.log";
+    const std::string key_log = dir + "/build-" + key + ".log";
     const std::string line = cmd + " --out " + shell_quote(dir) + " " + args +
-        " >> " + shell_quote(log) + " 2>&1";
+        " > " + shell_quote(key_log) + " 2>&1";
     std::string sh = "/bin/sh", flag = "-c";
     char* argv[] = {sh.data(), flag.data(), const_cast<char*>(line.c_str()), nullptr};
     pid_t pid = 0;
@@ -1575,10 +1735,43 @@ struct IronStreamBuilder {
     if (rc == 0) {
       do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
     }
-    if (rc != 0 || waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    append_log(key_log, log, key);
+    const bool ok = rc == 0 && waited >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+        exists(key);
+    if (!ok) {
       std::fprintf(stderr,
-          "torch-xdna2: convolution program build failed; using CPU fallback. "
-          "See %s and run torch-xdna2-doctor.\n", log.c_str());
+          "torch-xdna2: convolution program build failed (%s); using CPU fallback. "
+          "See %s and run torch-xdna2-doctor.\n", key.c_str(), log.c_str());
+      std::fflush(stderr);
+    }
+    return ok;
+  }
+
+  void worker() {
+    auto& report = iron_build_report();
+    for (;;) {
+      std::string key, args;
+      {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&] {
+          return !queue.empty() &&
+                 (running == 0 || std::filesystem::exists(std::filesystem::path(dir) / xclbin));
+        });
+        key = queue.front().first;
+        args = queue.front().second;
+        queue.pop_front();
+        ++running;
+      }
+      report.acquire_slot();
+      const bool ok = build(key, args);
+      report.release_slot();
+      {
+        std::lock_guard<std::mutex> lock(m);
+        --running;
+      }
+      cv.notify_all();
+      --outstanding;
+      report.finish(ok);
     }
   }
 
@@ -1589,28 +1782,25 @@ struct IronStreamBuilder {
     if (!seen.insert(key).second) return;
     if (sync) {
       lock.unlock();
-      build(args);
+      std::fprintf(stderr,
+          "torch-xdna2: compiling NPU kernel program %s (synchronous build)...\n", key.c_str());
+      std::fflush(stderr);
+      const auto t0 = std::chrono::steady_clock::now();
+      build(key, args);
+      std::fprintf(stderr, "torch-xdna2: %s done in %s\n", key.c_str(),
+                   IronBuildReport::duration(std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t0).count()).c_str());
+      std::fflush(stderr);
       return;
     }
     queue.emplace_back(key, args);
     ++outstanding;
-    if (!started) {
-      started = true;
-      std::thread([this] {
-        for (;;) {
-          std::string args;
-          {
-            std::unique_lock<std::mutex> lock(m);
-            cv.wait(lock, [&] { return !queue.empty(); });
-            args = queue.front().second;
-            queue.pop_front();
-          }
-          build(args);
-          --outstanding;
-        }
-      }).detach();
+    iron_build_report().add();
+    if (workers < iron_build_report().max_jobs()) {
+      ++workers;
+      std::thread([this] { worker(); }).detach();
     }
-    cv.notify_one();
+    cv.notify_all();
   }
 
   // True if the stream exists; otherwise queues its build.
@@ -1966,15 +2156,23 @@ struct XdnaConv3x3wRuntime {
     return p;
   }
 
-  // The stream for p if it is ready, else nullptr (and a build is queued).
-  Conv3x3wStream* stream(const Conv3x3wPlan& p) {
+  static std::string build_args(const Conv3x3wPlan& p) {
+    return "--groups " + std::to_string(p.groups) + " --wp " + std::to_string(p.wp) +
+        " --chunks " + std::to_string(p.chunks);
+  }
+
+  // The stream for p if it is ready, else nullptr (and a build is queued,
+  // together with the builds of its pieces so that one wait covers them all).
+  Conv3x3wStream* stream(const Conv3x3wPlan& p, bool with_pieces = true) {
     {
       std::lock_guard<std::mutex> lock(mutex);
       auto it = streams.find(p.key);
       if (it != streams.end()) return it->second.get();
     }
-    if (!builder.ready(p.key, "--groups " + std::to_string(p.groups) + " --wp " +
-                                  std::to_string(p.wp) + " --chunks " + std::to_string(p.chunks))) {
+    if (!builder.ready(p.key, build_args(p))) {
+      if (with_pieces) {
+        for (const auto& [g0, q] : piece_plans(p)) builder.request(q.key, build_args(q));
+      }
       return nullptr;
     }
     std::lock_guard<std::mutex> lock(mutex);
@@ -2080,27 +2278,37 @@ struct XdnaConv3x3wRuntime {
     return groups >= 16 ? 4 : groups >= 6 ? 2 : 1;
   }
 
+  // p split into pieces of consecutive groups (first group, plan); empty when
+  // p runs as one.
+  std::vector<std::pair<int64_t, Conv3x3wPlan>> piece_plans(const Conv3x3wPlan& p) const {
+    std::vector<std::pair<int64_t, Conv3x3wPlan>> out;
+    const int64_t k = piece_count(p.groups);
+    if (k <= 1) return out;
+    const int64_t ng = ceil_div(p.groups, k);
+    for (int64_t g0 = 0; g0 < p.groups; g0 += ng) {
+      Conv3x3wPlan q = p;
+      q.groups = std::min(ng, p.groups - g0);
+      q.key = "g" + std::to_string(q.groups) + "_w" + std::to_string(q.wp) +
+          "_c" + std::to_string(q.chunks);
+      out.emplace_back(g0, q);
+    }
+    return out;
+  }
+
   // Pieces of p as (first group, groups, stream).  Falls back to one piece
   // (the full stream s) until every piece stream is built.
   std::vector<Conv3x3wPiece> piece_streams(const Conv3x3wPlan& p, Conv3x3wStream& s) {
-    const int64_t k = piece_count(p.groups);
     std::vector<Conv3x3wPiece> out;
-    if (k > 1) {
-      const int64_t ng = ceil_div(p.groups, k);
-      for (int64_t g0 = 0; g0 < p.groups; g0 += ng) {
-        Conv3x3wPlan q = p;
-        q.groups = std::min(ng, p.groups - g0);
-        q.key = "g" + std::to_string(q.groups) + "_w" + std::to_string(q.wp) +
-            "_c" + std::to_string(q.chunks);
-        auto* st = stream(q);
-        if (!st) {
-          out.clear();
-          break;
-        }
-        out.push_back({g0, q.groups, st});
-      }
+    bool all = true;
+    for (const auto& [g0, q] : piece_plans(p)) {
+      auto* st = stream(q, false);  // every missing piece is queued, not just the first
+      if (!st) all = false;
+      else out.push_back({g0, q.groups, st});
     }
-    if (out.empty()) out.push_back({0, p.groups, &s});
+    if (!all || out.empty()) {
+      out.clear();
+      out.push_back({0, p.groups, &s});
+    }
     return out;
   }
 
@@ -5178,6 +5386,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         auto runtime = std::make_unique<XdnaConv3x3wRuntime>();
         runtime->builder.dir = dir;
         runtime->builder.cmd = build_cmd;
+        runtime->builder.xclbin = "conv3x3w.xclbin";
         runtime->builder.sync = sync_build;
         runtime->min_macs = min_macs;
         conv3x3w_runtime_slot() = std::move(runtime);
@@ -5193,6 +5402,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         auto runtime = std::make_unique<XdnaConv3x3wDwRuntime>();
         runtime->builder.dir = dir;
         runtime->builder.cmd = build_cmd;
+        runtime->builder.xclbin = "conv3x3w_dw.xclbin";
         runtime->builder.sync = sync_build;
         runtime->min_macs = min_macs;
         conv3x3w_dw_runtime_slot() = std::move(runtime);
@@ -5394,6 +5604,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     if (auto& rt = conv3x3w_runtime_slot()) n += rt->builder.outstanding.load();
     if (auto& rt = conv3x3w_dw_runtime_slot()) n += rt->builder.outstanding.load();
     return n;
+  });
+  // Print the "compiling N programs" line now if builds are pending (Python
+  // calls it right before it waits).
+  m.def("iron_builds_announce", []() { iron_build_report().announce(); });
+  // Block (GIL released) until no build is pending or `timeout_s` passes;
+  // returns the number still pending.  Callers loop with a short timeout so
+  // Ctrl-C works.
+  m.def("iron_wait_builds", [](double timeout_s) {
+    py::gil_scoped_release release;
+    return iron_build_report().wait(timeout_s);
   });
   m.def("npu_mode", []() { return g_npu_mode.load(); });
   m.def("conv3x3w_configured", []() {

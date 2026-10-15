@@ -19,6 +19,7 @@ from .device import (
     set_npu_mode,
     synchronize,
     try_register_xdna_device,
+    wait_for_builds,
 )
 
 __version__ = "0.1.0"
@@ -37,6 +38,7 @@ __all__ = [
     "autotune_result",
     "set_npu_mode",
     "npu_mode",
+    "wait_for_builds",
     "reset_fallback_stats",
     "fallback_stats",
     "mapped_cpu_stats",

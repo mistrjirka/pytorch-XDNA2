@@ -339,6 +339,7 @@ def register_xdna_device() -> None:
         from . import cpu_islands
 
         cpu_islands.install()
+    _start_build_wait()      # before the autotuner: its step timing excludes the wait
     _start_npu_mode_selection()
     from torch.optim.optimizer import (
         register_optimizer_step_post_hook,
@@ -452,6 +453,73 @@ def _bump_fused_param_versions(optimizer, args, kwargs) -> None:
 
 
 # --------------------------------------------------------------------------
+# Kernel builds: pause training at a step boundary until they are done.
+# --------------------------------------------------------------------------
+
+def wait_for_builds(timeout: float | None = None) -> bool:
+    """Block until the NPU kernel programs requested so far are compiled.
+
+    Programs are compiled in the background the first time a shape is seen
+    (first run after an install or update; cached on disk afterwards).  Until
+    one exists that convolution runs on the CPU.  Prints progress to stderr
+    (prefix "torch-xdna2:") and returns True when nothing is pending, or False
+    if `timeout` seconds passed first (builds keep running).
+    """
+    import time
+
+    register_xdna_device()
+    if _C.iron_builds_pending() == 0:
+        return True
+    _C.iron_builds_announce()
+    print("torch-xdna2: pausing training until the NPU kernel programs are ready "
+          "(XDNA_WAIT_FOR_BUILDS=0 keeps training on the CPU meanwhile).",
+          file=sys.stderr, flush=True)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    # Short slices keep Ctrl-C responsive (the native wait does not see signals).
+    while _C.iron_wait_builds(0.25) > 0:
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+    return True
+
+
+class _BuildWaiter:
+    """Optimizer post-hook: if kernel builds are pending, wait for them.
+
+    The first training step discovers the convolution shapes (and runs them on
+    the CPU, no stream existing yet); here, at its end, training pauses until
+    every program is compiled, so all later steps run on the NPU.  Shapes that
+    first appear later are handled the same way at the next step boundary.
+    """
+
+    def __init__(self, max_wait: float) -> None:
+        self.max_wait = max_wait
+
+    def __call__(self, optimizer, args, kwargs) -> None:
+        if _C.iron_builds_pending() == 0:
+            return
+        if not any(p.device.type == "xdna" for g in optimizer.param_groups for p in g["params"]):
+            return
+        if not wait_for_builds(self.max_wait):
+            print(f"torch-xdna2: still compiling after {self.max_wait:.0f} s; training continues "
+                  "on the CPU until the programs are ready.", file=sys.stderr, flush=True)
+        # The step that just ended includes the wait, and the steps before it
+        # ran without the new programs: the autotuner must not time either.
+        if _AUTOTUNER is not None and _AUTOTUNER.active:
+            _AUTOTUNER._restart()
+
+
+def _start_build_wait() -> None:
+    """XDNA_WAIT_FOR_BUILDS=0 restores non-blocking builds (CPU fallback until
+    ready); XDNA_WAIT_FOR_BUILDS_MAX_S (default 3600) caps one wait."""
+    if os.environ.get("XDNA_WAIT_FOR_BUILDS", "1") == "0":
+        return
+    from torch.optim.optimizer import register_optimizer_step_post_hook
+
+    register_optimizer_step_post_hook(
+        _BuildWaiter(float(os.environ.get("XDNA_WAIT_FOR_BUILDS_MAX_S", "3600"))))
+
+
+# --------------------------------------------------------------------------
 # Step autotuner: which NPU paths pay off for this model.
 # --------------------------------------------------------------------------
 
@@ -471,13 +539,12 @@ class _StepAutotuner:
     pending kernel builds are done) the modes run in blocks of one transition
     step plus `steps` timed steps, in ABBA order (2 1 0 0 1 2, `rounds` times)
     so that drift (heat, background load) does not favour one mode; an NPU mode
-    must beat CPU-only by `tolerance`.  Steps timed while a kernel build was
-    still pending ran the CPU path in all modes, so a measurement that saw one
-    is thrown away and repeated (at most MAX_RESTARTS times) instead of
-    finalized: otherwise a fresh install would settle on CPU only.
+    must beat CPU-only by `tolerance`.  While a kernel build is pending every
+    mode runs the CPU path for the affected convolutions and costs the same, so
+    the schedule does not advance then: any measurement is dropped, the mode
+    stays at 2, and timing restarts once the builds are done.  Otherwise a
+    fresh install would settle on CPU only.
     """
-
-    MAX_RESTARTS = 5
 
     def __init__(self, warmup: int, steps: int, rounds: int, tolerance: float) -> None:
         self.warmup, self.steps, self.tolerance = warmup, steps, tolerance
@@ -491,8 +558,6 @@ class _StepAutotuner:
         self.samples: dict[int, list[float]] = {m: [] for m in (2, 1, 0)}
         self.result: dict | None = None
         self.active = True
-        self.builds_seen = False    # a timed step ran while builds were pending
-        self.restarts = 0
 
     def __call__(self, optimizer, args, kwargs) -> None:
         import time
@@ -514,15 +579,15 @@ class _StepAutotuner:
         self.seen += 1
         if last is None:
             return
-        if self.seen <= self.warmup or (
-            _C.iron_builds_pending() > 0 and self.seen <= 20 * self.warmup
-        ):
+        if _C.iron_builds_pending() > 0:
+            self._restart()
+            return
+        if self.seen <= self.warmup:
             return
         if self.skip > 0:
             self.skip -= 1
             return
         self.samples[self.order[self.phase]].append((now - last) * 1e3)
-        self.builds_seen |= _C.iron_builds_pending() > 0
         self.timed += 1
         if self.timed < self.steps:
             return
@@ -532,14 +597,13 @@ class _StepAutotuner:
             _C.set_npu_mode(self.order[self.phase])
             self.skip = 1
             return
-        if self.builds_seen and self.restarts < self.MAX_RESTARTS:
-            self.restarts += 1
-            self.builds_seen = False
-            self.samples = {m: [] for m in (2, 1, 0)}
-            self.phase, self.timed, self.skip = 0, 0, 1
-            _C.set_npu_mode(self.order[0])
-            return
         self._decide()
+
+    def _restart(self) -> None:
+        """Drop the measurements so far; run in mode 2 until builds are done."""
+        self.samples = {m: [] for m in (2, 1, 0)}
+        self.phase, self.timed, self.skip = 0, 0, 1
+        _C.set_npu_mode(self.order[0])
 
     def _decide(self) -> None:
         import statistics
