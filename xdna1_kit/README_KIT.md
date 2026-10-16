@@ -77,11 +77,14 @@ A failing GEMM case, a failing training run, or a crashed worker never aborts th
 ## What the training test does (the part we judge by)
 * Model: 3 linear layers `1024 -> 1024 -> 1024 -> 1024` (GELU between them), batch 1024, MSE loss on a synthetic regression
   target (fixed random teacher, learnable), Adam, 300 steps; a second, heavier config `2048` wide, batch 2048, 60 steps.
-  Because batch = width, **all 8 matmuls of a step (3 forward, 2 dX, 3 dW) have one shape** (1024^3, resp. 2048^3), so one
-  prebuilt xclbin serves the whole step. The same xclbins are also GEMM cases above.
+  Because batch = width, **all 8 matmuls of a step (3 forward, 2 dX, 3 dW) have one shape** (1024^3, resp. 2048^3).
 * On the NPU: forward `y = x@W`, `dX = dY@W^T`, `dW = X^T@dY` all run on the NPU as bf16 inputs with fp32 accumulation
-  (fp32 output; the bf16-output xclbin is run too). Host transposes and fp32->bf16 conversions are inside the timed step.
-  Bias, GELU, loss, autograd bookkeeping and the Adam optimizer stay on the CPU in fp32.
+  (fp32 output; the bf16-output xclbin is run too). Bias, GELU, loss, autograd bookkeeping and the Adam optimizer stay on the CPU in fp32.
+  The transposed operands are handled two ways, both timed:
+  * `npu-f32out`, `npu-bf16out`: one xclbin; a background thread transposes `W^T` and `X^T` on the host while the NPU runs.
+  * `npu-f32out-npuT`: no host transposes; separate dX (B column-major) and dW (A column-major) xclbins read the operands as
+    stored. This costs three NPU context switches per step, so this run also measures the switch cost on your NPU.
+  The dX/dW xclbins of the 1024 config are also GEMM cases above (ids ending `_dx`, `_dw`).
 * CPU baselines, same code, same init, same data: `cpu-bf16` (torch.mm on bf16 operands with fp32 master weights and Adam,
   i.e. what bf16 autocast does; the fair speed comparison) and `cpu-fp32` (loss reference), each at default OpenMP and under
   `OMP_WAIT_POLICY=PASSIVE`; the NPU run is repeated under PASSIVE too (its host ops are multithreaded as well).

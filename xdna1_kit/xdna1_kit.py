@@ -434,7 +434,12 @@ def npu_worker(args):
 
             A, B = make_inputs(M, K, N)
             ref = reference(A, B)
-            a_bytes, b_bytes = A.tobytes(), B.tobytes()
+            # the _dx / _dw variants read the operand the way it is stored for the backward pass: dX = dY @ W^T gets W^T's
+            # transpose (B stored (N,K)), dW = X^T @ dY gets X^T's transpose (A stored (K,M)); the reference stays A @ B
+            var = case.get("variant")
+            a_bytes = (np.ascontiguousarray(A.T) if var == "dw" else A).tobytes()
+            b_bytes = (np.ascontiguousarray(B.T) if var == "dx" else B).tobytes()
+            rec["variant"] = var
             # --- correctness -------------------------------------------------------------------------
             bo_a.write(a_bytes, 0); bo_a.sync(sync_to)
             bo_b.write(b_bytes, 0); bo_b.sync(sync_to)
@@ -557,11 +562,16 @@ def cpu_worker(args):
 # ----------------------------------------------------------------------------------------------------------
 E2E_WARM = 5            # first steps are trained but not timed (xclbin/BO first-use effects, torch allocator warm-up)
 E2E_POOL = 8            # batches of the synthetic dataset, cycled
-E2E_BACKENDS = {        # name -> (kind, description)
-    "npu-f32out": ("npu", "NPU matmuls, bf16 inputs, fp32 accumulate + fp32 output"),
-    "npu-bf16out": ("npu", "NPU matmuls, bf16 inputs, fp32 accumulate, bf16 output (RNE store)"),
-    "cpu-bf16": ("cpu", "CPU torch.mm on bf16 operands (like bf16 autocast), fp32 master weights/optimizer"),
-    "cpu-fp32": ("cpu", "CPU torch.mm in fp32 (loss reference)"),
+E2E_LAYOUTS = {         # how the NPU gets the transposed operands of the backward pass
+    "hostT": "host-side bf16 transposes (W^T once per optimizer step, X^T once per forward), done by a background thread while the NPU runs; one xclbin",
+    "npuT": "the NPU reads W as stored for dX = dY@W^T (B column-major) and X as stored for dW = X^T@dY (A column-major); no host transposes; three xclbins, one hw-context switch per kind",
+}
+E2E_BACKENDS = {        # name -> (kind, description, options)
+    "npu-f32out": ("npu", "NPU matmuls, bf16 inputs, fp32 accumulate + fp32 output, transposes on the host in the background (hostT)", {"dout": "f32", "layout": "hostT"}),
+    "npu-bf16out": ("npu", "NPU matmuls, bf16 inputs, fp32 accumulate, bf16 output (RNE store), hostT", {"dout": "bf16", "layout": "hostT"}),
+    "npu-f32out-npuT": ("npu", "as npu-f32out, but the NPU reads the transposed operands itself (npuT: dX/dW xclbins, no host transposes)", {"dout": "f32", "layout": "npuT"}),
+    "cpu-bf16": ("cpu", "CPU torch.mm on bf16 operands (like bf16 autocast), fp32 master weights/optimizer", {}),
+    "cpu-fp32": ("cpu", "CPU torch.mm in fp32 (loss reference)", {}),
 }
 _PROF = {}
 
@@ -570,17 +580,11 @@ def _acc(key, dt):
     _PROF[key] = _PROF.get(key, 0.0) + dt
 
 
-class NpuMatmul:
-    """One prebuilt fixed-shape xclbin (M,K,N) as a torch-friendly matmul: operands are converted to bf16 straight
-    into the mapped device buffers (the transpose of a strided view happens inside that copy), the result is copied out."""
+class _Xclbin:
+    """One prebuilt xclbin + its instruction stream: hw context, kernel, instruction buffer."""
 
-    def __init__(self, dev, case, base, torch, np, pyxrt):
-        self.shape = (case["M"], case["K"], case["N"])
-        M, K, N = self.shape
-        self.f32 = case["dtype_out"] == "f32"
-        self.tp = pyxrt
-        self.to_dev = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
-        self.from_dev = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
+    def __init__(self, dev, case, base, np, pyxrt):
+        self.case, self.tp = case, pyxrt
         xb = pyxrt.xclbin(str(base / case["xclbin"]))
         dev.register_xclbin(xb)
         self.ctx = pyxrt.hw_context(dev, xb.get_uuid())
@@ -588,47 +592,223 @@ class NpuMatmul:
         instr = np.fromfile(str(base / case["insts"]), dtype=np.uint32)
         self.n_instr = len(instr)
         self.bo_i = pyxrt.bo(dev, instr.nbytes, pyxrt.bo.cacheable, self.k.group_id(1))
-        self.bo_a = pyxrt.bo(dev, M * K * 2, pyxrt.bo.host_only, self.k.group_id(3))
-        self.bo_b = pyxrt.bo(dev, K * N * 2, pyxrt.bo.host_only, self.k.group_id(4))
-        self.bo_c = pyxrt.bo(dev, M * N * (4 if self.f32 else 2), pyxrt.bo.host_only, self.k.group_id(5))
+        self.bo_i.write(instr.tobytes(), 0)
+        self.bo_i.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
         self.bo_t = pyxrt.bo(dev, 1, pyxrt.bo.host_only, self.k.group_id(6))
         self.bo_r = pyxrt.bo(dev, 4, pyxrt.bo.host_only, self.k.group_id(7))
-        self.bo_i.write(instr.tobytes(), 0)
-        self.bo_i.sync(self.to_dev)
-        # torch tensors that alias the mapped buffers
-        self.A = torch.from_numpy(np.frombuffer(self.bo_a.map(), dtype=np.int16)).view(torch.bfloat16).view(M, K)
-        self.B = torch.from_numpy(np.frombuffer(self.bo_b.map(), dtype=np.int16)).view(torch.bfloat16).view(K, N)
-        cm = self.bo_c.map()
-        self.C = (torch.from_numpy(np.frombuffer(cm, dtype=np.float32)).view(M, N) if self.f32
-                  else torch.from_numpy(np.frombuffer(cm, dtype=np.int16)).view(torch.bfloat16).view(M, N))
+
+    def run_for(self, ba, bb, bc):
+        """A reusable run object bound to (A, B, C): start() / wait() per dispatch, no per-call argument setup."""
+        r = self.tp.run(self.k)
+        for i, v in enumerate((3, self.bo_i, self.n_instr, ba, bb, bc, self.bo_t, self.bo_r)):
+            r.set_arg(i, v)
+        return r
+
+
+class NpuTrainEngine:
+    """The 3-layer MLP training step on the NPU (all layers D x D, batch D, so every matmul is one D^3 GEMM).
+
+    Operand reuse: W is converted to bf16 once per optimizer step (used by the forward AND by dX = dY@W^T), the bf16 X of the
+    forward stays in its device buffer for dW, dY is converted once and used by dX (as A) and dW (as B). The result buffers
+    are mapped; the returned tensors alias them (no copy out), valid until the same slot is dispatched again.
+    layout "hostT": dX needs W^T and dW needs X^T as plain row-major bf16 operands of the SAME xclbin; a background thread
+        transposes them (torch bf16 transpose, 0.65 ms per 1024^2, single-thread bound) while the NPU is busy.
+    layout "npuT": no host transposes; dX uses the xclbin built with B column-major (W as stored), dW the one built with A
+        column-major (X as stored). The three xclbins are three hw contexts, so every change of kind costs a context switch;
+        the dW runs of the step are queued back to back after the last dX to pay for it once.
+    dW is dispatched asynchronously and collected in finish_backward() (it overlaps the host work between the layers);
+    p.grad of the weights is set there, not by autograd."""
+
+    def __init__(self, dev, cases, base, torch, np, pyxrt, n_layers, D, f32, layout):
+        from concurrent.futures import ThreadPoolExecutor
+        self.torch, self.L, self.D, self.f32, self.layout = torch, n_layers, D, f32, layout
+        self.to_dev = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+        self.from_dev = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
+        self.fwd_x = _Xclbin(dev, cases["fwd"], base, np, pyxrt)
+        if layout == "npuT":
+            self.dx_x = _Xclbin(dev, cases["dx"], base, np, pyxrt)
+            self.dw_x = _Xclbin(dev, cases["dw"], base, np, pyxrt)
+        else:
+            self.dx_x = self.dw_x = self.fwd_x
+        gid = self.fwd_x.k.group_id          # one memory group for every buffer (the buffers are shared between the xclbins)
+        nb, ob = D * D * 2, D * D * (4 if f32 else 2)
+
+        def bo(nbytes, g):
+            return pyxrt.bo(dev, nbytes, pyxrt.bo.host_only, gid(g))
+
+        def bf(b):
+            return torch.from_numpy(np.frombuffer(b.map(), dtype=np.int16)).view(torch.bfloat16).view(D, D)
+
+        def ov(b):
+            return (torch.from_numpy(np.frombuffer(b.map(), dtype=np.float32)).view(D, D) if f32 else bf(b))
+        L = n_layers
+        self.bo_x, self.bo_w, self.bo_dy = [bo(nb, 3) for _ in range(L)], [bo(nb, 4) for _ in range(L)], [bo(nb, 3) for _ in range(L)]
+        self.bo_y, self.bo_dx = bo(ob, 5), bo(ob, 5)                        # consumed right away: shared by all layers
+        self.bo_dw = [bo(ob, 5) for _ in range(L)]                          # live until the optimizer step: one per layer
+        self.X, self.W, self.DY = [bf(b) for b in self.bo_x], [bf(b) for b in self.bo_w], [bf(b) for b in self.bo_dy]
+        self.Y, self.DX, self.DW = ov(self.bo_y), ov(self.bo_dx), [ov(b) for b in self.bo_dw]
+        if layout == "hostT":
+            self.bo_wt = [bo(nb, 4) for _ in range(L)]                      # W^T (layer 0's is never needed: no dX there)
+            self.bo_xt = [bo(nb, 3) for _ in range(L)]                      # X^T
+            self.WT, self.XT = [bf(b) for b in self.bo_wt], [bf(b) for b in self.bo_xt]
+        self.fwd_run = [self.fwd_x.run_for(self.bo_x[l], self.bo_w[l], self.bo_y) for l in range(L)]
+        if layout == "hostT":
+            self.dx_run = [self.dx_x.run_for(self.bo_dy[l], self.bo_wt[l], self.bo_dx) for l in range(L)]
+            self.dw_run = [self.dw_x.run_for(self.bo_xt[l], self.bo_dy[l], self.bo_dw[l]) for l in range(L)]
+        else:
+            self.dx_run = [self.dx_x.run_for(self.bo_dy[l], self.bo_w[l], self.bo_dx) for l in range(L)]
+            self.dw_run = [self.dw_x.run_for(self.bo_x[l], self.bo_dy[l], self.bo_dw[l]) for l in range(L)]
+        # one OpenMP thread for the background casts/transposes (memory bound: about as fast as a full team). Without the cap each
+        # torch op there starts a second full OpenMP team that fights the main team's spinning threads (20 vs 12 ms per step)
+        self.pool = ThreadPoolExecutor(max_workers=1, initializer=torch.set_num_threads, initargs=(1,))
+        self.w_fut, self.wt_fut, self.xt_fut = [None] * L, [None] * L, [None] * L
+        self.w_dirty, self.wt_dirty = [False] * L, [False] * L
+        self.pending = []
         self.calls = 0
 
-    def mm(self, a, b):
-        M, K, N = self.shape
-        if tuple(a.shape) != (M, K) or tuple(b.shape) != (K, N):
-            raise RuntimeError(f"xclbin is {M}x{K}x{N}, got operands {tuple(a.shape)} @ {tuple(b.shape)}")
+    # -- helpers -------------------------------------------------------------------------------------------
+    def _bg(self, fn, *a):
+        def task():
+            t = time.perf_counter()
+            fn(*a)
+            _acc("bg", time.perf_counter() - t)
+        return self.pool.submit(task)
+
+    def _need(self, fut):
+        if fut is not None:
+            t = time.perf_counter()
+            fut.result()
+            _acc("bgwait", time.perf_counter() - t)
+
+    @staticmethod
+    def _wait(run, what):
+        t = time.perf_counter()
+        st = run.wait(60000)
+        _acc("wait", time.perf_counter() - t)
+        if "COMPLETED" not in str(st):
+            raise RuntimeError(f"NPU dispatch ({what}) did not complete: ert_cmd_state={st}")
+
+    def _cast_w(self, l, w):
+        self.W[l].copy_(w.detach())
+
+    def _transpose(self, dst, src):
+        dst.copy_(src.t())
+
+    # -- one training step ---------------------------------------------------------------------------------
+    def begin(self, ws):
+        """Start of a forward pass: bf16 copies of the weights. Every pass: the fused Adam step updates the weights in place
+        without bumping the tensor version counter, so a changed-since-last-pass check would keep stale weights on the NPU."""
+        self.ws = ws
+        self.pending = []
+        for l, w in enumerate(ws):
+            self.w_dirty[l] = self.wt_dirty[l] = True
+            if l == 0:
+                t = time.perf_counter(); self._cast_w(0, w); _acc("pack", time.perf_counter() - t)
+                self.w_fut[0] = None
+            else:
+                self.w_fut[l] = self._bg(self._cast_w, l, w)
+        if self.layout == "hostT":
+            for l in range(1, len(ws)):
+                if self.wt_dirty[l]:
+                    self.wt_fut[l] = self._bg(self._transpose, self.WT[l], self.W[l])   # after the casts: the worker is FIFO
+
+    def forward(self, l, x):
         pc = time.perf_counter
         t0 = pc()
-        # fp32 -> bf16 (RNE) first (fast, keeps the operand's strides), then one copy into the mapped device buffer;
-        # for the transposed operands (W^T, X^T) that copy IS the transpose (half the bytes of a fp32 transpose)
-        self.A.copy_(a.to(self.A.dtype))
-        self.B.copy_(b.to(self.B.dtype))
+        self.X[l].copy_(x)                       # fp32 -> bf16 (RNE) straight into the mapped device buffer
         t1 = pc()
-        self.bo_a.sync(self.to_dev)
-        self.bo_b.sync(self.to_dev)
-        r = self.k(3, self.bo_i, self.n_instr, self.bo_a, self.bo_b, self.bo_c, self.bo_t, self.bo_r)
+        if self.layout == "hostT":
+            self.xt_fut[l] = self._bg(self._transpose, self.XT[l], self.X[l])
+        self._need(self.w_fut[l])
         t2 = pc()
-        st = r.wait(60000)
+        self.bo_x[l].sync(self.to_dev)
+        if self.w_dirty[l]:
+            self.bo_w[l].sync(self.to_dev)
+            self.w_dirty[l] = False
+        self.fwd_run[l].start()
         t3 = pc()
-        if "COMPLETED" not in str(st):
-            raise RuntimeError(f"NPU dispatch did not complete: ert_cmd_state={st}")
-        self.bo_c.sync(self.from_dev)
+        self._wait(self.fwd_run[l], f"forward layer {l}")
         t4 = pc()
-        out = self.C.clone() if self.f32 else self.C.float()
+        self.bo_y.sync(self.from_dev)
+        y = self.Y.detach() if self.f32 else self.Y.float()
         t5 = pc()
         self.calls += 1
-        _acc("pack", t1 - t0); _acc("submit_sync", (t2 - t1) + (t4 - t3)); _acc("wait", t3 - t2); _acc("unpack", t5 - t4)
-        return out
+        _acc("pack", t1 - t0); _acc("submit_sync", (t3 - t2) + (t5 - t4))
+        return y
+
+    def backward(self, l, g, need_dx):
+        pc = time.perf_counter
+        t0 = pc()
+        self.DY[l].copy_(g)
+        t1 = pc()
+        self.bo_dy[l].sync(self.to_dev)
+        dx = None
+        if need_dx:
+            if self.layout == "hostT":
+                self._need(self.wt_fut[l])
+                if self.wt_dirty[l]:
+                    self.bo_wt[l].sync(self.to_dev)
+                    self.wt_dirty[l] = False
+            self.dx_run[l].start()
+        if self.layout == "hostT":                # queue dW right behind dX: it runs while the host does the work between layers
+            self._need(self.xt_fut[l])
+            self.bo_xt[l].sync(self.to_dev)
+            self.dw_run[l].start()
+        self.pending.append(l)
+        t2 = pc()
+        if need_dx:
+            self._wait(self.dx_run[l], f"dX layer {l}")
+            t3 = pc()
+            self.bo_dx.sync(self.from_dev)
+            dx = self.DX.detach() if self.f32 else self.DX.float()
+            t4 = pc()
+            _acc("submit_sync", t4 - t3)
+            self.calls += 1
+        _acc("pack", t1 - t0); _acc("submit_sync", t2 - t1)
+        return dx
+
+    def finish_backward(self, ws):
+        """Collect the dW of every layer (dispatching them first with layout npuT) and set the weights' .grad."""
+        pc = time.perf_counter
+        if self.layout == "npuT":                 # all dW back to back in the dW hw context
+            t = pc()
+            for l in self.pending:
+                self.bo_x[l].sync(self.to_dev)
+                self.dw_run[l].start()
+            _acc("submit_sync", pc() - t)
+        for l in self.pending:
+            self._wait(self.dw_run[l], f"dW layer {l}")
+            t = pc()
+            self.bo_dw[l].sync(self.from_dev)
+            ws[l].grad = self.DW[l] if self.f32 else self.DW[l].float()
+            _acc("submit_sync", pc() - t)
+            self.calls += 1
+        self.pending = []
+
+    def linear(self, h, l, w):
+        return _npu_linear_fn(self.torch).apply(h, w, self, l)
+
+    def close(self):
+        self.pool.shutdown(wait=True)
+
+
+_NPU_FN = {}
+
+
+def _npu_linear_fn(torch):
+    if "fn" not in _NPU_FN:
+        class NpuLinearFn(torch.autograd.Function):
+            """y = x @ W on the NPU. dX is computed in backward(); dW is dispatched there too but collected in finish_backward()."""
+            @staticmethod
+            def forward(ctx, x, w, eng, l):
+                ctx.eng, ctx.l = eng, l
+                return eng.forward(l, x)
+
+            @staticmethod
+            def backward(ctx, g):
+                return ctx.eng.backward(ctx.l, g, ctx.needs_input_grad[0]), None, None, None
+        _NPU_FN["fn"] = NpuLinearFn
+    return _NPU_FN["fn"]
 
 
 class CpuMatmul:
@@ -653,7 +833,7 @@ class CpuMatmul:
 
 def e2e_make_function(torch, router):
     class MM(torch.autograd.Function):
-        """y = x @ W; dX = dY @ W^T and dW = X^T @ dY are routed to the same matmul engine (NPU or CPU)."""
+        """y = x @ W; dX = dY @ W^T and dW = X^T @ dY are routed to the same matmul engine (CPU backends)."""
         @staticmethod
         def forward(ctx, x, w):
             ctx.save_for_backward(x, w)
@@ -666,6 +846,22 @@ def e2e_make_function(torch, router):
             dw = router(x.t(), g) if ctx.needs_input_grad[1] else None
             return dx, dw
     return MM
+
+
+class FnBackend:
+    """A matmul router (torch.mm on CPU) as an e2e backend: same interface as NpuTrainEngine."""
+
+    def __init__(self, torch, router):
+        self.MM = e2e_make_function(torch, router)
+
+    def begin(self, ws):
+        pass
+
+    def linear(self, h, l, w):
+        return self.MM.apply(h, w)
+
+    def finish_backward(self, ws):
+        pass
 
 
 def e2e_data(torch, np, cfg):
@@ -687,10 +883,11 @@ def e2e_data(torch, np, cfg):
     return pool[:-1], pool[-1], init
 
 
-def e2e_forward(torch, MM, params, x):
+def e2e_forward(torch, backend, params, x):
+    backend.begin([w for w, _ in params])
     h = x
     for i, (w, b) in enumerate(params):
-        h = MM.apply(h, w) + b          # matmul on the engine, bias on the CPU
+        h = backend.linear(h, i, w) + b          # matmul on the engine, bias on the CPU
         if i < len(params) - 1:
             h = torch.nn.functional.gelu(h)
     return h
@@ -700,16 +897,18 @@ def e2e_params(torch, init):
     return [(torch.from_numpy(w.copy()).requires_grad_(), torch.from_numpy(b.copy()).requires_grad_()) for w, b in init]
 
 
-def e2e_grads(torch, MM, init, x, y):
+def e2e_grads(torch, backend, init, x, y):
     ps = e2e_params(torch, init)
-    loss = torch.nn.functional.mse_loss(e2e_forward(torch, MM, ps, x), y)
+    loss = torch.nn.functional.mse_loss(e2e_forward(torch, backend, ps, x), y)
     loss.backward()
+    backend.finish_backward([w for w, _ in ps])
     return loss.item(), [g for w, b in ps for g in (w.grad.clone(), b.grad.clone())]
 
 
-def e2e_train(torch, np, MM, init, pool, held, cfg, steps, router_calls):
+def e2e_train(torch, np, backend, init, pool, held, cfg, steps, router_calls):
     """Train; per-step wall / process-CPU / breakdown after E2E_WARM steps. Returns the record."""
     params = e2e_params(torch, init)
+    ws = [w for w, _ in params]
     flat = [t for p in params for t in p]
     try:
         opt = torch.optim.Adam(flat, lr=cfg["lr"], fused=True)
@@ -726,9 +925,10 @@ def e2e_train(torch, np, MM, init, pool, held, cfg, steps, router_calls):
             calls0 = router_calls()
         x, y = pool[step % len(pool)]
         c0 = time.process_time(); t0 = pc()
-        loss = torch.nn.functional.mse_loss(e2e_forward(torch, MM, params, x), y)
+        loss = torch.nn.functional.mse_loss(e2e_forward(torch, backend, params, x), y)
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        backend.finish_backward(ws)         # collect the dW dispatched during backward (sets ws[i].grad)
         t1 = pc()
         opt.step()
         t2 = pc()
@@ -743,10 +943,13 @@ def e2e_train(torch, np, MM, init, pool, held, cfg, steps, router_calls):
     proc_cpu = (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
     with torch.no_grad():
         xe, ye = held
-        ev = float(torch.nn.functional.mse_loss(e2e_forward(torch, MM_FP32_EVAL(torch), params, xe), ye))
+        ev = float(torch.nn.functional.mse_loss(e2e_forward(torch, FnBackend(torch, torch.mm), params, xe), ye))
     prof = {k: v / n * 1e3 for k, v in _PROF.items()}
     wait, opt_ms = prof.get("wait", 0.0), statistics.fmean(opts) * 1e3
-    copy_ms = prof.get("pack", 0) + prof.get("submit_sync", 0) + prof.get("unpack", 0)
+    # host work on the critical path: casts/copies into the device buffers, BO syncs, launch, result conversion, and time blocked
+    # on the background transpose thread; "hidden" = the background thread's busy time (runs while the NPU computes)
+    copy_ms = prof.get("pack", 0) + prof.get("submit_sync", 0) + prof.get("unpack", 0) + prof.get("bgwait", 0)
+    hidden_ms = prof.get("bg", 0.0)
     wall_ms = [w * 1e3 for w in walls]
     return {
         "steps": steps, "timed_steps": n, "warmup_steps_excluded": E2E_WARM,
@@ -761,19 +964,14 @@ def e2e_train(torch, np, MM, init, pool, held, cfg, steps, router_calls):
         "energy_mJ_per_step": (joules / n * 1e3) if joules is not None else None,
         "breakdown_ms_per_step": {
             "matmul": wait, "host_copy_sync": copy_ms, "optimizer": opt_ms,
-            "other_cpu": max(0.0, statistics.fmean(wall_ms) - wait - copy_ms - opt_ms)},
+            "other_cpu": max(0.0, statistics.fmean(wall_ms) - wait - copy_ms - opt_ms),
+            "host_copy_hidden": hidden_ms, "host_copy_total": copy_ms + hidden_ms},
         "breakdown_detail_ms_per_step": {k: round(v, 4) for k, v in prof.items()},
-        "breakdown_note": "matmul = NPU wait (cpu backends: torch.mm); host_copy_sync = fp32->bf16 + transpose copy into device buffers, "
-                          "BO syncs, kernel submit, result copy out (cpu-bf16: casts); other_cpu = bias, GELU, loss, autograd, zero_grad",
+        "breakdown_note": "matmul = time blocked waiting for the NPU (cpu backends: torch.mm); host_copy_sync = host copy/sync work on the critical "
+                          "path: fp32->bf16 into device buffers, BO syncs, launch, result conversion, waits for the transpose thread (cpu-bf16: casts); "
+                          "host_copy_hidden = background transpose/cast work that ran while the NPU computed (not in the step time); "
+                          "other_cpu = bias, GELU, loss, autograd, zero_grad, and host work overlapped with NPU dW runs",
     }
-
-
-def MM_FP32_EVAL(torch):
-    class _E(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, x, w):
-            return torch.mm(x, w)
-    return _E
 
 
 def rel_l2_t(torch, a, b):
@@ -798,7 +996,7 @@ def e2e_worker(args):
     res["torch"], res["threads"] = torch.__version__, torch.get_num_threads()
     manifest = json.loads(Path(args.manifest).read_text())
     base = Path(args.manifest).resolve().parent
-    cases = {c["id"]: c for c in manifest["cases"]}
+    cases = {c["id"]: c for c in manifest["cases"] + manifest.get("layout_cases", [])}
     cfgs = select_e2e(manifest, args)
     dev = None
     pyxrt = None
@@ -820,34 +1018,41 @@ def e2e_worker(args):
             rec = {"id": f"{cfg['id']}|{backend}", "config": cfg["id"], "backend": backend, "description": E2E_BACKENDS[backend][1]}
             steps = max(E2E_WARM + 5, args.e2e_steps or (cfg.get("quick_steps", 50) if args.quick else cfg["steps"]))
             print(f"[e2e:{args.variant}] {rec['id']} {steps} steps ...", flush=True)
-            shapes = eng = router = calls = MM = None
+            eng = calls = bk = None
             try:
+                opts = E2E_BACKENDS[backend][2]
                 if kind == "npu":
                     if dev is None:
                         raise RuntimeError("NPU not usable: " + res.get("npu_error", "?").strip().splitlines()[-1])
-                    cid = cfg["gemm"]["f32" if backend == "npu-f32out" else "bf16"]
-                    eng = NpuMatmul(dev, cases[cid], base, torch, np, pyxrt)
+                    cid = cfg["gemm"][opts["dout"]]
+                    cs = {"fwd": cases[cid]}
                     rec["xclbin_case"] = cid
-                    shapes = {eng.shape: eng}   # one xclbin per shape; the configs use a single shape
-                    router = lambda a, b: shapes[(a.shape[0], a.shape[1], b.shape[1])].mm(a, b)
-                    calls = lambda: sum(e.calls for e in shapes.values())
+                    if opts["layout"] == "npuT":
+                        lay = (cfg.get("gemm_npuT") or {}).get(opts["dout"])
+                        if not lay:
+                            raise RuntimeError("the manifest has no dX/dW (transposed-operand) xclbins for this config")
+                        cs["dx"], cs["dw"] = cases[lay["dx"]], cases[lay["dw"]]
+                        rec["xclbin_cases_npuT"] = lay
+                    dims = cfg["dims"]
+                    if len(set(dims)) != 1 or cfg["batch"] != dims[0]:
+                        raise RuntimeError("the NPU engine needs batch == width in every layer (one D^3 GEMM shape)")
+                    eng = NpuTrainEngine(dev, cs, base, torch, np, pyxrt, len(dims) - 1, dims[0], opts["dout"] == "f32", opts["layout"])
+                    bk, calls = eng, (lambda: eng.calls)
                 else:
                     eng = CpuMatmul(backend, torch)
-                    router = eng.mm
-                    calls = lambda: eng.calls
+                    bk, calls = FnBackend(torch, eng.mm), (lambda: eng.calls)
                 pool, held, init = e2e_data(torch, np, cfg)
-                MM = e2e_make_function(torch, router)
                 rec["config_detail"] = {k: cfg[k] for k in ("batch", "dims", "lr")}
                 # gradient check at the initial weights on batch 0 against fp32 CPU autograd
                 x0, y0 = pool[0]
                 _PROF.clear()
-                l_a, g_a = e2e_grads(torch, MM, init, x0, y0)
-                l_r, g_r = e2e_grads(torch, e2e_make_function(torch, lambda a, b: torch.mm(a, b)), init, x0, y0)
+                l_a, g_a = e2e_grads(torch, bk, init, x0, y0)
+                l_r, g_r = e2e_grads(torch, FnBackend(torch, torch.mm), init, x0, y0)
                 names = [f"{k}{i}" for i in range(len(init)) for k in ("W", "b")]
                 rec["grad_check"] = {"loss": l_a, "loss_fp32_ref": l_r, "rel_l2": {n: rel_l2_t(torch, a, r) for n, a, r in zip(names, g_a, g_r)}}
                 rec["grad_check"]["max_rel_l2"] = max(rec["grad_check"]["rel_l2"].values())
                 _PROF.clear()
-                rec["train"] = e2e_train(torch, np, MM, init, pool, held, cfg, steps, calls)
+                rec["train"] = e2e_train(torch, np, bk, init, pool, held, cfg, steps, calls)
             except BaseException as e:
                 if isinstance(e, KeyboardInterrupt):
                     res["interrupted"] = True
@@ -856,7 +1061,9 @@ def e2e_worker(args):
                 rec["kernel_log"] = kernel_log_tail(since=T_START - 2) if kind == "npu" else None
                 print(f"[e2e] {rec['id']} ERROR {rec['error']}", flush=True)
             res["runs"].append(rec)
-            shapes = eng = router = calls = MM = None   # release BOs / hw context before the next xclbin
+            if hasattr(eng, "close"):
+                eng.close()
+            eng = calls = bk = None   # release BOs / hw context before the next xclbin
             gc.collect()
             flush()
             if res.get("interrupted"):
@@ -880,7 +1087,8 @@ def select_e2e(manifest, args):
 # orchestrator
 # ----------------------------------------------------------------------------------------------------------
 def select_cases(manifest, args):
-    cases = manifest["cases"]
+    # plain cases, then the transposed-operand variants flagged "bench" (dX: B column-major, dW: A column-major)
+    cases = list(manifest["cases"]) + [c for c in manifest.get("layout_cases", []) if c.get("bench")]
     if getattr(args, "quick", False):
         cases = [c for c in cases if c.get("quick")]
     if getattr(args, "only", None):
@@ -890,7 +1098,7 @@ def select_cases(manifest, args):
 
 def verify_manifest_files(manifest, base):
     problems = []
-    for c in manifest["cases"]:
+    for c in manifest["cases"] + manifest.get("layout_cases", []):
         for key in ("xclbin", "insts"):
             p = base / c[key]
             if not p.is_file():
@@ -932,7 +1140,7 @@ def fmt(x, nd=2):
 
 
 E2E_LOSS_TOL = 0.05     # final-loss relative difference vs the CPU fp32 run that counts as "matches"
-E2E_GRAD_TOL = {"npu-f32out": 0.03, "npu-bf16out": 0.06, "cpu-bf16": 0.06, "cpu-fp32": 1e-6}   # step-0 gradient relL2 vs fp32 autograd
+E2E_GRAD_TOL = {"npu-f32out": 0.03, "npu-f32out-npuT": 0.03, "npu-bf16out": 0.06, "cpu-bf16": 0.06, "cpu-fp32": 1e-6}   # step-0 gradient relL2 vs fp32 autograd
 
 
 def e2e_runs(e2e):
@@ -1282,7 +1490,8 @@ def main():
         # (name, python, OMP variant, backends)
         plan = []
         if want_npu:
-            plan.append(("npu_default", args.python_npu, "default", "npu-f32out,npu-bf16out"))
+            has_npuT = any(c.get("gemm_npuT") for c in select_e2e(manifest, args))
+            plan.append(("npu_default", args.python_npu, "default", "npu-f32out,npu-bf16out" + (",npu-f32out-npuT" if has_npuT else "")))
             plan.append(("npu_passive", args.python_npu, "passive", "npu-f32out"))
         if not args.npu_only:
             plan.append(("cpu_default", args.python_cpu, "default", "cpu-fp32,cpu-bf16"))

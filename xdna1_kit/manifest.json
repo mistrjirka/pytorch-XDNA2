@@ -1,7 +1,7 @@
 {
- "schema": 1,
+ "schema": 2,
  "target": "npu1",
- "built_with": "mlir-aie 1.3.4 + Peano (llvm-aie 21.0.0.2026062301), upstream whole_array.py ed23bba, --dev npu --n-aie-cols 4, native AIE2 bf16 mmul, LOCAL mm.cc with round-to-nearest-even (crRnd=conv_even) before bf16 stores",
+ "built_with": "mlir-aie 1.3.4 + Peano (llvm-aie 21.0.0.2026062301), upstream whole_array.py ed23bba, --dev npu --n-aie-cols 4, native AIE2 bf16 mmul, LOCAL mm.cc with round-to-nearest-even (crRnd=conv_even) before bf16 stores; _dx variants --b-col-maj 1, _dw variants local A_COL_MAJ (src/whole_array_xp.py)",
  "cases": [
   {
    "id": "256x256x128_32x32x32_f32",
@@ -244,6 +244,184 @@
    "quick": true
   }
  ],
+ "layout_cases": [
+  {
+   "id": "1024x1024x1024_64x32x64_f32_dw",
+   "M": 1024,
+   "K": 1024,
+   "N": 1024,
+   "tile": [
+    64,
+    32,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_1024x1024x1024_64x32x64_4c_dw.xclbin",
+   "insts": "npu1_bf16_f32out_1024x1024x1024_64x32x64_4c_dw.bin",
+   "xclbin_sha256": "93c23b7d70e22726db5c4da89e0d0d125ce8c59415b93de0884d17464ee2cb84",
+   "insts_sha256": "081fe71ca39e23180864d490a35d7ac69ca347a4120e2ae75917795a6d9c2c42",
+   "max_rel_l2": 0.01,
+   "quick": false,
+   "variant": "dw",
+   "bench": true
+  },
+  {
+   "id": "1024x1024x1024_64x32x64_f32_dx",
+   "M": 1024,
+   "K": 1024,
+   "N": 1024,
+   "tile": [
+    64,
+    32,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_1024x1024x1024_64x32x64_4c_dx.xclbin",
+   "insts": "npu1_bf16_f32out_1024x1024x1024_64x32x64_4c_dx.bin",
+   "xclbin_sha256": "ff5cd7551e7e0cf76c0ae92973b1154d300bc8275b1ad5526d37bab369022d68",
+   "insts_sha256": "722bc1a0ea474419b43f74b816abc8047a4ac49f594ba234409db7f9f3d23374",
+   "max_rel_l2": 0.01,
+   "quick": false,
+   "variant": "dx",
+   "bench": true
+  },
+  {
+   "id": "1024x1024x1024_64x64x64_bf16_dw",
+   "M": 1024,
+   "K": 1024,
+   "N": 1024,
+   "tile": [
+    64,
+    64,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "bf16",
+   "xclbin": "npu1_bf16_bf16out_1024x1024x1024_64x64x64_4c_dw.xclbin",
+   "insts": "npu1_bf16_bf16out_1024x1024x1024_64x64x64_4c_dw.bin",
+   "xclbin_sha256": "cf93ce24a64abdfc2310ed6f64a5a7bfefd1efcea235253d50a0441dd402394d",
+   "insts_sha256": "a0649fbb08cd8fd6630b67a64afca9c10e363fab68cf6ff90583fa0bf4e66616",
+   "max_rel_l2": 0.015,
+   "quick": false,
+   "variant": "dw",
+   "bench": false
+  },
+  {
+   "id": "1024x1024x1024_64x64x64_bf16_dx",
+   "M": 1024,
+   "K": 1024,
+   "N": 1024,
+   "tile": [
+    64,
+    64,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "bf16",
+   "xclbin": "npu1_bf16_bf16out_1024x1024x1024_64x64x64_4c_dx.xclbin",
+   "insts": "npu1_bf16_bf16out_1024x1024x1024_64x64x64_4c_dx.bin",
+   "xclbin_sha256": "542b3bc3006e61737723e0a71a48323fbc43449318955ac299650b6d15e157fd",
+   "insts_sha256": "da5a3e47b9a28ac8dd43c3a8b358f57a2dad35de8b25115480462865821669be",
+   "max_rel_l2": 0.015,
+   "quick": false,
+   "variant": "dx",
+   "bench": false
+  },
+  {
+   "id": "2048x2048x2048_64x32x64_f32_dw",
+   "M": 2048,
+   "K": 2048,
+   "N": 2048,
+   "tile": [
+    64,
+    32,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_2048x2048x2048_64x32x64_4c_dw.xclbin",
+   "insts": "npu1_bf16_f32out_2048x2048x2048_64x32x64_4c_dw.bin",
+   "xclbin_sha256": "243c1ad56742d0d7096b84f4ca8d396909e8288b657d980d9363c48173ae11fe",
+   "insts_sha256": "7c796cad735a6df1ba93e74089d7ed3f17ae78ff1fff54f91860e9eb3ec73bb1",
+   "max_rel_l2": 0.01,
+   "quick": false,
+   "variant": "dw",
+   "bench": false
+  },
+  {
+   "id": "2048x2048x2048_64x32x64_f32_dx",
+   "M": 2048,
+   "K": 2048,
+   "N": 2048,
+   "tile": [
+    64,
+    32,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_2048x2048x2048_64x32x64_4c_dx.xclbin",
+   "insts": "npu1_bf16_f32out_2048x2048x2048_64x32x64_4c_dx.bin",
+   "xclbin_sha256": "9837f6965e4e3f01ee71bab28b7e93c2f690e3f62621210fb50b1ce6dd94e9ce",
+   "insts_sha256": "f7d80f75a7d2d71921d6ff180ae5537b8c0b31042ab48095ffac17b0c8179259",
+   "max_rel_l2": 0.01,
+   "quick": false,
+   "variant": "dx",
+   "bench": false
+  },
+  {
+   "id": "2048x2048x2048_64x64x64_bf16_dw",
+   "M": 2048,
+   "K": 2048,
+   "N": 2048,
+   "tile": [
+    64,
+    64,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "bf16",
+   "xclbin": "npu1_bf16_bf16out_2048x2048x2048_64x64x64_4c_dw.xclbin",
+   "insts": "npu1_bf16_bf16out_2048x2048x2048_64x64x64_4c_dw.bin",
+   "xclbin_sha256": "290e2eda38086a30471c5f455dba407a04aef1f83ada3e9eb99bd013fb70900b",
+   "insts_sha256": "33c43103473a55966a5802f6c50fad06e33651bd3b6819015fe2dd928b831d7f",
+   "max_rel_l2": 0.015,
+   "quick": false,
+   "variant": "dw",
+   "bench": false
+  },
+  {
+   "id": "2048x2048x2048_64x64x64_bf16_dx",
+   "M": 2048,
+   "K": 2048,
+   "N": 2048,
+   "tile": [
+    64,
+    64,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "bf16",
+   "xclbin": "npu1_bf16_bf16out_2048x2048x2048_64x64x64_4c_dx.xclbin",
+   "insts": "npu1_bf16_bf16out_2048x2048x2048_64x64x64_4c_dx.bin",
+   "xclbin_sha256": "852296f17a5a98ba03be293f964ac3421b36b2d07a900707ee6975ac20e5c21f",
+   "insts_sha256": "c5518121bb023fc01196fb83e4cb299a08dc7f3fa236b33f24d9589eecc0aaec",
+   "max_rel_l2": 0.015,
+   "quick": false,
+   "variant": "dx",
+   "bench": false
+  }
+ ],
  "e2e": {
   "configs": [
    {
@@ -264,6 +442,16 @@
     "gemm": {
      "f32": "1024x1024x1024_64x32x64_f32",
      "bf16": "1024x1024x1024_64x64x64_bf16"
+    },
+    "gemm_npuT": {
+     "f32": {
+      "dx": "1024x1024x1024_64x32x64_f32_dx",
+      "dw": "1024x1024x1024_64x32x64_f32_dw"
+     },
+     "bf16": {
+      "dx": "1024x1024x1024_64x64x64_bf16_dx",
+      "dw": "1024x1024x1024_64x64x64_bf16_dw"
+     }
     }
    },
    {
@@ -284,6 +472,16 @@
     "gemm": {
      "f32": "2048x2048x2048_64x32x64_f32",
      "bf16": "2048x2048x2048_64x64x64_bf16"
+    },
+    "gemm_npuT": {
+     "f32": {
+      "dx": "2048x2048x2048_64x32x64_f32_dx",
+      "dw": "2048x2048x2048_64x32x64_f32_dw"
+     },
+     "bf16": {
+      "dx": "2048x2048x2048_64x64x64_bf16_dx",
+      "dw": "2048x2048x2048_64x64x64_bf16_dw"
+     }
     }
    }
   ]
