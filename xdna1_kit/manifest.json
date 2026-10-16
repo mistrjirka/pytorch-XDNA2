@@ -84,6 +84,26 @@
    "quick": false
   },
   {
+   "id": "1024x1024x1024_64x32x64_f32",
+   "M": 1024,
+   "K": 1024,
+   "N": 1024,
+   "tile": [
+    64,
+    32,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_1024x1024x1024_64x32x64_4c.xclbin",
+   "insts": "npu1_bf16_f32out_1024x1024x1024_64x32x64_4c.bin",
+   "xclbin_sha256": "7ea199e3af3e7dea4d5ad4e96c159b05f867408b26666c85343e9e63555db368",
+   "insts_sha256": "53b99352e6b81b9cfbb6a1865166ccdc3c99243e7cc756adb49f0bbaa7d08ffb",
+   "max_rel_l2": 0.01,
+   "quick": false
+  },
+  {
    "id": "1024x1024x1024_64x64x64_bf16",
    "M": 1024,
    "K": 1024,
@@ -223,5 +243,49 @@
    "max_rel_l2": 0.015,
    "quick": true
   }
- ]
+ ],
+ "e2e": {
+  "configs": [
+   {
+    "id": "mlp3_b1024_w1024",
+    "batch": 1024,
+    "dims": [
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "steps": 300,
+    "quick_steps": 60,
+    "quick": true,
+    "fp32_ref": true,
+    "npu_passive": true,
+    "lr": 0.0003,
+    "gemm": {
+     "f32": "1024x1024x1024_64x32x64_f32",
+     "bf16": "1024x1024x1024_64x64x64_bf16"
+    }
+   },
+   {
+    "id": "mlp3_b2048_w2048",
+    "batch": 2048,
+    "dims": [
+     2048,
+     2048,
+     2048,
+     2048
+    ],
+    "steps": 60,
+    "quick_steps": 20,
+    "quick": false,
+    "fp32_ref": false,
+    "npu_passive": false,
+    "lr": 0.0003,
+    "gemm": {
+     "f32": "2048x2048x2048_64x32x64_f32",
+     "bf16": "2048x2048x2048_64x64x64_bf16"
+    }
+   }
+  ]
+ }
 }

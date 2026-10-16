@@ -22,7 +22,7 @@ What it does
 
 The NPU worker needs: python with pyxrt + numpy (Arch/Manjaro: `pacman -S xrt xrt-plugin-amdxdna`, system python).
 The CPU worker needs: python with torch (CPU build is enough). Both run with the python that starts the script
-(a `--system-site-packages` venv sees pyxrt and torch); --python-npu / --python-cpu override.
+(a uv venv created with `--python /usr/bin/python3 --system-site-packages` sees pyxrt and torch); --python-npu / --python-cpu override.
 No mlir-aie / IRON / Peano installation is needed: the xclbins are prebuilt.
 
 Safe by construction: nothing is installed, no files outside --outdir are written, no sudo is called.
@@ -30,6 +30,7 @@ Safe by construction: nothing is installed, no files outside --outdir are writte
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import hashlib
 import json
@@ -551,6 +552,331 @@ def cpu_worker(args):
 
 
 # ----------------------------------------------------------------------------------------------------------
+# END-TO-END training test (worker role "e2e"): an MLP trained with every matmul (forward AND backward) on the NPU,
+# against the identical training on the CPU. Needs python with torch + numpy (+ pyxrt for the NPU backends).
+# ----------------------------------------------------------------------------------------------------------
+E2E_WARM = 5            # first steps are trained but not timed (xclbin/BO first-use effects, torch allocator warm-up)
+E2E_POOL = 8            # batches of the synthetic dataset, cycled
+E2E_BACKENDS = {        # name -> (kind, description)
+    "npu-f32out": ("npu", "NPU matmuls, bf16 inputs, fp32 accumulate + fp32 output"),
+    "npu-bf16out": ("npu", "NPU matmuls, bf16 inputs, fp32 accumulate, bf16 output (RNE store)"),
+    "cpu-bf16": ("cpu", "CPU torch.mm on bf16 operands (like bf16 autocast), fp32 master weights/optimizer"),
+    "cpu-fp32": ("cpu", "CPU torch.mm in fp32 (loss reference)"),
+}
+_PROF = {}
+
+
+def _acc(key, dt):
+    _PROF[key] = _PROF.get(key, 0.0) + dt
+
+
+class NpuMatmul:
+    """One prebuilt fixed-shape xclbin (M,K,N) as a torch-friendly matmul: operands are converted to bf16 straight
+    into the mapped device buffers (the transpose of a strided view happens inside that copy), the result is copied out."""
+
+    def __init__(self, dev, case, base, torch, np, pyxrt):
+        self.shape = (case["M"], case["K"], case["N"])
+        M, K, N = self.shape
+        self.f32 = case["dtype_out"] == "f32"
+        self.tp = pyxrt
+        self.to_dev = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+        self.from_dev = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
+        xb = pyxrt.xclbin(str(base / case["xclbin"]))
+        dev.register_xclbin(xb)
+        self.ctx = pyxrt.hw_context(dev, xb.get_uuid())
+        self.k = pyxrt.kernel(self.ctx, [x.get_name() for x in xb.get_kernels()][0])
+        instr = np.fromfile(str(base / case["insts"]), dtype=np.uint32)
+        self.n_instr = len(instr)
+        self.bo_i = pyxrt.bo(dev, instr.nbytes, pyxrt.bo.cacheable, self.k.group_id(1))
+        self.bo_a = pyxrt.bo(dev, M * K * 2, pyxrt.bo.host_only, self.k.group_id(3))
+        self.bo_b = pyxrt.bo(dev, K * N * 2, pyxrt.bo.host_only, self.k.group_id(4))
+        self.bo_c = pyxrt.bo(dev, M * N * (4 if self.f32 else 2), pyxrt.bo.host_only, self.k.group_id(5))
+        self.bo_t = pyxrt.bo(dev, 1, pyxrt.bo.host_only, self.k.group_id(6))
+        self.bo_r = pyxrt.bo(dev, 4, pyxrt.bo.host_only, self.k.group_id(7))
+        self.bo_i.write(instr.tobytes(), 0)
+        self.bo_i.sync(self.to_dev)
+        # torch tensors that alias the mapped buffers
+        self.A = torch.from_numpy(np.frombuffer(self.bo_a.map(), dtype=np.int16)).view(torch.bfloat16).view(M, K)
+        self.B = torch.from_numpy(np.frombuffer(self.bo_b.map(), dtype=np.int16)).view(torch.bfloat16).view(K, N)
+        cm = self.bo_c.map()
+        self.C = (torch.from_numpy(np.frombuffer(cm, dtype=np.float32)).view(M, N) if self.f32
+                  else torch.from_numpy(np.frombuffer(cm, dtype=np.int16)).view(torch.bfloat16).view(M, N))
+        self.calls = 0
+
+    def mm(self, a, b):
+        M, K, N = self.shape
+        if tuple(a.shape) != (M, K) or tuple(b.shape) != (K, N):
+            raise RuntimeError(f"xclbin is {M}x{K}x{N}, got operands {tuple(a.shape)} @ {tuple(b.shape)}")
+        pc = time.perf_counter
+        t0 = pc()
+        # fp32 -> bf16 (RNE) first (fast, keeps the operand's strides), then one copy into the mapped device buffer;
+        # for the transposed operands (W^T, X^T) that copy IS the transpose (half the bytes of a fp32 transpose)
+        self.A.copy_(a.to(self.A.dtype))
+        self.B.copy_(b.to(self.B.dtype))
+        t1 = pc()
+        self.bo_a.sync(self.to_dev)
+        self.bo_b.sync(self.to_dev)
+        r = self.k(3, self.bo_i, self.n_instr, self.bo_a, self.bo_b, self.bo_c, self.bo_t, self.bo_r)
+        t2 = pc()
+        st = r.wait(60000)
+        t3 = pc()
+        if "COMPLETED" not in str(st):
+            raise RuntimeError(f"NPU dispatch did not complete: ert_cmd_state={st}")
+        self.bo_c.sync(self.from_dev)
+        t4 = pc()
+        out = self.C.clone() if self.f32 else self.C.float()
+        t5 = pc()
+        self.calls += 1
+        _acc("pack", t1 - t0); _acc("submit_sync", (t2 - t1) + (t4 - t3)); _acc("wait", t3 - t2); _acc("unpack", t5 - t4)
+        return out
+
+
+class CpuMatmul:
+    def __init__(self, kind, torch):
+        self.bf16 = kind == "cpu-bf16"
+        self.torch = torch
+        self.calls = 0
+
+    def mm(self, a, b):
+        torch, pc = self.torch, time.perf_counter
+        self.calls += 1
+        if not self.bf16:
+            t0 = pc(); o = torch.mm(a, b); _acc("wait", pc() - t0)
+            return o
+        t0 = pc(); a16 = a.to(torch.bfloat16); b16 = b.to(torch.bfloat16)
+        t1 = pc(); o = torch.mm(a16, b16)
+        t2 = pc(); out = o.float()
+        t3 = pc()
+        _acc("pack", t1 - t0); _acc("wait", t2 - t1); _acc("unpack", t3 - t2)
+        return out
+
+
+def e2e_make_function(torch, router):
+    class MM(torch.autograd.Function):
+        """y = x @ W; dX = dY @ W^T and dW = X^T @ dY are routed to the same matmul engine (NPU or CPU)."""
+        @staticmethod
+        def forward(ctx, x, w):
+            ctx.save_for_backward(x, w)
+            return router(x, w)
+
+        @staticmethod
+        def backward(ctx, g):
+            x, w = ctx.saved_tensors
+            dx = router(g, w.t()) if ctx.needs_input_grad[0] else None
+            dw = router(x.t(), g) if ctx.needs_input_grad[1] else None
+            return dx, dw
+    return MM
+
+
+def e2e_data(torch, np, cfg):
+    """Deterministic synthetic regression problem: y = tanh(x @ U @ V), a fixed random low-rank teacher (learnable)."""
+    rng = np.random.default_rng(20261016 + cfg["batch"] + cfg["dims"][0])
+    d_in, d_out, B = cfg["dims"][0], cfg["dims"][-1], cfg["batch"]
+    r = max(8, d_in // 16)
+    wt = (torch.from_numpy(rng.standard_normal((d_in, r), dtype=np.float32) / np.float32(d_in ** 0.5))
+          @ torch.from_numpy(rng.standard_normal((r, d_out), dtype=np.float32) / np.float32(r ** 0.5)))
+    pool = []
+    for _ in range(E2E_POOL + 1):      # the last batch is held out for the final evaluation
+        x = torch.from_numpy(rng.standard_normal((B, d_in), dtype=np.float32))
+        pool.append((x, torch.tanh(x @ wt)))
+    init = []
+    for i in range(len(cfg["dims"]) - 1):
+        fi, fo = cfg["dims"][i], cfg["dims"][i + 1]
+        scale = (2.0 / fi) ** 0.5 if i < len(cfg["dims"]) - 2 else 0.1 * (1.0 / fi) ** 0.5   # small output layer: no collapse-to-zero plateau
+        init.append((rng.standard_normal((fi, fo), dtype=np.float32) * np.float32(scale), np.zeros(fo, dtype=np.float32)))
+    return pool[:-1], pool[-1], init
+
+
+def e2e_forward(torch, MM, params, x):
+    h = x
+    for i, (w, b) in enumerate(params):
+        h = MM.apply(h, w) + b          # matmul on the engine, bias on the CPU
+        if i < len(params) - 1:
+            h = torch.nn.functional.gelu(h)
+    return h
+
+
+def e2e_params(torch, init):
+    return [(torch.from_numpy(w.copy()).requires_grad_(), torch.from_numpy(b.copy()).requires_grad_()) for w, b in init]
+
+
+def e2e_grads(torch, MM, init, x, y):
+    ps = e2e_params(torch, init)
+    loss = torch.nn.functional.mse_loss(e2e_forward(torch, MM, ps, x), y)
+    loss.backward()
+    return loss.item(), [g for w, b in ps for g in (w.grad.clone(), b.grad.clone())]
+
+
+def e2e_train(torch, np, MM, init, pool, held, cfg, steps, router_calls):
+    """Train; per-step wall / process-CPU / breakdown after E2E_WARM steps. Returns the record."""
+    params = e2e_params(torch, init)
+    flat = [t for p in params for t in p]
+    try:
+        opt = torch.optim.Adam(flat, lr=cfg["lr"], fused=True)
+    except Exception:
+        opt = torch.optim.Adam(flat, lr=cfg["lr"])
+    pc = time.perf_counter
+    losses, walls, cpus, opts = [], [], [], []
+    em = EnergyMeter()
+    r0 = b0 = t_start = None
+    for step in range(steps):
+        if step == E2E_WARM:
+            _PROF.clear()
+            r0 = resource.getrusage(resource.RUSAGE_SELF); b0 = cpu_busy_seconds(); em.start(); t_start = pc()
+            calls0 = router_calls()
+        x, y = pool[step % len(pool)]
+        c0 = time.process_time(); t0 = pc()
+        loss = torch.nn.functional.mse_loss(e2e_forward(torch, MM, params, x), y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        t1 = pc()
+        opt.step()
+        t2 = pc()
+        losses.append(loss.item())
+        t3 = pc(); c1 = time.process_time()
+        if step >= E2E_WARM:
+            walls.append(t3 - t0); cpus.append(c1 - c0); opts.append(t2 - t1)
+    n = len(walls)
+    total = pc() - t_start
+    joules, watts = em.stop()
+    r1 = resource.getrusage(resource.RUSAGE_SELF); b1 = cpu_busy_seconds()
+    proc_cpu = (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
+    with torch.no_grad():
+        xe, ye = held
+        ev = float(torch.nn.functional.mse_loss(e2e_forward(torch, MM_FP32_EVAL(torch), params, xe), ye))
+    prof = {k: v / n * 1e3 for k, v in _PROF.items()}
+    wait, opt_ms = prof.get("wait", 0.0), statistics.fmean(opts) * 1e3
+    copy_ms = prof.get("pack", 0) + prof.get("submit_sync", 0) + prof.get("unpack", 0)
+    wall_ms = [w * 1e3 for w in walls]
+    return {
+        "steps": steps, "timed_steps": n, "warmup_steps_excluded": E2E_WARM,
+        "mm_calls_per_step": (router_calls() - calls0) / n,
+        "losses": [round(v, 7) for v in losses],
+        "final_loss_mean_last10": statistics.fmean(losses[-10:]), "eval_loss_heldout_fp32": ev,
+        "step_ms": stats_ms(wall_ms), "total_wall_s": total,
+        "proc_cpu_ms_per_step": proc_cpu / n * 1e3, "proc_cpu_ms_per_step_median": statistics.median(cpus) * 1e3,
+        "proc_cpu_over_wall": proc_cpu / total,
+        "sys_busy_cpu_ms_per_step": (b1 - b0) / n * 1e3,
+        "energy_source": em.kind, "mean_power_W": watts,
+        "energy_mJ_per_step": (joules / n * 1e3) if joules is not None else None,
+        "breakdown_ms_per_step": {
+            "matmul": wait, "host_copy_sync": copy_ms, "optimizer": opt_ms,
+            "other_cpu": max(0.0, statistics.fmean(wall_ms) - wait - copy_ms - opt_ms)},
+        "breakdown_detail_ms_per_step": {k: round(v, 4) for k, v in prof.items()},
+        "breakdown_note": "matmul = NPU wait (cpu backends: torch.mm); host_copy_sync = fp32->bf16 + transpose copy into device buffers, "
+                          "BO syncs, kernel submit, result copy out (cpu-bf16: casts); other_cpu = bias, GELU, loss, autograd, zero_grad",
+    }
+
+
+def MM_FP32_EVAL(torch):
+    class _E(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, w):
+            return torch.mm(x, w)
+    return _E
+
+
+def rel_l2_t(torch, a, b):
+    return float(torch.linalg.vector_norm((a - b).double()) / torch.linalg.vector_norm(b.double()))
+
+
+def e2e_worker(args):
+    import numpy as np
+    out_path = Path(args.json_out)
+    res = {"role": "e2e", "variant": args.variant, "omp_wait_policy": os.environ.get("OMP_WAIT_POLICY", "(unset)"),
+           "backends": args.e2e_backends, "runs": [], "finished": False}
+
+    def flush():
+        out_path.write_text(json.dumps(res, indent=1))
+    flush()
+    try:
+        import torch
+    except Exception:
+        res["error"] = "torch not importable: " + traceback.format_exc()
+        flush()
+        return 0
+    res["torch"], res["threads"] = torch.__version__, torch.get_num_threads()
+    manifest = json.loads(Path(args.manifest).read_text())
+    base = Path(args.manifest).resolve().parent
+    cases = {c["id"]: c for c in manifest["cases"]}
+    cfgs = select_e2e(manifest, args)
+    dev = None
+    pyxrt = None
+    for backend in args.e2e_backends.split(","):
+        kind = E2E_BACKENDS[backend][0]
+        if kind == "npu" and dev is None and "npu_error" not in res:
+            try:
+                import pyxrt
+                dev = pyxrt.device(0)
+                res["device_name"] = str(dev.get_info(pyxrt.xrt_info_device.name))
+            except Exception:
+                res["npu_error"] = traceback.format_exc()
+        for cfg in cfgs:
+            # run-time budget: the fp32 reference only where the config asks for it, the PASSIVE NPU run only for the small config
+            if backend == "cpu-fp32" and not cfg.get("fp32_ref", True):
+                continue
+            if kind == "npu" and args.variant == "passive" and not cfg.get("npu_passive", True):
+                continue
+            rec = {"id": f"{cfg['id']}|{backend}", "config": cfg["id"], "backend": backend, "description": E2E_BACKENDS[backend][1]}
+            steps = max(E2E_WARM + 5, args.e2e_steps or (cfg.get("quick_steps", 50) if args.quick else cfg["steps"]))
+            print(f"[e2e:{args.variant}] {rec['id']} {steps} steps ...", flush=True)
+            shapes = eng = router = calls = MM = None
+            try:
+                if kind == "npu":
+                    if dev is None:
+                        raise RuntimeError("NPU not usable: " + res.get("npu_error", "?").strip().splitlines()[-1])
+                    cid = cfg["gemm"]["f32" if backend == "npu-f32out" else "bf16"]
+                    eng = NpuMatmul(dev, cases[cid], base, torch, np, pyxrt)
+                    rec["xclbin_case"] = cid
+                    shapes = {eng.shape: eng}   # one xclbin per shape; the configs use a single shape
+                    router = lambda a, b: shapes[(a.shape[0], a.shape[1], b.shape[1])].mm(a, b)
+                    calls = lambda: sum(e.calls for e in shapes.values())
+                else:
+                    eng = CpuMatmul(backend, torch)
+                    router = eng.mm
+                    calls = lambda: eng.calls
+                pool, held, init = e2e_data(torch, np, cfg)
+                MM = e2e_make_function(torch, router)
+                rec["config_detail"] = {k: cfg[k] for k in ("batch", "dims", "lr")}
+                # gradient check at the initial weights on batch 0 against fp32 CPU autograd
+                x0, y0 = pool[0]
+                _PROF.clear()
+                l_a, g_a = e2e_grads(torch, MM, init, x0, y0)
+                l_r, g_r = e2e_grads(torch, e2e_make_function(torch, lambda a, b: torch.mm(a, b)), init, x0, y0)
+                names = [f"{k}{i}" for i in range(len(init)) for k in ("W", "b")]
+                rec["grad_check"] = {"loss": l_a, "loss_fp32_ref": l_r, "rel_l2": {n: rel_l2_t(torch, a, r) for n, a, r in zip(names, g_a, g_r)}}
+                rec["grad_check"]["max_rel_l2"] = max(rec["grad_check"]["rel_l2"].values())
+                _PROF.clear()
+                rec["train"] = e2e_train(torch, np, MM, init, pool, held, cfg, steps, calls)
+            except BaseException as e:
+                if isinstance(e, KeyboardInterrupt):
+                    res["interrupted"] = True
+                rec["error"] = f"{type(e).__name__}: {e}"
+                rec["traceback"] = traceback.format_exc()
+                rec["kernel_log"] = kernel_log_tail(since=T_START - 2) if kind == "npu" else None
+                print(f"[e2e] {rec['id']} ERROR {rec['error']}", flush=True)
+            res["runs"].append(rec)
+            shapes = eng = router = calls = MM = None   # release BOs / hw context before the next xclbin
+            gc.collect()
+            flush()
+            if res.get("interrupted"):
+                break
+    res["finished"] = True
+    flush()
+    return 0
+
+
+def select_e2e(manifest, args):
+    cfgs = list((manifest.get("e2e") or {}).get("configs") or [])
+    if getattr(args, "quick", False):
+        cfgs = [c for c in cfgs if c.get("quick")]
+    if getattr(args, "e2e_config", None):
+        cfgs = [c for c in cfgs if args.e2e_config in c["id"]]
+    return cfgs
+
+
+
+# ----------------------------------------------------------------------------------------------------------
 # orchestrator
 # ----------------------------------------------------------------------------------------------------------
 def select_cases(manifest, args):
@@ -605,7 +931,98 @@ def fmt(x, nd=2):
     return "-" if x is None else (f"{x:.{nd}f}" if isinstance(x, (int, float)) else str(x))
 
 
-def summarize(env, npu, cpus, manifest, run_info=None):
+E2E_LOSS_TOL = 0.05     # final-loss relative difference vs the CPU fp32 run that counts as "matches"
+E2E_GRAD_TOL = {"npu-f32out": 0.03, "npu-bf16out": 0.06, "cpu-bf16": 0.06, "cpu-fp32": 1e-6}   # step-0 gradient relL2 vs fp32 autograd
+
+
+def e2e_runs(e2e):
+    """Flatten worker results -> list of dicts with the worker's variant attached."""
+    out = []
+    for w in e2e or []:
+        for r in w.get("runs", []):
+            out.append(dict(r, variant=w.get("variant", "?"), worker=w.get("name", "?"), threads=w.get("threads"),
+                            omp_wait_policy=w.get("omp_wait_policy")))
+    return out
+
+
+def summarize_e2e(e2e, manifest):
+    L = []
+    runs = e2e_runs(e2e)
+    L.append("")
+    L.append("=" * 118)
+    L.append("END-TO-END MLP TRAINING: every matmul (forward y=x@W, backward dX=dY@W^T and dW=X^T@dY) on the NPU vs the same training on the CPU")
+    L.append("bias, GELU, MSE loss, autograd bookkeeping and the Adam optimizer always run on the CPU. Same init, same data, same steps for every run.")
+    L.append("cpu-bf16 = torch.mm on bf16 operands (what bf16 autocast does) with fp32 master weights/Adam; cpu-fp32 = loss reference.")
+    for w in e2e or []:
+        if w.get("error") and not w.get("runs"):
+            L.append(f"E2E WORKER {w.get('name')} FAILED: {str(w['error']).strip().splitlines()[-1] if str(w['error']).strip() else ''}")
+        if w.get("npu_error"):
+            L.append(f"E2E WORKER {w.get('name')}: NPU not usable: {w['npu_error'].strip().splitlines()[-1]}")
+    cfgs = (manifest.get("e2e") or {}).get("configs") or []
+    for cfg in cfgs:
+        mine = [r for r in runs if r["config"] == cfg["id"]]
+        if not mine:
+            continue
+        L.append("")
+        dims = "-".join(str(d) for d in cfg["dims"])
+        calls = next((r["train"]["mm_calls_per_step"] for r in mine if "train" in r), "?")
+        L.append(f"config {cfg['id']}: {len(cfg['dims']) - 1} layers {dims}, batch {cfg['batch']}, Adam lr {cfg['lr']}, {calls:.0f} matmuls per step, GEMM shape "
+                 f"{cfg['batch']}x{cfg['dims'][0]}x{cfg['dims'][1]} (all fwd/dX/dW matmuls have this one shape)")
+        L.append(f"{'run (backend/omp)':26s} {'steps':>5s} {'loss0':>8s} {'25%':>8s} {'50%':>8s} {'final':>8s} {'eval':>8s} {'gradErr':>8s} "
+                 f"{'step ms':>8s} {'p90':>7s} {'cpu ms':>8s} {'cpu/wall':>8s} {'mJ/step':>8s} | {'matmul':>7s} {'copy':>6s} {'optim':>6s} {'other':>6s}")
+        for r in mine:
+            name = f"{r['backend']}/{r['variant']}"
+            if "error" in r:
+                L.append(f"{name:26s} ERROR {r['error']}")
+                continue
+            t, g = r["train"], r["grad_check"]
+            ls = t["losses"]
+            n = len(ls)
+            bd = t["breakdown_ms_per_step"]
+            L.append(f"{name:26s} {n:5d} {ls[0]:8.4f} {ls[n // 4]:8.4f} {ls[n // 2]:8.4f} {t['final_loss_mean_last10']:8.4f} {t['eval_loss_heldout_fp32']:8.4f} "
+                     f"{g['max_rel_l2']:8.4f} {t['step_ms']['median']:8.2f} {t['step_ms']['p90']:7.2f} {t['proc_cpu_ms_per_step']:8.2f} "
+                     f"{t['proc_cpu_over_wall']:8.2f} {fmt(t['energy_mJ_per_step'], 1):>8s} | {bd['matmul']:7.2f} {bd['host_copy_sync']:6.2f} {bd['optimizer']:6.2f} {bd['other_cpu']:6.2f}")
+        L.append("  (loss columns: training loss at step 0 / 25% / 50% / mean of last 10; eval = held-out batch, fp32 forward; gradErr = relL2 of the "
+                 "step-0 gradients vs fp32 autograd, max over parameters; cpu ms = process CPU time per step; breakdown in ms per step)")
+        ok = lambda b, v: next((r for r in mine if r["backend"] == b and r["variant"] == v and "train" in r), None)
+        ref32, refbf = ok("cpu-fp32", "default"), ok("cpu-bf16", "default")
+        for r in mine:
+            if "train" not in r or not r["backend"].startswith("npu"):
+                continue
+            name = f"{r['backend']}/{r['variant']}"
+            t = r["train"]
+            parts = []
+            for lab, ref in (("cpu-fp32", ref32), ("cpu-bf16", refbf)):
+                if ref:
+                    d = (t["final_loss_mean_last10"] - ref["train"]["final_loss_mean_last10"]) / ref["train"]["final_loss_mean_last10"]
+                    curve = max(abs(a - b) / b for a, b in zip(t["losses"], ref["train"]["losses"]) if b)
+                    parts.append(f"vs {lab}: final-loss diff {d * 100:+.2f}% (max over curve {curve * 100:.1f}%)")
+            ref, rl = (ref32, "cpu-fp32") if ref32 else (refbf, "cpu-bf16")
+            gok = r["grad_check"]["max_rel_l2"] <= E2E_GRAD_TOL[r["backend"]]
+            if ref:
+                d = abs(t["final_loss_mean_last10"] - ref["train"]["final_loss_mean_last10"]) / ref["train"]["final_loss_mean_last10"]
+                parts.append(f"LOSS MATCH {'PASS' if d <= E2E_LOSS_TOL else 'FAIL'} (tol {E2E_LOSS_TOL * 100:.0f}% of {rl}), ")
+            parts.append(f"GRAD CHECK {'PASS' if gok else 'FAIL'} (tol {E2E_GRAD_TOL[r['backend']]})")
+            L.append(f"  {name}: " + "; ".join(parts).replace(", ;", ","))
+        if not any("train" in r and r["backend"].startswith("npu") for r in mine):
+            continue
+        L.append("  NPU vs CPU (ratio > 1: NPU better) -- step time / process CPU time / energy per step")
+        for r in mine:
+            if "train" not in r or not r["backend"].startswith("npu"):
+                continue
+            for cr in mine:
+                if "train" not in cr or not cr["backend"].startswith("cpu") or cr["backend"] == "cpu-fp32" and cr["variant"] != "default":
+                    continue
+                a, b = r["train"], cr["train"]
+                en = (b["energy_mJ_per_step"] / a["energy_mJ_per_step"]) if a["energy_mJ_per_step"] and b["energy_mJ_per_step"] else None
+                L.append(f"    {r['backend'] + '/' + r['variant']:24s} vs {cr['backend'] + '/' + cr['variant']:20s} "
+                         f"speed {b['step_ms']['median'] / a['step_ms']['median']:5.2f}  cpu-time {b['proc_cpu_ms_per_step'] / a['proc_cpu_ms_per_step']:5.2f}  "
+                         f"energy {fmt(en):>5s}")
+    return L
+
+
+
+def summarize(env, npu, cpus, manifest, run_info=None, e2e=None):
     L = []
     L.append(f"XDNA1 bf16 GEMM kit  {env['time']}  {env['cpu_model']}  kernel {env['kernel']}")
     L.append(f"NPU: {env['npu_devices']}   energy source: {env['energy_meter']['kind']} ({env['energy_meter']['detail']})")
@@ -680,6 +1097,8 @@ def summarize(env, npu, cpus, manifest, run_info=None):
                 cput = m["proc_cpu_ms_per_call"] / e["proc_cpu_ms_per_call"] if e["proc_cpu_ms_per_call"] else float("inf")
                 en = (m["energy_mJ_per_call"] / e["energy_mJ_per_call"]) if m["energy_mJ_per_call"] and e["energy_mJ_per_call"] else None
                 L.append(f"{c['id']:44s} {cpu['variant']:>14s} {speed:6.2f} {cput:8.2f} {fmt(en):>7s}")
+    if e2e:
+        L += summarize_e2e(e2e, manifest)
     return "\n".join(L)
 
 
@@ -704,7 +1123,7 @@ def main():
     ap.add_argument("--idle-seconds", type=float, default=3.0)
     ap.add_argument("--python-npu", default=sys.executable, help="python with pyxrt + numpy (default: the python running this script)")
     ap.add_argument("--python-cpu", default=sys.executable, help="python with torch + numpy (default: the python running this script)")
-    ap.add_argument("--cpu-variants", default="default,passive,passive4", help="comma list of: default, passive, passive4")
+    ap.add_argument("--cpu-variants", default="default,passive", help="comma list of: default, passive, passive4")
     ap.add_argument("--cpu-only", action="store_true", help="skip the NPU part (works on any machine)")
     ap.add_argument("--npu-only", action="store_true")
     ap.add_argument("--env-only", action="store_true", help="print the environment report and exit")
@@ -719,7 +1138,12 @@ def main():
     ap.add_argument("--pmode", choices=["default", "powersaver", "balanced", "performance", "turbo"],
                     help="set the NPU power mode with `xrt-smi configure --pmode` for the NPU part and restore `default` afterwards "
                          "(an Ryzen 7 8700G thesis measured NPU clocks 0.79/1.02/1.79 GHz for powersaver/balanced/turbo)")
-    ap.add_argument("--role", choices=["npu", "cpu"], help=argparse.SUPPRESS)
+    ap.add_argument("--no-e2e", action="store_true", help="skip the end-to-end MLP training test (only the GEMM cases)")
+    ap.add_argument("--e2e-only", action="store_true", help="run only the end-to-end MLP training test (skip the GEMM cases)")
+    ap.add_argument("--e2e-config", help="substring filter on the e2e config ids in the manifest")
+    ap.add_argument("--e2e-steps", type=int, default=0, help="override the number of training steps of every e2e config")
+    ap.add_argument("--role", choices=["npu", "cpu", "e2e"], help=argparse.SUPPRESS)
+    ap.add_argument("--e2e-backends", default="cpu-bf16", help=argparse.SUPPRESS)
     ap.add_argument("--variant", default="default", help=argparse.SUPPRESS)
     ap.add_argument("--json-out", help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -730,6 +1154,8 @@ def main():
         return npu_worker(args)
     if args.role == "cpu":
         return cpu_worker(args)
+    if args.role == "e2e":
+        return e2e_worker(args)
 
     tag = "_" + (args.tag or args.power) if (args.tag or args.power) else ""
     outdir = Path(args.outdir)
@@ -790,9 +1216,20 @@ def main():
             return refuse(outdir, host, stamp, env, 6,
                           f"pyxrt is not importable with {args.python_npu}: {env['pyxrt']}\n"
                           "pyxrt comes with the Arch/Manjaro `xrt` package and only exists for the SYSTEM python "
-                          "(/usr/lib/python3.*/site-packages/pyxrt*.so). Create the venv with `python3 -m venv --system-site-packages kitvenv` "
-                          "(see README) or pass --python-npu /usr/bin/python3.", tag)
+                          "(/usr/lib/python3.*/site-packages/pyxrt*.so). Create the venv on the system python with "
+                          "`uv venv --python /usr/bin/python3 --system-site-packages kitvenv` (see README: the venv must be on the python "
+                          "that matches the pyxrt .so, i.e. /usr/bin/python3, and must have system site-packages), or pass --python-npu /usr/bin/python3.", tag)
     if args.dry_run:
+        e2e_cfgs = select_e2e(manifest, args)
+        if not args.no_e2e:
+            have = {c["id"] for c in manifest["cases"]}
+            miss = [v for c in e2e_cfgs for v in c["gemm"].values() if v not in have]
+            print(f"e2e training configs in the manifest: {[c['id'] for c in e2e_cfgs]}" + (f"   MISSING xclbin cases: {miss}" if miss else ""))
+            for role, py in (("NPU e2e", args.python_npu), ("CPU e2e", args.python_cpu)):
+                if want_npu or role == "CPU e2e":
+                    r = sh([py, "-c", "import torch,numpy;print('torch', torch.__version__)"])
+                    if not r.startswith("torch"):
+                        print(f"WARNING: {role} needs torch + numpy in {py}: {r.splitlines()[-1] if r else '?'} -- the e2e part would be skipped (GEMM cases unaffected)")
         print("\n--dry-run: environment, device generation and manifest files check out; nothing was loaded or timed.")
         return 0
 
@@ -800,8 +1237,11 @@ def main():
     work.mkdir(exist_ok=True)
     npu = None
     cpus = []
+    e2e = []
     run_info = {"worker_returncodes": {}, "worker_stderr_tail": {}, "power_start": power_snapshot()}
-    if want_npu:
+    variants = {"default": {}, "passive": {"OMP_WAIT_POLICY": "PASSIVE"},
+                "passive4": {"OMP_WAIT_POLICY": "PASSIVE", "OMP_NUM_THREADS": "4"}}
+    if want_npu and not args.e2e_only:
         print("\n=== NPU worker ===", flush=True)
         if args.pmode:
             env["pmode_set"] = sh([XRT_SMI or "xrt-smi", "configure", "--pmode", args.pmode])
@@ -823,9 +1263,7 @@ def main():
             run_info["kernel_log_after_npu_worker_failure"] = kernel_log_tail(since=t_run0 - 2)
         if npu is None:
             npu = {"role": "npu", "cases": [], "error": f"NPU worker produced no results (rc={rc})"}
-    if not args.npu_only:
-        variants = {"default": {}, "passive": {"OMP_WAIT_POLICY": "PASSIVE"},
-                    "passive4": {"OMP_WAIT_POLICY": "PASSIVE", "OMP_NUM_THREADS": "4"}}
+    if not args.npu_only and not args.e2e_only:
         for v in [x for x in args.cpu_variants.split(",") if x]:
             print(f"\n=== CPU worker: {v} ===", flush=True)
             outj = work / f"cpu_{v}.json"
@@ -839,14 +1277,46 @@ def main():
                     pass
             if rc != 0:
                 print(f"CPU worker {v} exited with {rc} (is torch importable with {args.python_cpu}?)")
+    if not args.no_e2e and select_e2e(manifest, args):
+        # End-to-end training. Own worker processes: a failure here never touches the GEMM results above and vice versa.
+        # (name, python, OMP variant, backends)
+        plan = []
+        if want_npu:
+            plan.append(("npu_default", args.python_npu, "default", "npu-f32out,npu-bf16out"))
+            plan.append(("npu_passive", args.python_npu, "passive", "npu-f32out"))
+        if not args.npu_only:
+            plan.append(("cpu_default", args.python_cpu, "default", "cpu-fp32,cpu-bf16"))
+            plan.append(("cpu_passive", args.python_cpu, "passive", "cpu-bf16"))
+        for name, py, v, backends in plan:
+            print(f"\n=== e2e training worker: {name} ({backends}) ===", flush=True)
+            outj = work / f"e2e_{name}.json"
+            rc, err = run_worker(py, "e2e", args, outj, variants[v], ["--variant", v, "--e2e-backends", backends,
+                                                                      "--e2e-config", args.e2e_config or "", "--e2e-steps", str(args.e2e_steps)],
+                                 timeout=args.worker_timeout)
+            run_info["worker_returncodes"]["e2e_" + name] = rc
+            run_info["worker_stderr_tail"]["e2e_" + name] = err
+            rec = {"name": name, "role": "e2e", "variant": v, "backends": backends, "runs": [], "error": f"worker produced no results (rc={rc})"}
+            if outj.exists():
+                try:
+                    rec = json.loads(outj.read_text())
+                    rec["name"] = name
+                except Exception:
+                    pass
+            if rc != 0:
+                print(f"e2e worker {name} exited with {rc} (partial results are kept)")
+                rec.setdefault("error", f"worker exited with rc={rc}; stderr tail: {err[-600:]}")
+                if want_npu and name.startswith("npu"):
+                    run_info["kernel_log_after_e2e_%s_failure" % name] = kernel_log_tail(since=t_run0 - 2)
+            e2e.append(rec)
     run_info["power_end"] = power_snapshot()
     run_info["plug_state_changed_during_run"] = on_battery(run_info["power_start"]) != on_battery(run_info["power_end"])
     run_info["total_wall_s"] = time.time() - t_run0
-    summary = summarize(env, npu, cpus, manifest, run_info)
+    summary = summarize(env, npu, cpus, manifest, run_info, e2e)
     print("\n" + summary)
     out = {"env": env, "manifest_target": target, "manifest_built_with": manifest.get("built_with"),
            "manifest_cases": [{k: c[k] for k in ("id", "tile", "max_rel_l2", "xclbin_sha256", "insts_sha256") if k in c} for c in manifest["cases"]],
-           "run": run_info, "args": vars(args), "tag": tag, "npu": npu, "cpu": cpus}
+           "manifest_e2e": (manifest.get("e2e") or {}).get("configs"),
+           "run": run_info, "args": vars(args), "tag": tag, "npu": npu, "cpu": cpus, "e2e": e2e}
     (outdir / f"kit_results_{host}{tag}_{stamp}.json").write_text(json.dumps(out, indent=1))
     (outdir / f"kit_summary_{host}{tag}_{stamp}.txt").write_text(summary + "\n")
     print(f"\nWrote {outdir}/kit_results_{host}{tag}_{stamp}.json and kit_summary_{host}{tag}_{stamp}.txt  -- please send both.")
