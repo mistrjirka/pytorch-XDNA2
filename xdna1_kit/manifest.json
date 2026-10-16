@@ -1,0 +1,227 @@
+{
+ "schema": 1,
+ "target": "npu1",
+ "built_with": "mlir-aie 1.3.4 + Peano (llvm-aie 21.0.0.2026062301), upstream whole_array.py ed23bba, --dev npu --n-aie-cols 4, native AIE2 bf16 mmul, LOCAL mm.cc with round-to-nearest-even (crRnd=conv_even) before bf16 stores",
+ "cases": [
+  {
+   "id": "256x256x128_32x32x32_f32",
+   "M": 256,
+   "K": 256,
+   "N": 128,
+   "tile": [
+    32,
+    32,
+    32
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_256x256x128_32x32x32_4c.xclbin",
+   "insts": "npu1_bf16_f32out_256x256x128_32x32x32_4c.bin",
+   "xclbin_sha256": "e01cdae2b071351a6472c18fa3f78e8ef550f28d573d45a914d8a0f6cbfa5090",
+   "insts_sha256": "a9d7b954ff9ae672412f8f01e64204471f752233ab13c0f24f48eb5add17374a",
+   "max_rel_l2": 0.01,
+   "quick": true
+  },
+  {
+   "id": "512x512x512_32x32x32_f32",
+   "M": 512,
+   "K": 512,
+   "N": 512,
+   "tile": [
+    32,
+    32,
+    32
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_512x512x512_32x32x32_4c.xclbin",
+   "insts": "npu1_bf16_f32out_512x512x512_32x32x32_4c.bin",
+   "xclbin_sha256": "ce98438310712b007ca462bef330c175612a5366a4a9fbbbaee9981f81b834ab",
+   "insts_sha256": "1d3ef3cdd367e68c8e42cc4394e53096707d3b6de837e753f25ae631ab643067",
+   "max_rel_l2": 0.01,
+   "quick": true
+  },
+  {
+   "id": "512x512x512_64x32x64_f32",
+   "M": 512,
+   "K": 512,
+   "N": 512,
+   "tile": [
+    64,
+    32,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_512x512x512_64x32x64_4c.xclbin",
+   "insts": "npu1_bf16_f32out_512x512x512_64x32x64_4c.bin",
+   "xclbin_sha256": "6aa1a6675e46cf6e20240ac3ea22410e1407f655ca603f83ba046aaae2d7aac0",
+   "insts_sha256": "a37fca923f275ba6a616b65b078464645e7272c4ff9aace6bf29993a84bd778b",
+   "max_rel_l2": 0.01,
+   "quick": false
+  },
+  {
+   "id": "512x512x512_64x64x64_bf16",
+   "M": 512,
+   "K": 512,
+   "N": 512,
+   "tile": [
+    64,
+    64,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "bf16",
+   "xclbin": "npu1_bf16_bf16out_512x512x512_64x64x64_4c.xclbin",
+   "insts": "npu1_bf16_bf16out_512x512x512_64x64x64_4c.bin",
+   "xclbin_sha256": "484e9afaad1a8ed19e532d844090e9b6b1539ea160fd71f4123b66158dd6987c",
+   "insts_sha256": "6e1f087c028847fd6339bbbd60641332ccb412c6e068d08d8764d221efdd067a",
+   "max_rel_l2": 0.015,
+   "quick": false
+  },
+  {
+   "id": "1024x1024x1024_64x64x64_bf16",
+   "M": 1024,
+   "K": 1024,
+   "N": 1024,
+   "tile": [
+    64,
+    64,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "bf16",
+   "xclbin": "npu1_bf16_bf16out_1024x1024x1024_64x64x64_4c.xclbin",
+   "insts": "npu1_bf16_bf16out_1024x1024x1024_64x64x64_4c.bin",
+   "xclbin_sha256": "fe69cb86c4e4d17a568c21d8f7969a2a16447675ff5b9e60684d39c22744833b",
+   "insts_sha256": "13294a3e2a2b38cda973b5da04f70341ff09ad91fc56c8fb5c018f49f306cc37",
+   "max_rel_l2": 0.015,
+   "quick": true
+  },
+  {
+   "id": "2048x2048x2048_32x64x64_f32",
+   "M": 2048,
+   "K": 2048,
+   "N": 2048,
+   "tile": [
+    32,
+    64,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_2048x2048x2048_32x64x64_4c.xclbin",
+   "insts": "npu1_bf16_f32out_2048x2048x2048_32x64x64_4c.bin",
+   "xclbin_sha256": "e01f4a9ff66513398dab97eab1dcbb65d4f2168d8bbebe3cb757f8aaaa7cec33",
+   "insts_sha256": "26abfb109344dcbbf967ec4c685283b81be38333c39486e12b3746aac9090854",
+   "max_rel_l2": 0.01,
+   "quick": false
+  },
+  {
+   "id": "2048x2048x2048_64x32x64_f32",
+   "M": 2048,
+   "K": 2048,
+   "N": 2048,
+   "tile": [
+    64,
+    32,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_2048x2048x2048_64x32x64_4c.xclbin",
+   "insts": "npu1_bf16_f32out_2048x2048x2048_64x32x64_4c.bin",
+   "xclbin_sha256": "bf7942acba54c212ce934276b141a6b02a3f9bafb03c3332eefe6d349dacc8a1",
+   "insts_sha256": "f84649bbd5687f3a6cd99c2a2b571f58d0d1577dcab7487ed0e5a6df478f2bfd",
+   "max_rel_l2": 0.01,
+   "quick": false
+  },
+  {
+   "id": "2048x2048x2048_64x64x64_bf16",
+   "M": 2048,
+   "K": 2048,
+   "N": 2048,
+   "tile": [
+    64,
+    64,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "bf16",
+   "xclbin": "npu1_bf16_bf16out_2048x2048x2048_64x64x64_4c.xclbin",
+   "insts": "npu1_bf16_bf16out_2048x2048x2048_64x64x64_4c.bin",
+   "xclbin_sha256": "e8228f088f3e11b4ff83ccc74ebb641fe54da5c30c2fb7780f8d731adcd5c483",
+   "insts_sha256": "d7eb1f57ca25182a747eacd900ac9bb28586e7d42602b1609a02eb25b49ad798",
+   "max_rel_l2": 0.015,
+   "quick": true
+  },
+  {
+   "id": "4096x768x3072_32x64x64_f32",
+   "M": 4096,
+   "K": 768,
+   "N": 3072,
+   "tile": [
+    32,
+    64,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_4096x768x3072_32x64x64_4c.xclbin",
+   "insts": "npu1_bf16_f32out_4096x768x3072_32x64x64_4c.bin",
+   "xclbin_sha256": "8b6bd60f202b78f45823f412fcf5a172a8521d9241f218485f1f33fdb6e15707",
+   "insts_sha256": "7ee8ce3a0e461db1f2682c8173d96f6e36819b96df435f864c2ebaa0c24ac82a",
+   "max_rel_l2": 0.01,
+   "quick": false
+  },
+  {
+   "id": "4096x768x3072_64x32x64_f32",
+   "M": 4096,
+   "K": 768,
+   "N": 3072,
+   "tile": [
+    64,
+    32,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "f32",
+   "xclbin": "npu1_bf16_f32out_4096x768x3072_64x32x64_4c.xclbin",
+   "insts": "npu1_bf16_f32out_4096x768x3072_64x32x64_4c.bin",
+   "xclbin_sha256": "c7ccb3507024c88f2dbc6b20d7dda8b2adadfebdd0cca34cf6d655d6e68a9bd1",
+   "insts_sha256": "96306fd4f88bccfdf3493f9a58339be0c6670172c6e7f962ac283d03bcdbc351",
+   "max_rel_l2": 0.01,
+   "quick": false
+  },
+  {
+   "id": "4096x768x3072_64x64x64_bf16",
+   "M": 4096,
+   "K": 768,
+   "N": 3072,
+   "tile": [
+    64,
+    64,
+    64
+   ],
+   "cols": 4,
+   "dtype_in": "bf16",
+   "dtype_out": "bf16",
+   "xclbin": "npu1_bf16_bf16out_4096x768x3072_64x64x64_4c.xclbin",
+   "insts": "npu1_bf16_bf16out_4096x768x3072_64x64x64_4c.bin",
+   "xclbin_sha256": "e765dc817c177f8d2b1a06cfa474ed246df6f71c72c746e6dcad9c139f85457d",
+   "insts_sha256": "7539848765cee7ced2ad02a57ab3b76ea7dc5311bd5eb2a3959f554153dc8719",
+   "max_rel_l2": 0.015,
+   "quick": true
+  }
+ ]
+}
