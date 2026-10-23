@@ -6,7 +6,7 @@ hardware tests can run under the system Python that provides pyxrt.
 """
 import numpy as np
 
-COLS, ROWS, M_CORE, N, K_STEP, MAX_WIDTH = 8, 4, 64, 128, 64, 36
+COLS, ROWS, M_CORE, N, K_STEP, MAX_WIDTH = 8, 4, 64, 128, 64, 64
 WIN_ROWS = M_CORE + 2 * (MAX_WIDTH + 2) + 2
 GROUP_OUT_ROWS = M_CORE * ROWS * COLS
 GROUP_ROWS = GROUP_OUT_ROWS + WIN_ROWS - M_CORE
@@ -92,7 +92,7 @@ def unpack_output(c_bits, batch, height, width, cout):
 
 # ---- width tiling: images wider than MAX_STRIP_W run as vertical strips ----
 
-MAX_STRIP_W = 34     # output columns per strip (data width 36 incl. halos)
+MAX_STRIP_W = 62     # output columns per strip (data width 64 incl. halos)
 
 
 def strip_geometry(width):

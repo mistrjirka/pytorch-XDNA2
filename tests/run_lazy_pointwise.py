@@ -284,7 +284,7 @@ bn_b = torch.randn(192).bfloat16().to("xdna")
 plain3 = torch.randn(8, 3, 40, 40).bfloat16().to("xdna")
 rows_cases = {
     "conv -> conv 16x16": ((8, 64, 16, 16), 128, 128, lambda y: y),
-    "conv -> conv strips W=40": ((8, 64, 40, 40), 128, 128, lambda y: y),
+    "conv -> conv strips W=72": ((8, 64, 24, 72), 128, 128, lambda y: y),
     "conv(192) -> leaky -> cat -> conv": (
         (8, 64, 40, 40), 192, 195, lambda y: torch.cat([F.leaky_relu(y, SLOPE), plain3], 1)),
     "conv -> BN -> leaky -> upsample -> conv": (
@@ -325,7 +325,7 @@ def phases():
     return {k: v["calls"] for k, v in xdna_train.mapped_cpu_stats().items()}
 
 
-for c, hw in ((128, 16), (192, 40)):
+for c, hw in ((128, 16), (192, 72)):
     t, g = rows_pair(c, hw, 8)
     p0 = phases()
     r_leaky = torch.ops.aten.leaky_relu_backward(g, t, SLOPE, False).cpu()
@@ -356,12 +356,12 @@ for c, hw in ((128, 16), (192, 40)):
 # The decoder's backward: upsample backward of a gradient in rows, then the
 # cat backward's channel slices, each fed to an activation backward.
 torch.manual_seed(9)
-xs_ = torch.randn(8, 64, 40, 40).bfloat16().to("xdna")
+xs_ = torch.randn(8, 64, 72, 72).bfloat16().to("xdna")  # 72 wide: strips
 g_big = F.conv2d(xs_, (torch.randn(192, 64, 3, 3) * 0.05).bfloat16().to("xdna"), padding=1)
-t_small = F.conv2d(xs_[:, :, :20, :20].contiguous(),
+t_small = F.conv2d(xs_[:, :, :36, :36].contiguous(),
                    (torch.randn(128, 64, 3, 3) * 0.05).bfloat16().to("xdna"), padding=1)
 p0 = phases()
-g_small = torch.ops.aten.upsample_nearest2d_backward(g_big, [40, 40], [8, 192, 20, 20], None, None)
+g_small = torch.ops.aten.upsample_nearest2d_backward(g_big, [72, 72], [8, 192, 36, 36], None, None)
 r_slices = [torch.ops.aten.leaky_relu_backward(g_small.narrow(1, c0, n), t_small.narrow(1, 0, n),
                                                SLOPE, False).cpu()
             for c0, n in ((0, 128), (128, 64))]
@@ -371,7 +371,7 @@ used_up = (p1.get("aten::upsample_nearest2d_backward.rows", 0)
            - p0.get("aten::upsample_nearest2d_backward.rows", 0))
 used_act = p1.get("aten::act_backward.rows", 0) - p0.get("aten::act_backward.rows", 0)
 g_big.cpu(), t_small.cpu()
-e_up = torch.ops.aten.upsample_nearest2d_backward(g_big, [40, 40], [8, 192, 20, 20], None, None).cpu()
+e_up = torch.ops.aten.upsample_nearest2d_backward(g_big, [72, 72], [8, 192, 36, 36], None, None).cpu()
 check("rows upsample backward used", used_up == 1 and used_act >= 1, f"up {used_up} act {used_act}")
 check("rows upsample backward equals eager", eq(r_up, e_up))
 check("rows leaky backward on cat slices equals eager",

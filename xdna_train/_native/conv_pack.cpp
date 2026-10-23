@@ -291,7 +291,7 @@ extern "C" void xdna_yxbc_slice_stripe_to_channels_last_partial_bf16(
 
 namespace {
 constexpr int kGroupOutRows = 2048;
-constexpr int kGroupRows = 2126;
+constexpr int kGroupRows = 2182;  // conv3x3w.GROUP_ROWS (MAX_WIDTH 64)
 constexpr int kKStep = 64;
 constexpr int kN = 128;
 
@@ -332,18 +332,19 @@ inline void gather_pixels(const uint16_t* s, std::size_t hw, int cc, int n, uint
     for (int i = 0; i < n; ++i) tile[i][c] = s[std::size_t(c) * hw + i];
 }
 
-// d[n * dstride + x] = s[x * kN + n] for x < nx, n < nv.
-inline void scatter_channels(const uint16_t* s, uint16_t* d, std::size_t dstride, int nx, int nv) {
+// d[n * dstride + x] = s[x * rs + n] for x < nx, n < nv.
+inline void scatter_channels(const uint16_t* s, long rs, uint16_t* d, std::size_t dstride, int nx,
+                             int nv) {
   int x = 0;
   for (; x + 8 <= nx; x += 8) {
     int n = 0;
     for (; n + 8 <= nv; n += 8)
-      transpose8x8_u16(s + std::size_t(x) * kN + n, kN, d + std::size_t(n) * dstride + x, dstride);
+      transpose8x8_u16(s + std::size_t(x) * rs + n, rs, d + std::size_t(n) * dstride + x, dstride);
     for (; n < nv; ++n)
-      for (int i = 0; i < 8; ++i) d[std::size_t(n) * dstride + x + i] = s[std::size_t(x + i) * kN + n];
+      for (int i = 0; i < 8; ++i) d[std::size_t(n) * dstride + x + i] = s[std::size_t(x + i) * rs + n];
   }
   for (; x < nx; ++x)
-    for (int n = 0; n < nv; ++n) d[std::size_t(n) * dstride + x] = s[std::size_t(x) * kN + n];
+    for (int n = 0; n < nv; ++n) d[std::size_t(n) * dstride + x] = s[std::size_t(x) * rs + n];
 }
 
 // Branch-free so the loops below vectorize (`omp simd`): these run on every
@@ -543,10 +544,10 @@ void sum4_span(const uint16_t* a, const uint16_t* b, const uint16_t* c, const ui
 }
 
 XDNA_SIMD_CLONES
-void accumulate_channel_stats(const uint16_t* rows, long nrows, int nv, double* sum,
+void accumulate_channel_stats(const uint16_t* rows, long nrows, long rs, int nv, double* sum,
                               double* sumsq) {
   for (long r = 0; r < nrows; ++r) {
-    const uint16_t* row = rows + r * kN;
+    const uint16_t* row = rows + r * rs;
 #pragma omp simd
     for (int n = 0; n < nv; ++n) {
       const double v = bf16_to_f32(row[n]);
@@ -579,7 +580,7 @@ inline void gather_segment(const XdnaPackSegment& sg, int b, int y, int x0, int 
       for (int k = k0; k < k0 + n;) {
         const int blk = k / kN, col = k % kN;
         const int cnt = kN - col < k0 + n - k ? kN - col : k0 + n - k;
-        std::memcpy(t[xi] + (k - k0), sg.rows + blk * sg.block_stride + row * kN + col,
+        std::memcpy(t[xi] + (k - k0), sg.rows + blk * sg.block_stride + row * sg.row_stride + col,
                     std::size_t(cnt) * sizeof(uint16_t));
         k += cnt;
       }
@@ -601,6 +602,20 @@ inline void gather_segment(const XdnaPackSegment& sg, int b, int y, int x0, int 
   if (sg.scale || sg.act) {
     const Pointwise pw{sg.scale, sg.shift, sg.act, sg.slope};
     for (int xi = 0; xi < nx; ++xi) apply_pointwise(t[xi], t[xi], n, pw, k0, 1);
+  }
+}
+
+// One row of the packed input.  A full 64-channel row (128 bytes, two whole
+// cache lines) goes out with streaming stores: a normal store first reads the
+// line it overwrites (read for ownership), which made the memory-bound pack
+// move about 1.5x the bytes of a copy.  Callers end with _mm_sfence().
+inline void store_packed_row(uint16_t* d, const uint16_t* s, int cc) {
+  if (cc == kKStep && (reinterpret_cast<std::uintptr_t>(d) & 15) == 0) {
+    for (int i = 0; i < kKStep; i += 8)
+      _mm_stream_si128(reinterpret_cast<__m128i*>(d + i),
+                       _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + i)));
+  } else {
+    std::memcpy(d, s, std::size_t(cc) * sizeof(uint16_t));
   }
 }
 
@@ -744,7 +759,7 @@ void xdna_conv3x3w_unpack_output_bf16(
     for (int y = 0; y < H; ++y) {
       const uint16_t* s = c + (std::size_t(b) * (H + 2) + y) * wp * kN;
       scatter_channels(
-          s, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W,
+          s, kN, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W,
           std::size_t(H) * W, W, cout_valid);
     }
   }
@@ -894,7 +909,7 @@ void xdna_conv3x3w_unpack_output_range_bf16(
       if (xb <= xa) continue;
       const uint16_t* s = c + (base + xa - p0) * kN;
       scatter_channels(
-          s, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W + xa,
+          s, kN, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W + xa,
           std::size_t(H) * W, int(xb - xa), cout_valid);
     }
   }
@@ -940,7 +955,9 @@ void xdna_conv3x3w_pack_segments_bf16(
   const int v0 = int(plo / img);
   const int v1 = int((phi - 1) / img) + 1 < Bv ? int((phi - 1) / img) + 1 : Bv;
   if (v1 <= v0) return;
-#pragma omp parallel for num_threads(g_pack_threads) collapse(3) schedule(static)
+#pragma omp parallel num_threads(g_pack_threads)
+  {
+#pragma omp for collapse(3) schedule(static)
   for (int vb = v0; vb < v1; ++vb) {
     for (int chunk = 0; chunk < chunks; ++chunk) {
       for (int y = 0; y < H; ++y) {
@@ -975,19 +992,19 @@ void xdna_conv3x3w_pack_segments_bf16(
             const std::size_t g = p / kGroupOutRows;
             const std::size_t r = p % kGroupOutRows;
             if (g >= std::size_t(g0) && g < std::size_t(g0 + ng))
-              std::memcpy(
-                  dst + (((g - g0) * chunks + chunk) * kGroupRows + r) * kKStep,
-                  tile[xi], std::size_t(cc) * sizeof(uint16_t));
+              store_packed_row(dst + (((g - g0) * chunks + chunk) * kGroupRows + r) * kKStep,
+                               tile[xi], cc);
             if (g > std::size_t(g0) && g <= std::size_t(g0 + ng) &&
                 r + kGroupOutRows < std::size_t(kGroupRows))
-              std::memcpy(
-                  dst + (((g - 1 - g0) * chunks + chunk) * kGroupRows + r +
-                         kGroupOutRows) * kKStep,
-                  tile[xi], std::size_t(cc) * sizeof(uint16_t));
+              store_packed_row(dst + (((g - 1 - g0) * chunks + chunk) * kGroupRows + r +
+                                      kGroupOutRows) * kKStep,
+                               tile[xi], cc);
           }
         }
       }
     }
+  }
+  _mm_sfence();
   }
 }
 
@@ -1106,7 +1123,8 @@ void xdna_conv3x3w_unpack_output_strips_range_stats_bf16(
     int p0,
     int p1,
     double* sum,
-    double* sumsq) {
+    double* sumsq,
+    long rs) {
   const int Wg = S == 1 ? W : So + 2;
   const int wp = Wg + 2;
   const int Bv = B * S;
@@ -1128,11 +1146,11 @@ void xdna_conv3x3w_unpack_output_strips_range_stats_bf16(
         const long tb = p1 - (base + first) < cols ? p1 - (base + first) : cols;
         if (tb <= ta) continue;
         const int x0 = (S == 1 ? 0 : sidx * So);
-        const uint16_t* s = c + (base + first + ta - p0) * kN;
-        if (sum) accumulate_channel_stats(s, tb - ta, cout_valid, local, local + kN);
+        const uint16_t* s = c + (base + first + ta - p0) * rs;
+        if (sum) accumulate_channel_stats(s, tb - ta, rs, cout_valid, local, local + kN);
         if (dst)
           scatter_channels(
-              s, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W + x0 + ta,
+              s, rs, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W + x0 + ta,
               std::size_t(H) * W, int(tb - ta), cout_valid);
       }
     }
@@ -1150,26 +1168,34 @@ void xdna_conv3x3w_unpack_output_strips_range_bf16(
     const uint16_t* c, uint16_t* dst, int B, int H, int W, int S, int So, int cout_valid,
     int C_total, int c_start, int p0, int p1) {
   xdna_conv3x3w_unpack_output_strips_range_stats_bf16(
-      c, dst, B, H, W, S, So, cout_valid, C_total, c_start, p0, p1, nullptr, nullptr);
+      c, dst, B, H, W, S, So, cout_valid, C_total, c_start, p0, p1, nullptr, nullptr, kN);
+}
+
+// Element (block nb, grid row) of a rows tensor; consecutive grid rows are
+// row_stride apart.
+inline uint16_t* rows_at(const XdnaRowsRef& r, int nb, long row) {
+  return r.p + std::size_t(nb) * r.block_stride + std::size_t(row) * r.row_stride;
 }
 
 void xdna_rows_act_backward_bf16(
-    const XdnaRowsGeom* g, const uint16_t* dy, const uint16_t* x, uint16_t* dx,
+    const XdnaRowsGeom* g, const XdnaRowsRef* dy, const XdnaRowsRef* x, const XdnaRowsRef* dx,
     const float* scale, const float* shift, int mode, float slope) {
   for_valid_rows(*g, [&](long row, int, int, int, int cols) {
     for (int nb = 0; nb * kN < g->C; ++nb) {
       const int nv = g->C - nb * kN < kN ? g->C - nb * kN : kN;
-      const std::size_t off = std::size_t(nb) * g->block_stride + std::size_t(row) * kN;
+      const uint16_t* a = rows_at(*dy, nb, row);
+      const uint16_t* b = rows_at(*x, nb, row);
+      uint16_t* o = rows_at(*dx, nb, row);
       for (int t = 0; t < cols; ++t)
-        act_backward_span(dy + off + t * kN, x + off + t * kN, dx + off + t * kN, nv,
-                          scale ? scale + nb * kN : nullptr, shift ? shift + nb * kN : nullptr,
-                          mode, slope);
+        act_backward_span(a + t * dy->row_stride, b + t * x->row_stride, o + t * dx->row_stride,
+                          nv, scale ? scale + nb * kN : nullptr,
+                          shift ? shift + nb * kN : nullptr, mode, slope);
     }
   });
 }
 
 void xdna_rows_bn_backward_bf16(
-    const XdnaRowsGeom* g, const uint16_t* dy, const uint16_t* x, uint16_t* dx,
+    const XdnaRowsGeom* g, const XdnaRowsRef* dy, const XdnaRowsRef* x, const XdnaRowsRef* dx,
     const float* mean, const float* invstd, const float* w, float* dgamma, float* dbeta) {
   const int C = g->C;
   std::vector<double> sum(C, 0.0), dotp(C, 0.0);
@@ -1185,10 +1211,11 @@ void xdna_rows_bn_backward_bf16(
         const int cols = g->S == 1 ? g->W : (g->W - sidx * g->So < g->So ? g->W - sidx * g->So : g->So);
         for (int nb = 0; nb * kN < C; ++nb) {
           const int nv = C - nb * kN < kN ? C - nb * kN : kN;
-          const std::size_t off = std::size_t(nb) * g->block_stride + std::size_t(row) * kN;
+          const uint16_t* a = rows_at(*dy, nb, row);
+          const uint16_t* b = rows_at(*x, nb, row);
           for (int t = 0; t < cols; ++t)
-            bn_backward_sums_span(dy + off + t * kN, x + off + t * kN, nv, mean + nb * kN,
-                                  ls.data() + nb * kN, ld.data() + nb * kN);
+            bn_backward_sums_span(a + t * dy->row_stride, b + t * x->row_stride, nv,
+                                  mean + nb * kN, ls.data() + nb * kN, ld.data() + nb * kN);
         }
       }
     }
@@ -1207,55 +1234,58 @@ void xdna_rows_bn_backward_bf16(
     if (dgamma) dgamma[c] = fd * invstd[c];
     if (dbeta) dbeta[c] = fs;
   }
-  if (!dx) return;
+  if (!dx->p) return;
   const float* wv = w ? w : ones.data();
   for_valid_rows(*g, [&](long row, int, int, int, int cols) {
     for (int nb = 0; nb * kN < C; ++nb) {
       const int nv = C - nb * kN < kN ? C - nb * kN : kN;
-      const std::size_t off = std::size_t(nb) * g->block_stride + std::size_t(row) * kN;
+      const uint16_t* a = rows_at(*dy, nb, row);
+      const uint16_t* b = rows_at(*x, nb, row);
+      uint16_t* o = rows_at(*dx, nb, row);
       for (int t = 0; t < cols; ++t)
-        bn_backward_dx_span(dy + off + t * kN, x + off + t * kN, dx + off + t * kN, nv,
-                            mean + nb * kN, k.data() + nb * kN, grad_mean.data() + nb * kN,
+        bn_backward_dx_span(a + t * dy->row_stride, b + t * x->row_stride, o + t * dx->row_stride,
+                            nv, mean + nb * kN, k.data() + nb * kN, grad_mean.data() + nb * kN,
                             invstd + nb * kN, wv + nb * kN);
     }
   });
 }
 
 void xdna_rows_add_bf16(
-    const XdnaRowsGeom* g, const uint16_t* a, const float* a_scale, const float* a_shift,
-    int a_act, float a_slope, const uint16_t* b, const float* b_scale, const float* b_shift,
-    int b_act, float b_slope, uint16_t* out) {
+    const XdnaRowsGeom* g, const XdnaRowsRef* a, const float* a_scale, const float* a_shift,
+    int a_act, float a_slope, const XdnaRowsRef* b, const float* b_scale, const float* b_shift,
+    int b_act, float b_slope, const XdnaRowsRef* out) {
   const Pointwise pa{a_scale, a_shift, a_act, a_slope};
   const Pointwise pb{b_scale, b_shift, b_act, b_slope};
   for_valid_rows(*g, [&](long row, int, int, int, int cols) {
     uint16_t ta[kN], tb[kN];
     for (int nb = 0; nb * kN < g->C; ++nb) {
       const int nv = g->C - nb * kN < kN ? g->C - nb * kN : kN;
-      const std::size_t off = std::size_t(nb) * g->block_stride + std::size_t(row) * kN;
+      const uint16_t* ra = rows_at(*a, nb, row);
+      const uint16_t* rb = rows_at(*b, nb, row);
+      uint16_t* ro = rows_at(*out, nb, row);
       for (int t = 0; t < cols; ++t) {
-        const uint16_t* va = a + off + t * kN;
-        const uint16_t* vb = b + off + t * kN;
+        const uint16_t* va = ra + t * a->row_stride;
+        const uint16_t* vb = rb + t * b->row_stride;
         if (pa.scale || pa.act) { apply_pointwise(va, ta, nv, pa, nb * kN, 1); va = ta; }
         if (pb.scale || pb.act) { apply_pointwise(vb, tb, nv, pb, nb * kN, 1); vb = tb; }
-        add_bf16_span(va, vb, out + off + t * kN, nv);
+        add_bf16_span(va, vb, ro + t * out->row_stride, nv);
       }
     }
   });
 }
 
 void xdna_rows_upsample2x_backward_bf16(
-    const XdnaRowsGeom* gb, const uint16_t* go, const XdnaRowsGeom* gs, uint16_t* gi) {
+    const XdnaRowsGeom* gb, const XdnaRowsRef* go, const XdnaRowsGeom* gs, const XdnaRowsRef* gi) {
   for_valid_rows(*gs, [&](long row, int b, int y, int x0, int cols) {
     for (int t = 0; t < cols; ++t) {
       const int x = x0 + t;
-      const std::size_t r00 = row_of(*gb, b, 2 * y, 2 * x), r01 = row_of(*gb, b, 2 * y, 2 * x + 1);
-      const std::size_t r10 = row_of(*gb, b, 2 * y + 1, 2 * x);
-      const std::size_t r11 = row_of(*gb, b, 2 * y + 1, 2 * x + 1);
+      const long r00 = long(row_of(*gb, b, 2 * y, 2 * x)), r01 = long(row_of(*gb, b, 2 * y, 2 * x + 1));
+      const long r10 = long(row_of(*gb, b, 2 * y + 1, 2 * x));
+      const long r11 = long(row_of(*gb, b, 2 * y + 1, 2 * x + 1));
       for (int nb = 0; nb * kN < gs->C; ++nb) {
         const int nv = gs->C - nb * kN < kN ? gs->C - nb * kN : kN;
-        const uint16_t* src = go + std::size_t(nb) * gb->block_stride;
-        sum4_span(src + r00 * kN, src + r01 * kN, src + r10 * kN, src + r11 * kN,
-                  gi + std::size_t(nb) * gs->block_stride + (std::size_t(row) + t) * kN, nv);
+        sum4_span(rows_at(*go, nb, r00), rows_at(*go, nb, r01), rows_at(*go, nb, r10),
+                  rows_at(*go, nb, r11), rows_at(*gi, nb, row + t), nv);
       }
     }
   });

@@ -516,15 +516,24 @@ struct XdnaLazySegment {
   float slope = 0.f;            // Leaky only
 };
 
-// Stage 4: a conv3x3w forward output kept as the NPU wrote it, unpacked to
-// NCHW only when something reads it that way.  `buffer` holds consecutive
-// blocks of [grid rows][128] bf16 in the strip layout, channel k in block
-// k / 128 (XdnaPackSegment::rows).
+struct Conv3x3wPacked;
+
+// Stage 4: a conv3x3w output kept as the NPU wrote it, or a host-computed
+// tensor on the same grid, unpacked to NCHW only when something reads it that
+// way.  Grid row r (strip layout) holds channel k at
+// base[(k / 128) * block_stride + r * row_stride + k % 128] (XdnaRowsRef):
+// the NPU writes 128-channel blocks (row_stride 128), the host NHWC.
+// Stage 6: `npu` is set when the buffer is an NPU buffer the next conv can
+// read as its input directly (no pack): grid row r at buffer row r + margin
+// (margin = wp + 1, so buffer row q is padded-grid input row q), and every
+// other buffer row (margin, padding pixels, tail) zero.
 struct XdnaConvRows {
-  std::shared_ptr<void> buffer;  // the NPU output buffer, out of its pool
+  std::shared_ptr<void> buffer;  // keeps the memory alive
   const uint16_t* base = nullptr;
-  int64_t block_stride = 0;      // elements
+  int64_t block_stride = 0, row_stride = 128;  // elements
   int64_t strips = 1, strip_out = 0, wp = 0, rows = 0;
+  Conv3x3wPacked* npu = nullptr;  // owned by `buffer`
+  int64_t margin = 0;
 };
 
 // A lazy value (XDNA_LAZY_POINTWISE): its segments concatenated along the
@@ -726,7 +735,7 @@ void unpack_rows_into(const XdnaConvRows& rows, uint16_t* dst, at::IntArrayRef s
     xdna_conv3x3w_unpack_output_strips_range_stats_bf16(
         rows.base + nb * rows.block_stride, dst, int(sizes[0]), int(sizes[2]), int(sizes[3]),
         int(rows.strips), int(rows.strip_out), int(std::min<int64_t>(128, C - nb * 128)), int(C),
-        int(nb * 128), 0, int(rows.rows), nullptr, nullptr);
+        int(nb * 128), 0, int(rows.rows), nullptr, nullptr, long(rows.row_stride));
   }
 }
 
@@ -787,11 +796,12 @@ std::vector<XdnaPackSegment> pack_segments(
     XdnaPackSegment ps{static_cast<const uint16_t*>(seg.source.const_data_ptr()), c0, channels,
                        int(seg.up), seg.scale.empty() ? nullptr : seg.scale.data(),
                        seg.shift.empty() ? nullptr : seg.shift.data(), int(seg.act), seg.slope,
-                       nullptr, 0, 0, 0, 0};
+                       nullptr, 0, 0, 0, 0, 0};
     if (auto rows = rows_of(seg.source)) {
       TORCH_CHECK(rows_alive, "XDNA: conv rows read without holding them");
       ps.rows = rows->base;
       ps.block_stride = long(rows->block_stride);
+      ps.row_stride = long(rows->row_stride);
       ps.rows_s = int(rows->strips);
       ps.rows_so = int(rows->strip_out);
       ps.rows_wp = int(rows->wp);
@@ -1878,7 +1888,7 @@ class ScopedMappedCpu {
 };
 
 // conv3x3w: 3x3 / stride 1 / pad 1 convolution on the whole array for any
-// batch, height, channel count and width <= 36 (xdna_train/_designs/conv3x3w.py).
+// batch, height, channel count and width <= 64 (xdna_train/_designs/conv3x3w.py).
 // One xclbin; an instruction stream per (groups, padded width, channel chunks),
 // compiled on first use by a background job and cached on disk.  Until a
 // stream exists the conv takes the next path (full-frame families or CPU), so
@@ -2168,7 +2178,7 @@ struct IronStreamBuilder {
   }
 };
 
-// Packed conv3x3w input [groups][chunks][2126][64] bf16 in an XRT BO.  Packing
+// Packed conv3x3w input [groups][chunks][2182][64] bf16 in an XRT BO.  Packing
 // writes only real pixels and channels, so a buffer is zeroed when created and
 // again whenever the packed (B, C, H, W) changes; released buffers go back to
 // a pool by size.  Forward and dX hand theirs to the deferred dW, which needs
@@ -2179,10 +2189,14 @@ struct Conv3x3wPacked {
   size_t bytes = 0;
   std::array<int64_t, 5> shape{};  // B, C, H, W, chunks of the last pack
   std::map<std::pair<size_t, size_t>, ShimBo*> subs;  // (offset, size)
+  // Rows buffers (stage 6) are read by the deferred dW thread and by convs on
+  // the main thread at the same time.
+  std::mutex subs_mutex;
 
   // A device-side window of this buffer (cached).
   ShimBo* sub(size_t offset, size_t size) {
     if (offset == 0 && size == bytes) return bo;
+    std::lock_guard<std::mutex> lock(subs_mutex);
     auto& b = subs[{offset, size}];
     if (!b) {
       b = shim_bo_subbuffer(bo, size, offset);
@@ -2270,12 +2284,66 @@ std::shared_ptr<Conv3x3wPacked> acquire_npu_out(size_t bytes) {
   });
 }
 
-// Width tiling: images wider than 36 run as S vertical strips of `so` output
+// XDNA_CONV_DIRECT_INPUT=0 turns stage 6 off (convs pack every input).
+bool conv_direct_input_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("XDNA_CONV_DIRECT_INPUT");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+
+// Host-written rows the next conv may read directly (stage 6,
+// XdnaConvRows::npu).  Its own pool: the CPU writes these buffers, so they
+// must never become NPU outputs (a dirty line could land over an NPU result).
+// The writers fill only valid rows, so a buffer is zeroed when created and
+// whenever its geometry tag (B, row stride, H, W) changes; a reader flushes
+// it to the device before a dispatch.
+std::shared_ptr<Conv3x3wPacked> acquire_rows_buffer(size_t bytes, std::array<int64_t, 5> tag) {
+  static auto* mutex = new std::mutex();
+  static auto* pool = new std::multimap<size_t, Conv3x3wPacked*>();
+  Conv3x3wPacked* buf = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(*mutex);
+    auto range = pool->equal_range(bytes);
+    auto pick = range.first;
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second->shape == tag) { pick = it; break; }
+    }
+    if (pick != range.second) {
+      buf = pick->second;
+      pool->erase(pick);
+    }
+  }
+  if (!buf) {
+    buf = new Conv3x3wPacked();
+    buf->bo = shim_bo_alloc(xdna_device(), nullptr, bytes, 2, 0);
+    TORCH_CHECK(buf->bo, "failed to allocate conv rows: ", shim_last_error());
+    buf->ptr = shim_bo_map(buf->bo);
+    TORCH_CHECK(buf->ptr, "failed to map conv rows: ", shim_last_error());
+    buf->bytes = bytes;
+    std::memset(buf->ptr, 0, bytes);
+    buf->shape = tag;
+  } else if (buf->shape != tag) {
+    std::memset(buf->ptr, 0, bytes);
+    buf->shape = tag;
+  }
+  return std::shared_ptr<Conv3x3wPacked>(buf, [](Conv3x3wPacked* b) {
+    if (shim_dispatch_poisoned()) return;  // a stuck command may still use it: leak
+    std::lock_guard<std::mutex> lock(*mutex);
+    pool->emplace(b->bytes, b);
+  });
+}
+
+// Width tiling: images wider than 64 run as S vertical strips of `so` output
 // columns, each a virtual image of so + 2 data columns (one real neighbour
 // column per side); S == 1 is the plain layout.  Mirrors
 // conv3x3w_host.strip_geometry.
-constexpr int64_t kConv3x3wMaxWidth = 36;
-constexpr int64_t kConv3x3wMaxStrip = 34;
+constexpr int64_t kConv3x3wMaxWidth = 64;
+constexpr int64_t kConv3x3wMaxStrip = 62;
+// Rows of one core's input window (conv3x3w.WIN_ROWS): a direct read of rows
+// group g reads buffer rows [g * 2048, g * 2048 + 2048 + this - 64).
+constexpr int64_t kConv3x3wWinRows = 64 + 2 * (kConv3x3wMaxWidth + 2) + 2;
 
 struct Conv3x3wStrips {
   int64_t s = 1, so = 0, wg = 0;  // strips, output columns per strip, grid data width
@@ -2371,8 +2439,13 @@ struct Conv3x3wPlan {
   int64_t batch = 0, cin = 0, cout = 0, h = 0, w = 0;  // the real tensor
   int64_t strips = 1, strip_out = 0, grid_w = 0;       // width tiling (see conv3x3w_strips)
   int64_t groups = 0, wp = 0, chunks = 0;              // of the (virtual) padded grid
+  int64_t in_rs = 0;  // > 0: reads its input directly from rows (conv_direct_input)
   std::string key;
 };
+
+// Stage 6: the rows of x when the conv can read them as its input directly
+// (a host-written rows tensor in an NPU buffer, XdnaConvRows::npu), else null.
+std::shared_ptr<XdnaConvRows> conv_direct_input(const at::Tensor& x);
 
 struct Conv3x3wWeightSlot {
   ShimBo* bo = nullptr;
@@ -2433,8 +2506,7 @@ struct XdnaConv3x3wRuntime {
   static constexpr int64_t kN = 128;
   static constexpr int64_t kKStep = 64;
   static constexpr int64_t kGroupOutRows = 2048;
-  static constexpr int64_t kGroupRows = 2126;
-  static constexpr int64_t kMaxWidth = 36;
+  static constexpr int64_t kGroupRows = 2182;
   static constexpr int64_t kMaxGroups = 1024;
 
   IronStreamBuilder builder;
@@ -2531,14 +2603,20 @@ struct XdnaConv3x3wRuntime {
     p.chunks = ceil_div(p.cin, kKStep);
     if (!cost_model_prefers_npu(p, real_macs)) return std::nullopt;
     if (p.groups > kMaxGroups) return std::nullopt;
-    p.key = "g" + std::to_string(p.groups) + "_w" + std::to_string(p.wp) +
-        "_c" + std::to_string(p.chunks);
+    if (auto direct = conv_direct_input(x)) p.in_rs = direct->row_stride;
+    p.key = plan_key(p);
     return p;
+  }
+
+  static std::string plan_key(const Conv3x3wPlan& p) {
+    return "g" + std::to_string(p.groups) + "_w" + std::to_string(p.wp) +
+        "_c" + std::to_string(p.chunks) + (p.in_rs ? "_i" + std::to_string(p.in_rs) : "");
   }
 
   static std::string build_args(const Conv3x3wPlan& p) {
     return "--groups " + std::to_string(p.groups) + " --wp " + std::to_string(p.wp) +
-        " --chunks " + std::to_string(p.chunks);
+        " --chunks " + std::to_string(p.chunks) +
+        (p.in_rs ? " --in-cin " + std::to_string(p.in_rs) : "");
   }
 
   // The stream for p if it is ready, else nullptr (and a build is queued,
@@ -2668,8 +2746,7 @@ struct XdnaConv3x3wRuntime {
     for (int64_t g0 = 0; g0 < p.groups; g0 += ng) {
       Conv3x3wPlan q = p;
       q.groups = std::min(ng, p.groups - g0);
-      q.key = "g" + std::to_string(q.groups) + "_w" + std::to_string(q.wp) +
-          "_c" + std::to_string(q.chunks);
+      q.key = plan_key(q);
       out.emplace_back(g0, q);
     }
     return out;
@@ -2722,7 +2799,12 @@ struct XdnaConv3x3wRuntime {
                      phase, long(p.batch), long(p.h), long(p.w), long(p.cin), long(p.cout), long(p.groups), ms, wait, pack, unpack, sync, psync);
       }
     } trace_out{trace, phase, p, trace_t0, trace_wait_ms, trace_pack_ms, trace_unpack_ms, trace_sync_ms, trace_psync_ms};
-    const auto x_in = conv_pack_input(x);
+    // Stage 6: x read directly from its rows, no pack.  Else packed (lazy
+    // values from their sources).
+    const auto direct = p.in_rs ? conv_direct_input(x) : nullptr;
+    TORCH_CHECK(!p.in_rs || (direct && direct->row_stride == p.in_rs),
+                "XDNA conv3x3w: direct input changed after planning");
+    const auto x_in = direct ? ConvPackInput{} : conv_pack_input(x);
     auto out = empty_memory_format(
         {c10::SymInt(p.batch), c10::SymInt(p.cout), c10::SymInt(p.h), c10::SymInt(p.w)},
         at::ScalarType::BFloat16, at::Layout::Strided, c10::Device(kXdnaType, 0),
@@ -2758,14 +2840,34 @@ struct XdnaConv3x3wRuntime {
     const size_t in_group = static_cast<size_t>(p.chunks * kGroupRows * kKStep * 2);
     const size_t out_group = static_cast<size_t>(kGroupOutRows * kN * 2);
     const int64_t m_total = p.batch * p.strips * (p.h + 2) * p.wp;
-    auto xin = acquire_packed(static_cast<size_t>(p.groups) * in_group);
+    auto xin = direct ? nullptr : acquire_packed(static_cast<size_t>(p.groups) * in_group);
     xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
     const std::array<int64_t, 5> xshape = {p.batch, p.cin, p.h, p.w, p.chunks};
-    if (xin->shape != xshape) {
+    if (xin && xin->shape != xshape) {
       if (xin->shape != std::array<int64_t, 5>{}) std::memset(xin->ptr, 0, xin->bytes);
       xin->shape = xshape;
     }
+    // Direct input: buffer row q is padded input row q, so piece g0 reads from
+    // row g0 * 2048 (windows of later groups overlap in place).
+    size_t direct_row0 = 0;
+    if (direct) {
+      ScopedMappedCpu flush_phase("npu_conv3x3w.direct_flush");
+      direct_row0 = static_cast<size_t>(
+          direct->base - direct->margin * p.in_rs - static_cast<const uint16_t*>(direct->npu->ptr)) * 2;
+      // TODO: flushes the whole buffer on every read (dX and dW read it twice);
+      // track a clean flag if the flush shows up in profiles.
+      TORCH_CHECK(shim_bo_sync_to_device(direct->npu->bo) == 0,
+                  "failed to sync conv3x3w direct input: ", shim_last_error());
+      g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
+    }
+    auto x_sub = [&](const Conv3x3wPiece& pc) {
+      if (!direct) return xin->sub(pc.g0 * in_group, pc.ng * in_group);
+      const size_t row_bytes = static_cast<size_t>(p.in_rs) * 2;
+      return direct->npu->sub(direct_row0 + pc.g0 * kGroupOutRows * row_bytes,
+                              (pc.ng * kGroupOutRows + kConv3x3wWinRows) * row_bytes);
+    };
     auto pack_piece = [&](const Conv3x3wPiece& pc) {
+      if (direct) return;
       ScopedMappedCpu pack_phase("npu_conv3x3w.pack");
       struct Acc { double& d; double t; decltype(now_ms)& f; ~Acc() { d += f() - t; } } acc{trace_pack_ms, now_ms(), now_ms};
       xdna_conv3x3w_pack_segments_bf16(
@@ -2822,7 +2924,7 @@ struct XdnaConv3x3wRuntime {
       for (const auto& pc : pieces) tasks.push_back({nb, &pc, nullptr});
     auto start = [&](Task& t, Conv3x3wRun& run) {
       const auto& pc = *t.pc;
-      ShimBo* data[3] = {xin->sub(pc.g0 * in_group, pc.ng * in_group), t.slot->bo,
+      ShimBo* data[3] = {x_sub(pc), t.slot->bo,
                          raw->sub(slot_of(t.nb) * block_bytes + pc.g0 * out_group,
                                   pc.ng * out_group)};
       run.r = shim_run_kernel_start(kernel, 3, pc.stream->instr, pc.stream->instr_words, data, 3);
@@ -2848,7 +2950,7 @@ struct XdnaConv3x3wRuntime {
           int(p.batch), int(p.h), int(p.w), int(p.strips), int(p.strip_out),
           int(std::min<int64_t>(kN, p.cout - t.nb * kN)), int(p.cout), int(t.nb * kN),
           int(p0), int(p1), stats ? stats->sum.data() + t.nb * kN : nullptr,
-          stats ? stats->sumsq.data() + t.nb * kN : nullptr);
+          stats ? stats->sumsq.data() + t.nb * kN : nullptr, long(kN));
     };
 
     // The run phase is the host wait for the NPU, i.e. what the overlapped
@@ -2951,10 +3053,19 @@ std::unique_ptr<XdnaConv3x3wRuntime>& conv3x3w_runtime_slot() {
 // never interleaved with the dX chain: backward returns the gradient as
 // pending host work, and the first reader (normally the optimizer) runs it.
 // All deferred dWs of a step then run back to back in one context.
+// A deferred NPU dW: the packed X and dY (or their rows, stage 6), held until
+// the gradient's first reader runs it.  No tensors: the operands are
+// snapshotted when backward runs.
+struct Conv3x3wDwJob {
+  std::shared_ptr<Conv3x3wPacked> x_buf, d_buf;
+  std::shared_ptr<XdnaConvRows> x_rows, d_rows;
+};
+
 struct Conv3x3wDwPlan {
   int64_t batch = 0, cin = 0, cout = 0, h = 0, w = 0;
   int64_t strips = 1, strip_out = 0, grid_w = 0;
   int64_t groups = 0, wp = 0, chunks = 0, cochunks = 0;
+  int64_t x_rs = 0, d_rs = 0;  // > 0: that operand is read directly from rows
   std::string buf_key;
   std::vector<std::pair<std::string, std::string>> passes;  // key, build args
 };
@@ -2962,8 +3073,7 @@ struct Conv3x3wDwPlan {
 struct XdnaConv3x3wDwRuntime {
   static constexpr int64_t kKStep = 64;
   static constexpr int64_t kGroupOutRows = 2048;
-  static constexpr int64_t kGroupRows = 2126;
-  static constexpr int64_t kMaxWidth = 36;
+  static constexpr int64_t kGroupRows = 2182;
   static constexpr int64_t kMaxChunks = 15;  // shim stride limit (2^20 words)
   static constexpr int64_t kAcc = 3 * 64 * 32;
   static constexpr int64_t kCols = 6, kRows = 4;
@@ -3026,14 +3136,22 @@ struct XdnaConv3x3wDwRuntime {
     const std::string base = "g" + std::to_string(p.groups) + "_w" + std::to_string(p.wp) +
         "_c" + std::to_string(p.chunks) + "_d" + std::to_string(p.cochunks);
     p.buf_key = base;
+    // Stage 6: operands still in directly readable rows are read there (the
+    // forward or dX conv read them the same way and packed nothing).
+    if (auto r = conv_direct_input(input)) p.x_rs = r->row_stride;
+    if (auto r = conv_direct_input(grad_output)) p.d_rs = r->row_stride;
+    const std::string direct_key = (p.x_rs ? "_xr" + std::to_string(p.x_rs) : "") +
+        (p.d_rs ? "_dr" + std::to_string(p.d_rs) : "");
+    const std::string direct_args = (p.x_rs ? " --x-rs " + std::to_string(p.x_rs) : "") +
+        (p.d_rs ? " --d-rs " + std::to_string(p.d_rs) : "");
     for (int64_t ci = 0; ci < ceil_div(p.chunks, 2); ++ci) {
       for (int64_t co = 0; co < ceil_div(p.cochunks, 2); ++co) {
         p.passes.emplace_back(
-            base + "_p" + std::to_string(ci) + "_q" + std::to_string(co),
+            base + "_p" + std::to_string(ci) + "_q" + std::to_string(co) + direct_key,
             "--groups " + std::to_string(p.groups) + " --wp " + std::to_string(p.wp) +
                 " --chunks " + std::to_string(p.chunks) + " --cochunks " +
                 std::to_string(p.cochunks) + " --ci-pass " + std::to_string(ci) +
-                " --co-pass " + std::to_string(co));
+                " --co-pass " + std::to_string(co) + direct_args);
       }
     }
     return p;
@@ -3072,8 +3190,15 @@ struct XdnaConv3x3wDwRuntime {
   // ops, dY reuse) cannot change the gradient.  x_buf / d_buf are the copies
   // the forward and dX runs already packed, else null and packed here.
   void pack_operands(const at::Tensor& input, const at::Tensor& grad_output,
-                     const Conv3x3wDwPlan& p, std::shared_ptr<Conv3x3wPacked>& x_buf,
-                     std::shared_ptr<Conv3x3wPacked>& d_buf) {
+                     const Conv3x3wDwPlan& p, Conv3x3wDwJob& job) {
+    auto& x_buf = job.x_buf;
+    auto& d_buf = job.d_buf;
+    // Rows read directly are immutable snapshots already (host rows are never
+    // written after their kernel ran).
+    if (p.x_rs) job.x_rows = conv_direct_input(input);
+    if (p.d_rs) job.d_rows = conv_direct_input(grad_output);
+    TORCH_CHECK(bool(job.x_rows) == bool(p.x_rs) && bool(job.d_rows) == bool(p.d_rs),
+                "XDNA conv3x3w_dw: direct operands changed after planning");
     xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
     // Tiled dY needs zero halo columns, which the dX run's packed copy (real
     // neighbours) does not have: repack it.
@@ -3087,21 +3212,34 @@ struct XdnaConv3x3wDwRuntime {
       buf = acquire_packed(static_cast<size_t>(p.groups * chunks * kGroupRows * kKStep * 2));
       pack_conv3x3w_input(*buf, t_in, t.sizes(), chunks, halo_zero);
     };
-    pack(x_buf, input, p.chunks, false);
-    pack(d_buf, grad_output, p.cochunks, true);
+    if (!p.x_rs) pack(x_buf, input, p.chunks, false);
+    if (!p.d_rs) pack(d_buf, grad_output, p.cochunks, true);
+  }
+
+  // The device buffer of an operand: packed, or rows from padded row 0
+  // (flushed: the host wrote them).
+  ShimBo* operand_bo(const Conv3x3wDwPlan& p, const std::shared_ptr<Conv3x3wPacked>& buf,
+                     const std::shared_ptr<XdnaConvRows>& rows) {
+    if (!rows) return buf->bo;
+    TORCH_CHECK(shim_bo_sync_to_device(rows->npu->bo) == 0,
+                "failed to sync conv3x3w_dw rows: ", shim_last_error());
+    const auto rs = rows->row_stride;
+    const size_t row0 = static_cast<size_t>(
+        rows->base - rows->margin * rs - static_cast<const uint16_t*>(rows->npu->ptr)) * 2;
+    return rows->npu->sub(row0, static_cast<size_t>((p.groups * kGroupOutRows + kConv3x3wWinRows) * rs * 2));
   }
 
   // gw [cout][cin][3][3] bf16 (host memory) = dW of the conv, from the packed
   // operands of pack_operands().
-  void compute(uint16_t* gw, const Conv3x3wDwPlan& p,
-               const std::shared_ptr<Conv3x3wPacked>& x_buf,
-               const std::shared_ptr<Conv3x3wPacked>& d_buf) {
+  void compute(uint16_t* gw, const Conv3x3wDwPlan& p, const Conv3x3wDwJob& job) {
     {
       std::lock_guard<std::mutex> guard(mutex);
       load_kernel();
     }
     xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
     std::lock_guard<std::mutex> guard(mutex);
+    ShimBo* x_bo = operand_bo(p, job.x_buf, job.x_rows);
+    ShimBo* d_bo = operand_bo(p, job.d_buf, job.d_rows);
     const int64_t co_passes = ceil_div(p.cochunks, 2);
     for (size_t i = 0; i < p.passes.size(); ++i) {
       const auto& key = p.passes[i].first;
@@ -3118,7 +3256,7 @@ struct XdnaConv3x3wDwRuntime {
       {
         ScopedMappedCpu run_phase("npu_conv3x3w.dw.run");
         const auto t0 = std::chrono::steady_clock::now();
-        ShimBo* data[3] = {x_buf->bo, d_buf->bo, c};
+        ShimBo* data[3] = {x_bo, d_bo, c};
         TORCH_CHECK(shim_run_kernel(kernel, 3, it->second.first, it->second.second, data, 3) == 0,
                     "conv3x3w_dw dispatch failed: ", shim_last_error());
         TORCH_CHECK(shim_bo_sync_from_device(c) == 0,
@@ -3169,11 +3307,6 @@ std::unique_ptr<XdnaConv3x3wDwRuntime>& conv3x3w_dw_runtime_slot() {
   return *slot;
 }
 
-// A deferred NPU dW: the packed X and dY, held until the gradient's first
-// reader runs it.  No tensors: the operands are snapshotted when backward runs.
-struct Conv3x3wDwJob {
-  std::shared_ptr<Conv3x3wPacked> x_buf, d_buf;
-};
 
 bool conv3x3w_dw_wants(int64_t batch, int64_t cin, int64_t cout, int64_t h, int64_t w) {
   auto& rt = conv3x3w_dw_runtime_slot();
@@ -3782,7 +3915,8 @@ struct RowsOperand {
 
 // A channel slice t = x[:, c0:c0+n] of a tensor x kept in rows (the cat
 // backward's narrow), as rows of its own: the same buffer from channel c0.
-// Only when the slice stays within one 128-channel block or starts at one.
+// In NPU blocks only when the slice stays within one block or starts at one;
+// in NHWC rows (block_stride 128) any slice.
 std::shared_ptr<XdnaConvRows> sliced_rows(const at::Tensor& t, const XdnaVirtualValue& value) {
   if (!value.rows || t.dim() != 4 || value.sizes.size() != 4 ||
       t.strides() != c10::IntArrayRef(value.strides) || t.size(0) != value.sizes[0] ||
@@ -3793,7 +3927,10 @@ std::shared_ptr<XdnaConvRows> sliced_rows(const at::Tensor& t, const XdnaVirtual
   const int64_t delta = t.storage_offset() - value.storage_offset;
   if (delta < 0 || delta % plane != 0) return nullptr;
   const int64_t c0 = delta / plane, n = t.size(1);
-  if (c0 + n > value.sizes[1] || (c0 % 128 != 0 && c0 % 128 + n > 128)) return nullptr;
+  if (c0 + n > value.sizes[1] ||
+      (value.rows->block_stride != 128 && c0 % 128 != 0 && c0 % 128 + n > 128)) {
+    return nullptr;
+  }
   auto rows = std::make_shared<XdnaConvRows>(*value.rows);
   rows->base += (c0 / 128) * rows->block_stride + c0 % 128;
   return rows;
@@ -3820,16 +3957,36 @@ std::optional<RowsOperand> rows_operand(const at::Tensor& t, bool allow_slice = 
   return RowsOperand{std::move(rows), seg, value};
 }
 
-// Rows of one grid share the block stride of the convs that made the grid
-// (host-written rows inherit it), so the rows kernels take one geometry.
+std::shared_ptr<XdnaConvRows> conv_direct_input(const at::Tensor& x) {
+  if (!conv_direct_input_enabled() || !conv_rows_enabled()) return nullptr;
+  auto op = rows_operand(x);
+  if (!op || op->seg || !op->rows->npu || op->rows->block_stride != 128) return nullptr;
+  const auto& r = *op->rows;
+  // Whole 64-channel chunks only: a chunk's bfp16 blocks would mix in the
+  // channels after a partial one.  The DMA needs 4-byte aligned rows, and the
+  // dW pattern a group stride of 2048 rows below 2^20 words.
+  const auto row0 = r.base - r.margin * r.row_stride - static_cast<const uint16_t*>(r.npu->ptr);
+  if (x.size(1) % 64 != 0 || r.row_stride % 2 != 0 || r.row_stride >= 1024 || row0 % 2 != 0) {
+    return nullptr;
+  }
+  return op->rows;
+}
+
+// Rows of one grid differ only in their strides, which the rows kernels take
+// per operand.
 bool same_grid(const XdnaConvRows& a, const XdnaConvRows& b) {
   return a.strips == b.strips && a.strip_out == b.strip_out && a.wp == b.wp &&
-      a.rows == b.rows && a.block_stride == b.block_stride;
+      a.rows == b.rows;
 }
 
 XdnaRowsGeom rows_geom(const at::Tensor& t, const XdnaConvRows& r) {
   return {int(t.size(0)), int(t.size(1)), int(t.size(2)), int(t.size(3)), int(r.strips),
-          int(r.strip_out), int(r.wp), long(r.block_stride)};
+          int(r.strip_out), int(r.wp)};
+}
+
+// The kernels' view of rows; inputs are only read through it.
+XdnaRowsRef rows_ref(const XdnaConvRows& r) {
+  return {const_cast<uint16_t*>(r.base), long(r.block_stride), long(r.row_stride)};
 }
 
 // The grid conv3x3w uses for B x . x H x W tensors (as its run computes it):
@@ -3841,21 +3998,34 @@ XdnaConvRows grid_for(int64_t batch, int64_t h, int64_t w) {
   g.strip_out = t.so;
   g.wp = t.wg + 2;
   g.rows = batch * t.s * (h + 2) * g.wp;
-  g.block_stride = (g.rows + 2047) / 2048 * 2048 * 128;
   return g;
 }
 
-// A new contiguous tensor of `sizes`, kept in host-written rows on the grid of
-// `grid`; *base is where to write them.  Plain host memory: the NPU never
-// writes these buffers, so they need no coherency handling.
+// A new contiguous tensor of `sizes`, kept in host-written NHWC rows (row
+// stride C) on the grid of `grid`; *base is where to write them.  On a
+// one-strip grid the rows go to an NPU buffer laid out for a direct conv read
+// (XdnaConvRows::npu); the NPU never writes it.  The rows kernels write only
+// valid rows, so a pool buffer reused for the same geometry keeps its zeros.
 at::Tensor new_rows_tensor(at::IntArrayRef sizes, const XdnaConvRows& grid, uint16_t** base) {
-  const int64_t blocks = (sizes[1] + 127) / 128;
-  auto storage = std::make_shared<at::Tensor>(
-      at::empty({blocks * grid.block_stride}, at::TensorOptions().dtype(at::kBFloat16)));
+  const int64_t C = sizes[1];
   auto rows = std::make_shared<XdnaConvRows>(grid);
-  *base = static_cast<uint16_t*>(storage->data_ptr());
+  rows->block_stride = 128;
+  rows->row_stride = C;
+  if (grid.strips == 1 && conv_direct_input_enabled() && xdna_device() != nullptr) {
+    const int64_t groups = (grid.rows + 2047) / 2048;
+    rows->margin = grid.wp + 1;
+    const size_t bytes = static_cast<size_t>((rows->margin + groups * 2048 + kConv3x3wWinRows) * C * 2);
+    auto buf = acquire_rows_buffer(bytes, {sizes[0], C, sizes[2], sizes[3], 1});
+    rows->npu = buf.get();
+    *base = static_cast<uint16_t*>(buf->ptr) + rows->margin * C;
+    rows->buffer = std::move(buf);
+  } else {
+    auto storage = std::make_shared<at::Tensor>(
+        at::empty({grid.rows * C}, at::TensorOptions().dtype(at::kBFloat16)));
+    *base = static_cast<uint16_t*>(storage->data_ptr());
+    rows->buffer = std::move(storage);
+  }
   rows->base = *base;
-  rows->buffer = std::move(storage);
   auto out = empty_memory_format(
       c10::fromIntArrayRefSlow(sizes), at::ScalarType::BFloat16, at::Layout::Strided,
       c10::Device(kXdnaType, 0), false, at::MemoryFormat::Contiguous);
@@ -3884,8 +4054,9 @@ at::Tensor rows_act_backward(const at::Tensor& grad, const at::Tensor& self, int
   uint16_t* out_base = nullptr;
   auto out = new_rows_tensor(self.sizes(), *x->rows, &out_base);
   const auto geom = rows_geom(self, *x->rows);
+  const auto rg = rows_ref(*g->rows), rx = rows_ref(*x->rows), ro = rows_ref(*rows_of(out));
   xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
-  xdna_rows_act_backward_bf16(&geom, g->rows->base, x->rows->base, out_base,
+  xdna_rows_act_backward_bf16(&geom, &rg, &rx, &ro,
                               x->seg ? opt_data(x->seg->scale) : nullptr,
                               x->seg ? opt_data(x->seg->shift) : nullptr, mode, slope);
   g_lazy_consumed.fetch_add(2, std::memory_order_relaxed);
@@ -3949,8 +4120,8 @@ at::Tensor rows_add(const at::Tensor& self, const at::Tensor& other, const at::S
   const auto [as, ash, aact, aslope] = pw(*a);
   const auto [bs, bsh, bact, bslope] = pw(*b);
   xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
-  xdna_rows_add_bf16(&geom, a->rows->base, as, ash, aact, aslope, b->rows->base, bs, bsh, bact,
-                     bslope, out_base);
+  const auto ra = rows_ref(*a->rows), rb = rows_ref(*b->rows), ro = rows_ref(*rows_of(out));
+  xdna_rows_add_bf16(&geom, &ra, as, ash, aact, aslope, &rb, bs, bsh, bact, bslope, &ro);
   g_lazy_consumed.fetch_add(2, std::memory_order_relaxed);
   return out;
 }
@@ -5054,9 +5225,10 @@ at::Tensor rows_upsample2x_backward(
   auto out = new_rows_tensor(at::IntArrayRef(in), small, &base);
   const auto gb = rows_geom(grad_output, *g->rows);
   XdnaRowsGeom gs{int(in[0]), int(in[1]), int(in[2]), int(in[3]), int(small.strips),
-                  int(small.strip_out), int(small.wp), long(small.block_stride)};
+                  int(small.strip_out), int(small.wp)};
+  const auto rgo = rows_ref(*g->rows), rgi = rows_ref(*rows_of(out));
   xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
-  xdna_rows_upsample2x_backward_bf16(&gb, g->rows->base, &gs, base);
+  xdna_rows_upsample2x_backward_bf16(&gb, &rgo, &gs, &rgi);
   g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
   return out;
 }
@@ -5370,8 +5542,10 @@ std::optional<std::tuple<at::Tensor, at::Tensor, at::Tensor>> rows_batch_norm_ba
   uint16_t* gi_base = nullptr;
   if (output_mask[0]) gi = new_rows_tensor(input.sizes(), *x->rows, &gi_base);
   const auto geom = rows_geom(input, *x->rows);
+  const auto rg = rows_ref(*g->rows), rx = rows_ref(*x->rows);
+  const XdnaRowsRef rgi = gi.defined() ? rows_ref(*rows_of(gi)) : XdnaRowsRef{nullptr, 0, 0};
   xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
-  xdna_rows_bn_backward_bf16(&geom, g->rows->base, x->rows->base, gi_base, mean.data(),
+  xdna_rows_bn_backward_bf16(&geom, &rg, &rx, &rgi, mean.data(),
                              invstd.data(), opt_data(w), dgamma.data(), dbeta.data());
   g_lazy_consumed.fetch_add(2, std::memory_order_relaxed);
   const auto dtype = defined(weight) ? weight->scalar_type()
@@ -5815,7 +5989,7 @@ convolution_backward_overrideable_xdna(
     // below: a cycle); gw's deleter also waits on it.  d_buf is filled in by the
     // dX run.
     w3_dw_job = std::make_shared<Conv3x3wDwJob>();
-    w3_dw_job->x_buf = take_packed(input, w3_dw_plan->chunks);
+    if (!w3_dw_plan->x_rs) w3_dw_job->x_buf = take_packed(input, w3_dw_plan->chunks);
     cpu_mask[1] = false;
   } else if (overlap_cpu_dw && have_npu_dx && output_mask[1]) {
     ensure_host_current(grad_output);
@@ -5934,13 +6108,12 @@ convolution_backward_overrideable_xdna(
   if (w3_dw_job) {
     // Snapshot X and dY now; only the NPU dispatch is deferred to the gradient's
     // first reader.
-    w3_dw_slot->pack_operands(input, grad_output, *w3_dw_plan, w3_dw_job->x_buf,
-                              w3_dw_job->d_buf);
+    w3_dw_slot->pack_operands(input, grad_output, *w3_dw_plan, *w3_dw_job);
     auto* gw_ptr = static_cast<uint16_t*>(cpu_alias(gw).data_ptr());
     auto* rt = w3_dw_slot.get();
     auto host_job = std::make_shared<DeferredHostJob>(
         [job = w3_dw_job, gw_ptr, rt, plan = *w3_dw_plan]() {
-          rt->compute(gw_ptr, plan, job->x_buf, job->d_buf);
+          rt->compute(gw_ptr, plan, *job);
           *job = Conv3x3wDwJob();
         });
     set_pending_host_write(gw, host_job);

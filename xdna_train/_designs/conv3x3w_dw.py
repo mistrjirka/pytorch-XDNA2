@@ -4,8 +4,8 @@ dW[co][ci][dy][dx] = sum_p X[p + dy*(W+2) + dx][ci] * dY[p][co] over padded-grid
 pixels p: bfp16 operands (8-pixel blocks) with fp32 sums (conv3x3w_dw_kernel.cc).
 
 Inputs reuse the forward family's packed input layout (conv3x3w_host.pack_input):
-  X:  pack_input(x,  chunks)   [groups][chunks][2126][64]
-  dY: pack_input(dy, cochunks) [groups][cochunks][2126][64]; pixel p of dY sits at
+  X:  pack_input(x,  chunks)   [groups][chunks][2182][64]
+  dY: pack_input(dy, cochunks) [groups][cochunks][2182][64]; pixel p of dY sits at
       grid row p + (W+2) + 1, and every padding position reads as zero.
 
 A dispatch ("pass") covers 2 input-channel chunks x 2 output-channel chunks
@@ -48,15 +48,16 @@ WIN = STEP + 2       # window rows per (dy, step): 3 dx taps
 K_STEP = 64          # channels per chunk
 CO_ROW = 32          # output channels per core row
 GROUP_OUT_ROWS = 2048
-GROUP_ROWS = 2126
+GROUP_ROWS = 2182     # conv3x3w.GROUP_ROWS: the packed X is the forward's
 STEPS_PER_GROUP = GROUP_OUT_ROWS // STEP
 ACC = 3 * 64 * CO_ROW  # fp32 per core
 MAX_ITER = 64        # shim BD iteration counter limit
 RTP_LEN = 4
 
 
-def stream_key(groups, wp, chunks, cochunks, ci_pass, co_pass):
-    return f"g{groups}_w{wp}_c{chunks}_d{cochunks}_p{ci_pass}_q{co_pass}"
+def stream_key(groups, wp, chunks, cochunks, ci_pass, co_pass, x_rs=0, d_rs=0):
+    return (f"g{groups}_w{wp}_c{chunks}_d{cochunks}_p{ci_pass}_q{co_pass}"
+            + (f"_xr{x_rs}" if x_rs else "") + (f"_dr{d_rs}" if d_rs else ""))
 
 
 def default_aie_kernels():
@@ -78,8 +79,11 @@ def conv3x3w_dw(
     co_pass: CompileTime[int] = 0,
     aie_kernels: CompileTime[str] = "",
     debug_flags: CompileTime[str] = "",
+    x_rs: CompileTime[int] = 0,
+    d_rs: CompileTime[int] = 0,
 ):
-    assert 3 <= wp <= 38 and groups >= 1
+    # A group reads rows up to 2048 + 2 * wp + 2 of its GROUP_ROWS.
+    assert 3 <= wp <= (GROUP_ROWS - GROUP_OUT_ROWS - 2) // 2 and groups >= 1
     # Shim strides are limited to 2^20 32-bit words.
     assert max(chunks, cochunks) * GROUP_ROWS * K_STEP // 2 < (1 << 20)
 
@@ -142,8 +146,14 @@ def conv3x3w_dw(
                       tile=Tile(c, 2 + q), stack_size=0xC00)
                for c in range(COLS) for q in range(ROWS)]
 
-    x_elems = groups * chunks * GROUP_ROWS * K_STEP
-    d_elems = groups * cochunks * GROUP_ROWS * K_STEP
+    # x_rs / d_rs > 0 (stage 6): the operand is NHWC rows of that many channels
+    # where buffer row q is padded-grid row q (the conv3x3w direct-input
+    # layout, conv3x3w.WIN_ROWS = 198 rows after the last group), not packed.
+    WIN_ROWS_FWD = GROUP_ROWS - GROUP_OUT_ROWS + STEP
+    x_elems = (groups * GROUP_OUT_ROWS + WIN_ROWS_FWD) * x_rs if x_rs else \
+        groups * chunks * GROUP_ROWS * K_STEP
+    d_elems = (groups * GROUP_OUT_ROWS + WIN_ROWS_FWD) * d_rs if d_rs else \
+        groups * cochunks * GROUP_ROWS * K_STEP
     X_ty = np.ndarray[(x_elems,), np.dtype[bfloat16]]
     D_ty = np.ndarray[(d_elems,), np.dtype[bfloat16]]
     C_ty = np.ndarray[(COLS * ROWS * ACC,), np.dtype[np.float32]]
@@ -152,6 +162,10 @@ def conv3x3w_dw(
         chunk = 2 * ci_pass + col // 3
         chunk = chunk if chunk < chunks else 0
         dy = col % 3
+        if x_rs:
+            base = (g0 * GROUP_OUT_ROWS + dy * wp) * x_rs + chunk * K_STEP
+            return TensorAccessPattern((x_elems,), base, [ng, STEPS_PER_GROUP, WIN, K_STEP],
+                                       [GROUP_OUT_ROWS * x_rs, STEP * x_rs, x_rs, 1])
         base = (g0 * chunks + chunk) * GROUP_ROWS * K_STEP + dy * wp * K_STEP
         return TensorAccessPattern((x_elems,), base, [ng, STEPS_PER_GROUP, WIN, K_STEP],
                                    [chunks * GROUP_ROWS * K_STEP, STEP * K_STEP, K_STEP, 1])
@@ -159,6 +173,10 @@ def conv3x3w_dw(
     def d_tap(q, g0, ng):
         chunk = 2 * co_pass + q // 2
         chunk = chunk if chunk < cochunks else 0
+        if d_rs:
+            base = (g0 * GROUP_OUT_ROWS + wp + 1) * d_rs + chunk * K_STEP + (q % 2) * CO_ROW
+            return TensorAccessPattern((d_elems,), base, [ng, STEPS_PER_GROUP, STEP, CO_ROW],
+                                       [GROUP_OUT_ROWS * d_rs, STEP * d_rs, d_rs, 1])
         base = ((g0 * cochunks + chunk) * GROUP_ROWS + wp + 1) * K_STEP + (q % 2) * CO_ROW
         return TensorAccessPattern((d_elems,), base, [ng, STEPS_PER_GROUP, STEP, CO_ROW],
                                    [cochunks * GROUP_ROWS * K_STEP, STEP * K_STEP, K_STEP, 1])
@@ -201,10 +219,10 @@ def conv3x3w_dw(
 
 
 def build(out_dir, groups, wp, chunks, cochunks, ci_pass, co_pass, aie_kernels=None,
-          keep_prj=False, debug_flags=""):
+          keep_prj=False, debug_flags="", x_rs=0, d_rs=0):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    key = stream_key(groups, wp, chunks, cochunks, ci_pass, co_pass)
+    key = stream_key(groups, wp, chunks, cochunks, ci_pass, co_pass, x_rs, d_rs)
     tmp_x = out / f".{key}.xclbin.tmp"
     tmp_i = out / f".{key}.bin.tmp"
     from aie.iron.device import from_name
@@ -213,7 +231,7 @@ def build(out_dir, groups, wp, chunks, cochunks, ci_pass, co_pass, aie_kernels=N
     conv3x3w_dw.specialize(groups=groups, wp=wp, chunks=chunks, cochunks=cochunks,
                            ci_pass=ci_pass, co_pass=co_pass,
                            aie_kernels=aie_kernels or default_aie_kernels(),
-                           debug_flags=debug_flags).compile(
+                           debug_flags=debug_flags, x_rs=x_rs, d_rs=d_rs).compile(
         xclbin_path=str(tmp_x), inst_path=str(tmp_i))
     shared = out / "conv3x3w_dw.xclbin"
     if not shared.exists():
@@ -234,9 +252,11 @@ def main():
     ap.add_argument("--aie-kernels", default=None)
     ap.add_argument("--keep-prj", action="store_true")
     ap.add_argument("--debug-flags", default="")
+    ap.add_argument("--x-rs", type=int, default=0)
+    ap.add_argument("--d-rs", type=int, default=0)
     a = ap.parse_args()
     print(build(a.out, a.groups, a.wp, a.chunks, a.cochunks, a.ci_pass, a.co_pass,
-                a.aie_kernels, a.keep_prj, a.debug_flags))
+                a.aie_kernels, a.keep_prj, a.debug_flags, a.x_rs, a.d_rs))
 
 
 if __name__ == "__main__":

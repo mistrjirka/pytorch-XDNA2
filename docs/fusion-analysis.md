@@ -180,6 +180,9 @@ strip grid), and the tensor is a lazy value of that kind
 
 ## Stage 5: NPU prologue/epilogue (evaluated, not built)
 
+Superseded by stage 6, which measured the direct read on hardware; kept for the
+numbers.
+
 Measured on lab04 with stages 1-4 in place:
 
 - Prologue (BN affine + activation on the core, on the input window): the
@@ -208,6 +211,68 @@ and hang risk. Not built now. Larger items first: the host pack itself (about
 that the removed unpack no longer hides. Revisit when the pack is near copy
 speed, or if the NPU kernel is rebuilt for other reasons.
 
+## Stage 6: faster pack, 64-wide window, direct conv input
+
+Each part measured on lab04 (B64, 64x64, `XDNA_NPU_MODE=2`), ABBA, 25 steps.
+
+- Pack stores (`store_packed_row`): a full 64-channel packed row is two
+  whole cache lines, written with streaming stores. A normal store first reads
+  the line it overwrites, so the memory-bound pack moved about 1.5x the bytes
+  of a copy. Pack kernel alone: 7.2 -> 6.1 ms for 134 MB, the speed of a
+  parallel `memcpy`. lab04: about 4 %.
+- 64-wide window (`conv3x3w.MAX_WIDTH` 36 -> 64): 64x64 convs ran as two strips
+  of 34 columns, so the pack wrote halo columns and the NPU computed 8 % more
+  rows. The window is now 198 x 64 bf16; with the double-buffered weights, the
+  output tile and the stack it leaves about 2 KB of the 64 KB core memory.
+  Packed `GROUP_ROWS` 2126 -> 2182 (the dW reads that layout). NPU time per
+  pass: 64x64 -2 to -6 %, small shapes +1 to +5 % (more window rows per core).
+  lab04: about 3 %.
+- Direct input (`XDNA_CONV_DIRECT_INPUT`, default on). Host-written rows on a
+  one-strip grid go to an NPU buffer laid out as the conv reads its input:
+  NHWC, buffer row q = padded-grid row q (a zero margin of wp + 1 rows in
+  front), padding pixels and a 198-row tail zero. The conv reads them through
+  an `--in-cin R` stream (`[chunks, 4 cores, 198 rows, 64]` with strides
+  `[64, 64 R, R, 1]`; windows overlap in place, no per-group halo copy). The
+  NPU dW reads X and dY the same way (`--x-rs`, `--d-rs`). Bytes read are the
+  bytes a pack would write: gradients are bit-equal with the feature off
+  (`tests/run_conv_direct_input.py`).
+  - Verified first on hardware outside torch (32x32 and 64x64, C 128/256):
+    same NPU time and results as the packed input, also with the output
+    written as strided NHWC rows and for conv -> conv with no host step.
+  - Who qualifies: only host-written rows (BatchNorm/activation backward,
+    adds, upsample backward, cat-backward slices of them), C a multiple of 64.
+    In lab04 forward every conv input is a lazy `LeakyReLU(BN(...))`, which
+    needs the BN and activation on the NPU core (not built), so only dX
+    convs read directly.
+  - The CPU dW of small convs read dY as NCHW, which ends the rows chain: the
+    16x16 trunk (14 convs, 2.4 GMAC dW each, under the 3 GMAC NPU dW gate)
+    never reached a direct read. The gate is now 2 GMAC (`device.py`): lab04
+    median 423-441 vs 533-557 ms per step with the trunk dW on the NPU
+    (mostly not the direct read: the CPU dW competed with host work). 1 GMAC
+    was measured before as 20-45 % slower for 1.2-1.3 GMAC convs (program
+    switch), so the gate stops above those. Zoo (noisy, ABBA): style_net and
+    conv_autoencoder faster, resnet18, unet and vgg11 within noise.
+  - Removing a pack exposes the NPU time it overlapped: lab04 pack -6 to -10
+    ms, dX NPU wait +6 ms. Net 1-3 % with the trunk dW on the NPU.
+- Layout: the rows kernels take block and row strides per operand
+  (`XdnaRowsRef`): NPU outputs stay in 128-channel blocks, host rows are NHWC,
+  so a channel slice of host rows is just an offset.
+
+Stage 6 total (lab04, ABBA vs commit 806ac70, 25 steps): median 440, 421, 478
+vs 634, 564, 615 ms; min 407, 407, 416 vs 540, 508, 525 ms.
+
+Not covered yet: the activation backward of a lazy cat (`leaky(cat(...))` in a
+decoder) is not a rows op, so cat-backward slices stay NCHW and are packed.
+
+Gotchas:
+- Host rows buffers have their own pool: the CPU writes them, so they must
+  never become NPU outputs (a dirty cache line could land over an NPU result).
+  Writers fill only valid rows; a buffer is zeroed when its geometry changes.
+- A direct read flushes the whole buffer each time (dX and dW both do).
+- Direct reads need 4-byte aligned rows (even row stride and channel offset)
+  and a row stride below 1024 (the dW group stride must stay under 2^20
+  words).
+
 ## Next stages, by what they unblock
 
 1. ~~More lazy producers~~: done (stage 1b).
@@ -217,6 +282,10 @@ speed, or if the NPU kernel is rebuilt for other reasons.
 3. ~~BatchNorm statistics in the conv unpack~~: done (stage 3).
 4. ~~Keep the NPU layout between ops~~: done (stage 4).
 5. ~~NPU prologue/epilogue~~: evaluated, not built (stage 5 above).
+6. ~~Faster pack, 64-wide window, direct conv input~~: done (stage 6).
+7. Forward direct input: BN scale/shift + activation + padding mask on the
+   conv core (and on the dW core, which reads the same X). Needs a fourth
+   input stream for scale/shift and a tolerance instead of bit-equality.
 
 ## Full graph recording (way 1): not needed yet
 

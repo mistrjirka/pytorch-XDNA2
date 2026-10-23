@@ -67,7 +67,7 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 | `XDNA_CONV_PACK_THREADS` | 12 | OpenMP width of full-frame pack/unpack (read 4x) | cpp:1669,3093,3151,3652 | tuning | project notes (4 under load) | MERGE/SIMPLIFY (one helper) | merged |
 | `XDNA_IRON_PYTHON` | auto-detect | python of the mlir-aie env; empty disables on-demand builds | device.py:113 | core config | README | KEEP | kept |
 | `XDNA_CONV3X3W_DIR`, `XDNA_CONV3X3W_DW_DIR` (name built as `XDNA_{NAME}_DIR`) | cache dir | directory with xclbin + streams | device.py:152 | debug | used when testing other builds | KEEP-BUT-DOCUMENT | kept |
-| `XDNA_CONV3X3W_MIN_MACS`, `XDNA_CONV3X3W_DW_MIN_MACS` (built as `XDNA_{NAME}_MIN_MACS`) | 20e6 / 3e9 | size floor | device.py:153 | tuning | README; tests set 0 | KEEP | kept |
+| `XDNA_CONV3X3W_MIN_MACS`, `XDNA_CONV3X3W_DW_MIN_MACS` (built as `XDNA_{NAME}_MIN_MACS`) | 20e6 / 2e9 | size floor | device.py:153 | tuning | README; tests set 0 | KEEP | kept |
 | `XDNA_CONV3X3W_SYNC_BUILD` | 0 | build streams before the first call | device.py:153 | debug | README, tests | KEEP | kept |
 | `XDNA_WAIT_FOR_BUILDS` | 1 | `0`: do not pause training at an optimizer step while NPU kernel programs compile (CPU fallback meanwhile) | device.py `_BuildWaiter` | core | docs/usage.md | KEEP | new |
 | `XDNA_WAIT_FOR_BUILDS_MAX_S` | 3600 | longest single wait for builds | device.py `_BuildWaiter` | tuning | -- | KEEP | new |
@@ -81,6 +81,7 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 | `XDNA_CONV3X3W_TRACE` | 0 | per-conv trace | cpp:2527,2913 | debug | log | KEEP | kept |
 | `XDNA_LAZY_POINTWISE` | 1 | `0` computes `leaky_relu`, `relu`, `relu_`, `clone`, `add`, channel `cat`, nearest 2x upsample and training `BatchNorm2d` eagerly instead of through lazy values that the conv3x3w pack and the residual add apply | cpp `lazy_pointwise_enabled` | core/debug | `tests/run_lazy_pointwise.py` (bit-equal to eager); docs/usage.md | KEEP | new |
 | `XDNA_LAZY_CONV_ROWS` | 1 | `0` unpacks every conv3x3w output to NCHW instead of keeping it in the NPU row layout for the next conv, BatchNorm, activations, upsample backward and adds (stage 4) | cpp `conv_rows_enabled` | core/perf | `tests/run_lazy_pointwise.py` (rows cases); docs/fusion-analysis.md | KEEP | new |
+| `XDNA_CONV_DIRECT_INPUT` | 1 | `0` packs every conv3x3w input instead of reading host-written rows (gradients in the NPU row layout) directly; the NPU dW then reads packed copies too (stage 6) | cpp `conv_direct_input_enabled` | core/perf | `tests/run_conv_direct_input.py`; docs/fusion-analysis.md | KEEP | new |
 | `XDNA_CONV3X3W_WEIGHT_CACHE` | 1 | `0` disables the weight cache | cpp:2413 | debug | `tests/run_conv3x3w_torch.py` | KEEP | kept |
 | `XDNA_ENABLE_PATCH_CONV` | 1 | register the patch conv family | device.py:207 | dead at default | see family table | REMOVE | removed |
 | `XDNA_PATCH_CONV_ARTIFACT_DIR` | bundled | alternative artifact dir | device.py:202 | dead | -- | REMOVE | removed |

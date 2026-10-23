@@ -23,7 +23,7 @@ Two hardware rules this design depends on (each one hung the array):
     group therefore issues one task per channel and at most 4 are in flight.
 
 Host layouts (see xdna_train conv packing):
-  X: [groups][chunks][GROUP_ROWS][64] bf16, GROUP_ROWS = 2048 + WIN_ROWS - 64,
+  X: [groups][chunks][GROUP_ROWS][64] bf16, GROUP_ROWS = 2048 + WIN_ROWS - 64 = 2182,
      padded NHWC rows with each group's halo duplicated
   B: [K/64 * N/8 ... ] bfp16ebs8 in AMD's ATB 1x2/8x8 shuffle, K = 576 * chunks
   C: [groups * 2048][128] bf16 padded-grid rows
@@ -33,7 +33,8 @@ Build (mlir-aie IRON environment):
   (or --batch B --height H --width W instead of --groups/--wp)
 writes DIR/conv3x3w.xclbin (shape independent) and DIR/<stream key>.bin.
 A stream depends only on (groups, padded width, channel chunks), so shapes
-with the same three values share it.
+with the same three values share it.  --in-cin R builds the variant that reads
+its input directly from NHWC rows of R channels (stage 6).
 """
 
 import argparse
@@ -59,15 +60,18 @@ COLS, ROWS = 8, 4
 M_CORE = 64          # output rows per core
 N = 128              # output channels per pass
 K_STEP = 64          # channels per window chunk / K step
-MAX_WIDTH = 36       # widest supported image (window rows = 64 + 2*(W+2) + 2)
+# Widest supported image (window rows = 64 + 2*(W+2) + 2).  64 makes the
+# window 198 x 64 bf16 (24.75 KB); with B (2 x 9 KB), C (16 KB) and the stack
+# that leaves about 2 KB of the 64 KB core memory.  Wider images run as strips.
+MAX_WIDTH = 64
 WIN_ROWS = M_CORE + 2 * (MAX_WIDTH + 2) + 2
 GROUP_OUT_ROWS = M_CORE * ROWS * COLS
 GROUP_ROWS = GROUP_OUT_ROWS + WIN_ROWS - M_CORE
 RTP_LEN = 16
 
 
-def stream_key(groups, wp, chunks):
-    return f"g{groups}_w{wp}_c{chunks}"
+def stream_key(groups, wp, chunks, in_cin=0):
+    return f"g{groups}_w{wp}_c{chunks}" + (f"_i{in_cin}" if in_cin else "")
 
 
 def default_aie_kernels():
@@ -96,6 +100,7 @@ def conv3x3w(
     debug_static: CompileTime[int] = 0,
     b_l1_depth: CompileTime[int] = 2,
     slots: CompileTime[int] = 2,
+    in_cin: CompileTime[int] = 0,
 ):
     assert 3 <= wp <= MAX_WIDTH + 2 and groups >= 1 and chunks >= 1
     r, s, t = 8, 8, 8
@@ -189,7 +194,12 @@ def conv3x3w(
         stack_size=0xD00,
     ))
 
-    x_elems = groups * chunks * GROUP_ROWS * k
+    # in_cin > 0 (stage 6, direct input): X is NHWC rows with in_cin channels
+    # per row where buffer row q is padded-grid input row q, so windows overlap
+    # in place instead of each group carrying its own halo copy.  The host
+    # keeps every padding position zero.
+    x_elems = (groups * GROUP_OUT_ROWS + WIN_ROWS) * in_cin if in_cin else \
+        groups * chunks * GROUP_ROWS * k
     X_ty = np.ndarray[(x_elems,), np.dtype[bfloat16]]
     B_ty = np.ndarray[(K * N // 8,), np.dtype[v8bfp16ebs8]]
     C_ty = np.ndarray[(groups * GROUP_OUT_ROWS * N,), np.dtype[bfloat16]]
@@ -202,6 +212,10 @@ def conv3x3w(
         # entries; with 3 the compiler moves the core dimension into the
         # iteration slot (wrong data).  One task per group keeps the shim
         # channel's task queue (depth 4) from overflowing.
+        if in_cin:
+            base = (grp * GROUP_OUT_ROWS + col * ROWS * M_CORE) * in_cin
+            return TensorAccessPattern((x_elems,), base, [chunks, ROWS, WIN_ROWS, k],
+                                       [k, M_CORE * in_cin, in_cin, 1])
         base = grp * chunks * GROUP_ROWS * k + col * ROWS * M_CORE * k
         return TensorAccessPattern((x_elems,), base, [chunks, ROWS, WIN_ROWS, k],
                                    [GROUP_ROWS * k, M_CORE * k, k, 1])
@@ -252,10 +266,10 @@ def conv3x3w(
 
 
 def build(out_dir, groups, wp, chunks, aie_kernels=None, debug_static=0, b_l1_depth=2,
-          slots=2, keep_prj=False):
+          slots=2, keep_prj=False, in_cin=0):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    key = stream_key(groups, wp, chunks)
+    key = stream_key(groups, wp, chunks, in_cin)
     aie_kernels = aie_kernels or default_aie_kernels()
     tmp_x = out / f".{key}.xclbin.tmp"
     tmp_i = out / f".{key}.bin.tmp"
@@ -264,7 +278,7 @@ def build(out_dir, groups, wp, chunks, aie_kernels=None, debug_static=0, b_l1_de
     set_current_device(from_name("npu2", n_cols=None))
     conv3x3w.specialize(groups=groups, wp=wp, chunks=chunks,
                         aie_kernels=aie_kernels, debug_static=debug_static,
-                        b_l1_depth=b_l1_depth, slots=slots).compile(xclbin_path=str(tmp_x),
+                        b_l1_depth=b_l1_depth, slots=slots, in_cin=in_cin).compile(xclbin_path=str(tmp_x),
                                                          inst_path=str(tmp_i))
     shared = out / "conv3x3w.xclbin"
     if not shared.exists():
@@ -291,11 +305,12 @@ def main():
     ap.add_argument("--debug-static", type=int, default=0)
     ap.add_argument("--b-l1-depth", type=int, default=2)
     ap.add_argument("--slots", type=int, default=2)
+    ap.add_argument("--in-cin", type=int, default=0)
     a = ap.parse_args()
     if a.groups is None:
         a.wp, _, a.groups = geometry(a.batch, a.height, a.width)
     print(build(a.out, a.groups, a.wp, a.chunks, a.aie_kernels, a.debug_static,
-                a.b_l1_depth, a.slots, a.keep_prj))
+                a.b_l1_depth, a.slots, a.keep_prj, a.in_cin))
 
 
 if __name__ == "__main__":

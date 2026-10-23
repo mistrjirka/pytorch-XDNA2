@@ -208,7 +208,7 @@ autotuner. `XDNA_AUTOTUNE=0` leaves all NPU paths eligible without step tuning.
 Mode 0 still has XDNA storage and dispatch overhead; compare against a model on
 `torch.device("cpu")` for a native CPU baseline.
 
-General 3x3 weight gradients below 3 billion multiply-accumulates stay on the CPU
+General 3x3 weight gradients below 2 billion multiply-accumulates stay on the CPU
 by default. `XDNA_CONV3X3W_DW_MIN_MACS` controls that threshold. It is a cost
 heuristic, not a guarantee that the faster device is selected for every shape.
 
@@ -272,8 +272,10 @@ XDNA path bit for bit, except the BatchNorm running variance (within one bf16 st
   BatchNorm (forward and backward), the activations and their backward, upsample backward and residual adds
   work on that layout directly, so a conv -> BatchNorm -> activation -> conv chain is not unpacked between
   convs. BatchNorm backward there sums in double, so a value can differ from eager by one bf16 step.
+- Gradients that the host computes in that layout go to NPU buffers the next NPU 3x3 conv and its weight
+  gradient read directly, with no pack (single-strip images, channels a multiple of 64).
 - `XDNA_LAZY_POINTWISE=0` computes these ops eagerly. `XDNA_LAZY_CONV_ROWS=0` keeps the lazy values but
-  unpacks every conv output.
+  unpacks every conv output. `XDNA_CONV_DIRECT_INPUT=0` packs every conv input.
 - Writing the input of a lazy value without reading it first (e.g. an `out=` op on a BatchNorm output that a
   LeakyReLU already used) raises an error instead of returning stale data.
 - `xdna_train.allocator_stats()` counts `lazy_created`, `lazy_consumed` (applied by a consumer),

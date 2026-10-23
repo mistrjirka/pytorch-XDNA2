@@ -26,7 +26,8 @@ SHAPES = [  # B, Cin, H, W, Cout, bias
     (40, 128, 9, 9, 128, False),
     (40, 256, 18, 18, 256, False),
     (3, 3, 5, 7, 10, True),
-    # width tiling (W > 36 runs as vertical strips)
+    # width tiling (W > 64 runs as vertical strips)
+    (2, 70, 12, 67, 70, False),
     (4, 64, 16, 56, 64, False),
     (2, 64, 20, 64, 128, True),
     (2, 70, 12, 37, 70, False),

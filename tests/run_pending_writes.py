@@ -43,6 +43,10 @@ def dw_stream_dir():
     for name in ("conv3x3w_dw.py", "conv3x3w_dw_kernel.cc"):
         with open(os.path.join(designs, name), "rb") as f:
             h.update(f.read())
+    if "XDNA_IRON_PYTHON" not in os.environ:
+        from xdna_tools import toolchain
+        if toolchain.managed_python() is not None:  # device.py hashes the compiler too
+            h.update(toolchain.toolchain_id().encode())
     root = os.environ.get("TORCH_XDNA2_CACHE") or os.path.join(
         os.path.expanduser("~"), ".cache", "torch-xdna2")
     return os.path.join(root, "conv3x3w_dw", h.hexdigest()[:16])
