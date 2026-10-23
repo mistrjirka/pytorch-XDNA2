@@ -260,18 +260,26 @@ unchanged; `torch.save(model)` of the whole object is not supported. The regions
 
 ## Lazy pointwise values
 
-Automatic, no model change. On contiguous NCHW bf16 tensors, `leaky_relu` (ReLU is slope 0) and training
-`BatchNorm2d` return a tensor whose bytes are not written yet. A following NPU 3x3 conv applies the
-per-channel `act(x * scale + shift)` while it packs its input, its NPU weight gradient does the same, and
-`leaky_relu_backward` takes its mask from the BatchNorm input. Any other reader (print, `.cpu()`, a CPU op, a
+Automatic, no model change. On contiguous NCHW bf16 tensors, `leaky_relu`, `relu` and training
+`BatchNorm2d` return a tensor whose bytes are not written yet, and so do `torch.cat` along channels and
+nearest 2x upsampling. `relu_` on such a BatchNorm output and `clone` keep it lazy. A following NPU 3x3 conv applies the per-channel `act(x * scale + shift)` while it packs its
+input, its NPU weight gradient does the same, a residual add (`+`, `+=`, alpha 1) computes it while adding,
+and the LeakyReLU and ReLU backward take their mask from the value's input. Any other reader (print, `.cpu()`, a CPU op, a
 view, an in-place write) writes the bytes first, so results never depend on who reads. Results equal the eager
 XDNA path bit for bit, except the BatchNorm running variance (within one bf16 step, eval mode only).
 
-- `XDNA_LAZY_POINTWISE=0` computes these ops eagerly.
+- NPU 3x3 conv outputs stay in the NPU's row layout until something reads them as NCHW. The next conv,
+  BatchNorm (forward and backward), the activations and their backward, upsample backward and residual adds
+  work on that layout directly, so a conv -> BatchNorm -> activation -> conv chain is not unpacked between
+  convs. BatchNorm backward there sums in double, so a value can differ from eager by one bf16 step.
+- `XDNA_LAZY_POINTWISE=0` computes these ops eagerly. `XDNA_LAZY_CONV_ROWS=0` keeps the lazy values but
+  unpacks every conv output.
 - Writing the input of a lazy value without reading it first (e.g. an `out=` op on a BatchNorm output that a
   LeakyReLU already used) raises an error instead of returning stale data.
-- `xdna_train.allocator_stats()` counts `lazy_created`, `lazy_consumed` (applied by a consumer) and
-  `lazy_materialized` (written because something else read it).
+- `xdna_train.allocator_stats()` counts `lazy_created`, `lazy_consumed` (applied by a consumer),
+  `lazy_materialized` (written because something else read it) and `bn_stats_reused` (BatchNorm statistics
+  taken from the conv that produced its input). With `XDNA_PROFILE_MAPPED_CPU=1`, `mapped_cpu_stats()` lists
+  the writes as `lazy.write[<op>]` under the op that forced them.
 
 ## Deferred gradients and timing
 

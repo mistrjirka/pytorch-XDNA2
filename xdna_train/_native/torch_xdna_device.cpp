@@ -34,6 +34,10 @@
 #include <ATen/ops/upsample_nearest2d_backward.h>
 #include <ATen/ops/native_batch_norm.h>
 #include <ATen/ops/native_batch_norm_backward.h>
+#include <ATen/ops/relu_ops.h>
+#include <ATen/ops/threshold_backward_ops.h>
+#include <ATen/ops/add_ops.h>
+#include <ATen/ops/clone_native.h>
 #include <ATen/CPUGeneratorImpl.h>
 #include <ATen/autocast_mode.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
@@ -44,6 +48,7 @@
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <torch/extension.h>
 #include "xrt_shim.h"
+#include "conv_pack.h"
 
 #include <algorithm>
 #include <atomic>
@@ -125,19 +130,24 @@ extern "C" void xdna_conv3x3w_unpack_output_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int);
 extern "C" void xdna_conv3x3w_pack_input_strips_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
-extern "C" void xdna_conv3x3w_pack_input_strips_range_pw_bf16(
-    const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int,
-    const float*, const float*, int, float);
-extern "C" void xdna_pointwise_channel_bf16(
-    const uint16_t*, uint16_t*, int, int, long, const float*, const float*, int, float);
 extern "C" void xdna_leaky_backward_pw_bf16(
     const uint16_t*, const uint16_t*, uint16_t*, int, int, long, const float*, const float*,
     float);
+extern "C" void xdna_relu_backward_pw_bf16(
+    const uint16_t*, const uint16_t*, uint16_t*, int, int, long, const float*, const float*);
+extern "C" void xdna_add_pw_bf16(
+    const uint16_t*, const float*, const float*, int, float,
+    const uint16_t*, const float*, const float*, int, float,
+    uint16_t*, int, int, long);
 extern "C" void xdna_conv3x3w_unpack_output_strips_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
 extern "C" int shim_dispatch_poisoned(void);
 extern "C" ShimRun* shim_run_kernel_start(
     ShimKernel*, unsigned int, ShimBo*, size_t, ShimBo* const*, size_t);
+
+// The boxed CPU fallback (defined below), for the eager path of ops that have
+// an XDNA kernel only for some inputs.
+void xdna_cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack);
 
 namespace {
 
@@ -492,16 +502,39 @@ void async_dw_maybe_kick() {
   if (k > 0 && policy.epoch_dx.load() >= k) DeferredJobLauncher::instance().kick();
 }
 
-// A lazy value (XDNA_LAZY_POINTWISE): y = act(source * scale + shift) per
-// channel, not written yet.  A consumer that reads every element anyway (the
-// conv3x3w pack) applies it while reading the source; any other access writes
-// the bytes first (materialize_virtual).  Only for contiguous NCHW bf16.
-struct XdnaVirtualValue {
+// Codes shared with the kernels in conv_pack.cpp (kAct*).
+enum class XdnaAct : int { None = 0, Leaky = 1, Relu = 2 };
+
+// Channels of a lazy value: act(up(source) * scale + shift) per channel, with
+// up() a nearest upsample by an integer factor (XdnaPackSegment).
+struct XdnaLazySegment {
   at::Tensor source;            // contiguous NCHW bf16, never lazy itself
   uint64_t source_epoch = 0;    // write_epoch of source when recorded
+  int64_t up = 1;
   std::vector<float> scale, shift;  // per channel, empty: no affine
-  bool act = false;             // LeakyReLU with `slope` (0: ReLU)
-  float slope = 0.f;
+  XdnaAct act = XdnaAct::None;
+  float slope = 0.f;            // Leaky only
+};
+
+// Stage 4: a conv3x3w forward output kept as the NPU wrote it, unpacked to
+// NCHW only when something reads it that way.  `buffer` holds consecutive
+// blocks of [grid rows][128] bf16 in the strip layout, channel k in block
+// k / 128 (XdnaPackSegment::rows).
+struct XdnaConvRows {
+  std::shared_ptr<void> buffer;  // the NPU output buffer, out of its pool
+  const uint16_t* base = nullptr;
+  int64_t block_stride = 0;      // elements
+  int64_t strips = 1, strip_out = 0, wp = 0, rows = 0;
+};
+
+// A lazy value (XDNA_LAZY_POINTWISE): its segments concatenated along the
+// channels, not written yet.  Or, with `rows` set instead of segments, the
+// output of a conv that is still in the NPU's layout.  A consumer that reads every element anyway (the
+// conv3x3w pack) computes it while reading the sources; any other access
+// writes the bytes first (materialize_virtual).  Only for contiguous NCHW bf16.
+struct XdnaVirtualValue {
+  std::vector<XdnaLazySegment> segments;
+  std::shared_ptr<XdnaConvRows> rows;
   // The producer's view, so it can be materialized from the storage alone (an
   // alias with other sizes, a storage resize, a dependent of another storage).
   std::vector<int64_t> sizes, strides;
@@ -510,6 +543,18 @@ struct XdnaVirtualValue {
 };
 
 std::atomic<uint64_t> g_lazy_created{0}, g_lazy_consumed{0}, g_lazy_materialized{0};
+std::atomic<uint64_t> g_bn_stats_reused{0};
+
+// Per-channel sum and sum of squares of a tensor's values, computed by the
+// conv3x3w unpack that wrote it.  Valid while the allocation's write epoch and
+// the tensor's view are unchanged.
+struct XdnaChannelStats {
+  std::vector<double> sum, sumsq;
+  double count = 0;
+  uint64_t epoch = 0;
+  std::vector<int64_t> sizes;
+  int64_t storage_offset = 0;
+};
 
 struct XdnaAllocation {
   uint64_t magic = kXdnaAllocationMagic;
@@ -538,6 +583,7 @@ struct XdnaAllocation {
   // a write would change their input.  Both guarded by virtual_mutex.
   std::mutex virtual_mutex;
   std::shared_ptr<XdnaVirtualValue> virtual_value;
+  std::shared_ptr<XdnaChannelStats> channel_stats;
   std::vector<c10::weak_intrusive_ptr<c10::StorageImpl>> dependents;
 };
 
@@ -635,6 +681,15 @@ bool lazy_pointwise_enabled() {
   return on;
 }
 
+// Stage 4 (needs lazy values): conv3x3w outputs stay in the NPU's rows.
+bool conv_rows_enabled() {
+  static const bool on = [] {
+    const char* raw = std::getenv("XDNA_LAZY_CONV_ROWS");
+    return lazy_pointwise_enabled() && (raw == nullptr || raw[0] == 0 || std::strcmp(raw, "0") != 0);
+  }();
+  return on;
+}
+
 std::shared_ptr<XdnaVirtualValue> virtual_value_of(const at::Tensor& tensor) {
   if (!tensor.defined() || tensor.device().type() != kXdnaType) return nullptr;
   auto* allocation = allocation_from_tensor(tensor);
@@ -642,8 +697,52 @@ std::shared_ptr<XdnaVirtualValue> virtual_value_of(const at::Tensor& tensor) {
   return allocation->virtual_value;
 }
 
+// The sources of `value`, current for the CPU.  A source written after the
+// value was recorded would change it: an error, never stale data.
+// The rows a tensor is still kept in (stage 4), if any.
+std::shared_ptr<XdnaConvRows> rows_of(const at::Tensor& t) {
+  auto value = virtual_value_of(t);
+  return value ? value->rows : nullptr;
+}
+
+// Sources are never lazy, except a conv output still kept in its rows: the
+// readers below read those rows instead.
+void sync_value_sources(const XdnaVirtualValue& value) {
+  for (const auto& seg : value.segments) {
+    auto* src = allocation_from_tensor(seg.source);
+    TORCH_CHECK(src->write_epoch.load() == seg.source_epoch,
+                "XDNA: the input of a lazy value was modified after the value was created "
+                "(set XDNA_LAZY_POINTWISE=0 to compute such ops eagerly)");
+    if (!rows_of(seg.source)) sync_host(src);
+  }
+}
+
+void materialize_virtual(c10::StorageImpl* storage, XdnaAllocation* allocation);
+
+// dst (contiguous NCHW of `sizes`) = the tensor kept in `rows`.
+void unpack_rows_into(const XdnaConvRows& rows, uint16_t* dst, at::IntArrayRef sizes) {
+  const int64_t C = sizes[1];
+  for (int64_t nb = 0; nb * 128 < C; ++nb) {
+    xdna_conv3x3w_unpack_output_strips_range_stats_bf16(
+        rows.base + nb * rows.block_stride, dst, int(sizes[0]), int(sizes[2]), int(sizes[3]),
+        int(rows.strips), int(rows.strip_out), int(std::min<int64_t>(128, C - nb * 128)), int(C),
+        int(nb * 128), 0, int(rows.rows), nullptr, nullptr);
+  }
+}
+
+void record_lazy_write(const char* kind, std::chrono::steady_clock::time_point t0);
+
+// Before a kernel reads a segment's source as NCHW: unpacks a source still kept
+// in conv rows.  Not a write (the bytes become what the value says), so the
+// values that read the source stay valid.
+void make_source_readable(const at::Tensor& src) {
+  auto* allocation = allocation_from_tensor(src);
+  materialize_virtual(src.storage().unsafeGetStorageImpl(), allocation);
+  sync_host(allocation);
+}
+
 // The lazy value of `tensor` when `tensor` is exactly the view it was created
-// with, so a consumer can read value->source in its place.
+// with, so a consumer can read the value's sources in its place.
 std::shared_ptr<XdnaVirtualValue> consumable_value_of(const at::Tensor& tensor) {
   auto value = virtual_value_of(tensor);
   if (!value || tensor.sizes() != c10::IntArrayRef(value->sizes) ||
@@ -651,12 +750,57 @@ std::shared_ptr<XdnaVirtualValue> consumable_value_of(const at::Tensor& tensor) 
       tensor.storage_offset() != value->storage_offset) {
     return nullptr;
   }
-  auto* src = allocation_from_tensor(value->source);
-  TORCH_CHECK(src->write_epoch.load() == value->source_epoch,
-              "XDNA: the input of a lazy value was modified after the value was created "
-              "(set XDNA_LAZY_POINTWISE=0 to compute such ops eagerly)");
-  sync_host(src);
+  sync_value_sources(*value);
   return value;
+}
+
+// The one segment of a value that is a per-channel pointwise of an equally
+// shaped source (what the elementwise consumers read), else nullptr.
+const XdnaLazySegment* single_segment(const XdnaVirtualValue* value) {
+  return value && value->segments.size() == 1 && value->segments[0].up == 1
+      ? &value->segments[0] : nullptr;
+}
+
+// A whole contiguous NCHW bf16 tensor as a segment, read as it is.
+XdnaLazySegment plain_segment(const at::Tensor& t) {
+  XdnaLazySegment seg;
+  seg.source = t;
+  return seg;
+}
+
+// A value's segments as a consumer composes them: a conv output kept in its
+// rows is one plain segment of the tensor itself.
+std::vector<XdnaLazySegment> segments_of(const at::Tensor& t, const XdnaVirtualValue& value) {
+  return value.rows ? std::vector<XdnaLazySegment>{plain_segment(t)} : value.segments;
+}
+
+// The segments in the kernels' form (conv_pack.h), channel offsets assigned.
+// A source still kept in conv rows is read from them; `rows_alive` (if given)
+// holds those rows while the result is used.
+std::vector<XdnaPackSegment> pack_segments(
+    const std::vector<XdnaLazySegment>& segments,
+    std::vector<std::shared_ptr<XdnaConvRows>>* rows_alive = nullptr) {
+  std::vector<XdnaPackSegment> out;
+  int c0 = 0;
+  for (const auto& seg : segments) {
+    const int channels = int(seg.source.size(1));
+    XdnaPackSegment ps{static_cast<const uint16_t*>(seg.source.const_data_ptr()), c0, channels,
+                       int(seg.up), seg.scale.empty() ? nullptr : seg.scale.data(),
+                       seg.shift.empty() ? nullptr : seg.shift.data(), int(seg.act), seg.slope,
+                       nullptr, 0, 0, 0, 0};
+    if (auto rows = rows_of(seg.source)) {
+      TORCH_CHECK(rows_alive, "XDNA: conv rows read without holding them");
+      ps.rows = rows->base;
+      ps.block_stride = long(rows->block_stride);
+      ps.rows_s = int(rows->strips);
+      ps.rows_so = int(rows->strip_out);
+      ps.rows_wp = int(rows->wp);
+      rows_alive->push_back(std::move(rows));
+    }
+    out.push_back(ps);
+    c0 += channels;
+  }
+  return out;
 }
 
 void set_virtual_value(const at::Tensor& tensor, std::shared_ptr<XdnaVirtualValue> value) {
@@ -665,9 +809,9 @@ void set_virtual_value(const at::Tensor& tensor, std::shared_ptr<XdnaVirtualValu
   value->strides.assign(tensor.strides().begin(), tensor.strides().end());
   value->storage_offset = tensor.storage_offset();
   value->dtype = tensor.dtype();
-  auto* src = allocation_from_tensor(value->source);
-  value->source_epoch = src->write_epoch.load();
-  {
+  for (auto& seg : value->segments) {
+    auto* src = allocation_from_tensor(seg.source);
+    seg.source_epoch = src->write_epoch.load();
     std::lock_guard<std::mutex> guard(src->virtual_mutex);
     auto& deps = src->dependents;
     deps.erase(std::remove_if(deps.begin(), deps.end(),
@@ -693,11 +837,8 @@ void materialize_virtual(c10::StorageImpl* storage, XdnaAllocation* allocation) 
   std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
   auto value = allocation->virtual_value;
   if (!value) return;
-  auto* src = allocation_from_tensor(value->source);
-  TORCH_CHECK(src->write_epoch.load() == value->source_epoch,
-              "XDNA: the input of a lazy value was modified after the value was created "
-              "(set XDNA_LAZY_POINTWISE=0 to compute such ops eagerly)");
-  sync_host(src);
+  const auto t0 = std::chrono::steady_clock::now();
+  sync_value_sources(*value);
   auto impl = c10::make_intrusive<c10::TensorImpl>(
       c10::TensorImpl::VIEW,
       c10::Storage(c10::intrusive_ptr<c10::StorageImpl>::reclaim_copy(storage)),
@@ -705,18 +846,23 @@ void materialize_virtual(c10::StorageImpl* storage, XdnaAllocation* allocation) 
   impl->set_sizes_and_strides(value->sizes, value->strides);
   impl->set_storage_offset(value->storage_offset);
   auto out = at::Tensor(std::move(impl));
-  const auto& x = value->source;
   xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
-  xdna_pointwise_channel_bf16(
-      static_cast<const uint16_t*>(x.const_data_ptr()),
-      static_cast<uint16_t*>(out.mutable_data_ptr()),
-      int(x.size(0)), int(x.size(1)), long(x.size(2) * x.size(3)),
-      value->scale.empty() ? nullptr : value->scale.data(),
-      value->shift.empty() ? nullptr : value->shift.data(),
-      value->act ? 1 : 0, value->slope);
+  if (const auto& rows = value->rows) {
+    // The unpack the conv skipped.
+    unpack_rows_into(*rows, static_cast<uint16_t*>(out.mutable_data_ptr()), out.sizes());
+  } else {
+    for (const auto& seg : value->segments) {
+      if (rows_of(seg.source)) make_source_readable(seg.source);
+    }
+    const auto segs = pack_segments(value->segments);
+    xdna_lazy_segments_write_bf16(
+        segs.data(), int(segs.size()), static_cast<uint16_t*>(out.mutable_data_ptr()),
+        int(out.size(0)), int(out.size(1)), int(out.size(2)), int(out.size(3)));
+  }
   allocation->virtual_value.reset();
   allocation->coherency = XdnaCoherency::HostDirty;
   g_lazy_materialized.fetch_add(1, std::memory_order_relaxed);
+  record_lazy_write(value->rows ? "rows" : "values", t0);
 }
 
 // Before any access to `allocation`: materialize the lazy values that read it.
@@ -788,6 +934,27 @@ void mark_device_dirty(const at::Tensor& tensor) {
 
 uint64_t write_epoch_of(const at::Tensor& tensor) {
   return allocation_from_tensor(tensor)->write_epoch.load();
+}
+
+void attach_channel_stats(const at::Tensor& t, std::shared_ptr<XdnaChannelStats> stats) {
+  auto* allocation = allocation_from_tensor(t);
+  stats->epoch = allocation->write_epoch.load();
+  stats->sizes.assign(t.sizes().begin(), t.sizes().end());
+  stats->storage_offset = t.storage_offset();
+  std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
+  allocation->channel_stats = std::move(stats);
+}
+
+// The statistics attached to t, if they still describe its values.
+std::shared_ptr<XdnaChannelStats> channel_stats_of(const at::Tensor& t) {
+  auto* allocation = allocation_from_tensor(t);
+  std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
+  auto stats = allocation->channel_stats;
+  if (!stats || stats->epoch != allocation->write_epoch.load() ||
+      t.sizes() != c10::IntArrayRef(stats->sizes) || t.storage_offset() != stats->storage_offset) {
+    return nullptr;
+  }
+  return stats;
 }
 
 // Frees the deferred host write of an allocation being released.  A job that
@@ -1665,15 +1832,38 @@ void record_mapped_cpu_ns(const char* name, uint64_t ns) {
   stat.total_ns += ns;
 }
 
+// The innermost host op running on this thread (profiling only): lazy writes
+// are counted under the op that forced them.
+thread_local const char* g_mapped_phase = nullptr;
+
+// "lazy.write[<op>].<rows|values>" in mapped_cpu_stats: which ops write lazy
+// values, so where a lazy chain breaks.
+void record_lazy_write(const char* kind, std::chrono::steady_clock::time_point t0) {
+  if (!profile_mapped_cpu()) return;
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+  static thread_local std::string key;
+  key = std::string("lazy.write[") + (g_mapped_phase ? g_mapped_phase : "fallback") + "]." + kind;
+  std::lock_guard<std::mutex> guard(mapped_cpu_stats_mutex());
+  auto& stat = mapped_cpu_stats_map()[key];
+  ++stat.calls;
+  stat.total_ns += uint64_t(ns);
+}
+
 class ScopedMappedCpu {
  public:
   explicit ScopedMappedCpu(const char* name)
       : name_(name), enabled_(profile_mapped_cpu()) {
     sync_host_threads();
-    if (enabled_) start_ = std::chrono::steady_clock::now();
+    if (enabled_) {
+      prev_phase_ = g_mapped_phase;
+      g_mapped_phase = name;
+      start_ = std::chrono::steady_clock::now();
+    }
   }
   ~ScopedMappedCpu() {
     if (!enabled_) return;
+    g_mapped_phase = prev_phase_;
     const auto end = std::chrono::steady_clock::now();
     const uint64_t ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1683,6 +1873,7 @@ class ScopedMappedCpu {
  private:
   const char* name_;
   bool enabled_;
+  const char* prev_phase_ = nullptr;
   std::chrono::steady_clock::time_point start_{};
 };
 
@@ -2102,27 +2293,46 @@ Conv3x3wStrips conv3x3w_strips(int64_t w) {
   return g;
 }
 
-// x (host NCHW bf16, contiguous) -> buf, then sync to the device.  halo_zero:
-// zero halo columns (dY for the weight gradient) when the image is tiled.
-// pw: a lazy value to apply while packing (x_cpu is then its source).
-void pack_conv3x3w_input(Conv3x3wPacked& buf, const at::Tensor& x_cpu, int64_t chunks,
-                         bool halo_zero = false, const XdnaVirtualValue* pw = nullptr) {
-  const std::array<int64_t, 5> shape = {
-      x_cpu.size(0), x_cpu.size(1), x_cpu.size(2), x_cpu.size(3), chunks};
+// What a conv pack reads for a tensor: a lazy tensor's segments (its own
+// bytes are never written unless something else reads them), else the
+// tensor itself.  Holds the sources alive while segs points into them.
+struct ConvPackInput {
+  std::shared_ptr<XdnaVirtualValue> lazy;
+  std::vector<XdnaLazySegment> segments;
+  std::vector<std::shared_ptr<XdnaConvRows>> rows_alive;
+  std::vector<XdnaPackSegment> segs;
+};
+
+ConvPackInput conv_pack_input(const at::Tensor& t) {
+  ConvPackInput in;
+  in.lazy = consumable_value_of(t);
+  if (in.lazy) {
+    g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
+    in.segments = segments_of(t, *in.lazy);
+  } else {
+    auto x = cpu_alias(t);
+    in.segments.push_back(plain_segment(x.is_contiguous() ? x : x.contiguous()));
+  }
+  in.segs = pack_segments(in.segments, &in.rows_alive);
+  return in;
+}
+
+// x (NCHW bf16 of `sizes`, as conv_pack_input) -> buf, then sync to the
+// device.  halo_zero: zero halo columns (dY for the weight gradient) when the
+// image is tiled.
+void pack_conv3x3w_input(Conv3x3wPacked& buf, const ConvPackInput& x, at::IntArrayRef sizes,
+                         int64_t chunks, bool halo_zero = false) {
+  const std::array<int64_t, 5> shape = {sizes[0], sizes[1], sizes[2], sizes[3], chunks};
   if (buf.shape != shape) {
     if (buf.shape != std::array<int64_t, 5>{}) std::memset(buf.ptr, 0, buf.bytes);
     buf.shape = shape;
   }
   const auto g = conv3x3w_strips(shape[3]);
   const int64_t groups = (shape[0] * g.s * (shape[2] + 2) * (g.wg + 2) + 2047) / 2048;
-  xdna_conv3x3w_pack_input_strips_range_pw_bf16(
-      static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
-      static_cast<uint16_t*>(buf.ptr),
+  xdna_conv3x3w_pack_segments_bf16(
+      x.segs.data(), int(x.segs.size()), static_cast<uint16_t*>(buf.ptr),
       int(shape[0]), int(shape[1]), int(shape[2]), int(shape[3]), int(g.s), int(g.so),
-      halo_zero ? 1 : 0, int(chunks), 0, int(groups),
-      pw && !pw->scale.empty() ? pw->scale.data() : nullptr,
-      pw && !pw->shift.empty() ? pw->shift.data() : nullptr,
-      pw && pw->act ? 1 : 0, pw ? pw->slope : 0.f);
+      halo_zero ? 1 : 0, int(chunks), 0, int(groups));
   TORCH_CHECK(shim_bo_sync_to_device(buf.bo) == 0,
               "failed to sync conv3x3w input: ", shim_last_error());
 }
@@ -2512,33 +2722,34 @@ struct XdnaConv3x3wRuntime {
                      phase, long(p.batch), long(p.h), long(p.w), long(p.cin), long(p.cout), long(p.groups), ms, wait, pack, unpack, sync, psync);
       }
     } trace_out{trace, phase, p, trace_t0, trace_wait_ms, trace_pack_ms, trace_unpack_ms, trace_sync_ms, trace_psync_ms};
-    // A lazy input is packed from its source with the pointwise value applied:
-    // its own bytes are never written unless something else reads them.
-    const auto lazy = consumable_value_of(x);
-    at::Tensor x_cpu;
-    if (lazy) {
-      x_cpu = cpu_alias_unchecked(lazy->source);
-      g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      x_cpu = cpu_alias(x);
-      if (!x_cpu.is_contiguous()) x_cpu = x_cpu.contiguous();
-    }
-    const float* pw_scale = lazy && !lazy->scale.empty() ? lazy->scale.data() : nullptr;
-    const float* pw_shift = lazy && !lazy->shift.empty() ? lazy->shift.data() : nullptr;
-    const int pw_act = lazy && lazy->act ? 1 : 0;
-    const float pw_slope = lazy ? lazy->slope : 0.f;
+    const auto x_in = conv_pack_input(x);
     auto out = empty_memory_format(
         {c10::SymInt(p.batch), c10::SymInt(p.cout), c10::SymInt(p.h), c10::SymInt(p.w)},
         at::ScalarType::BFloat16, at::Layout::Strided, c10::Device(kXdnaType, 0),
         false, at::MemoryFormat::Contiguous);
     auto out_cpu = cpu_alias(out);
+    // Statistics for a following BatchNorm, while the unpack has the rows in
+    // cache.  Not with a bias: eager adds it to the unpacked bf16 values.
+    const bool with_stats = !for_dx && lazy_pointwise_enabled() &&
+        !(bias.has_value() && bias->defined());
+    std::shared_ptr<XdnaChannelStats> stats;
+    if (with_stats) {
+      stats = std::make_shared<XdnaChannelStats>();
+      stats->sum.assign(p.cout, 0.0);
+      stats->sumsq.assign(p.cout, 0.0);
+      stats->count = double(p.batch) * double(p.h) * double(p.w);
+    }
     const size_t b_bytes = static_cast<size_t>(p.chunks * 9 * kKStep * kN / 8 * 9);
     const int64_t n_blocks = ceil_div(p.cout, kN);
-    // Two raw outputs so block nb can be unpacked while nb+1 runs.
-    std::array<std::shared_ptr<Conv3x3wPacked>, 2> raw;
-    for (int64_t i = 0; i < std::min<int64_t>(n_blocks, 2); ++i) {
-      raw[i] = acquire_npu_out(static_cast<size_t>(p.groups * kGroupOutRows * kN * 2));
-    }
+    // Stage 4: the output stays in the NPU's rows (every block kept) and is
+    // unpacked only if something reads it as NCHW; the next conv packs from
+    // the rows.  Otherwise two block slots, so block nb is unpacked while
+    // nb+1 runs.
+    const bool keep_rows = conv_rows_enabled() && !(bias.has_value() && bias->defined());
+    const int64_t slots = keep_rows ? n_blocks : std::min<int64_t>(n_blocks, 2);
+    const size_t block_bytes = static_cast<size_t>(p.groups * kGroupOutRows * kN * 2);
+    auto raw = acquire_npu_out(static_cast<size_t>(slots) * block_bytes);
+    auto slot_of = [&](int64_t nb) { return static_cast<size_t>(keep_rows ? nb : nb & 1); };
 
     // The conv runs as pieces of consecutive pixel groups, each with its own
     // (smaller) stream over a window of the same buffers, so the host packs
@@ -2557,11 +2768,11 @@ struct XdnaConv3x3wRuntime {
     auto pack_piece = [&](const Conv3x3wPiece& pc) {
       ScopedMappedCpu pack_phase("npu_conv3x3w.pack");
       struct Acc { double& d; double t; decltype(now_ms)& f; ~Acc() { d += f() - t; } } acc{trace_pack_ms, now_ms(), now_ms};
-      xdna_conv3x3w_pack_input_strips_range_pw_bf16(
-          static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
+      xdna_conv3x3w_pack_segments_bf16(
+          x_in.segs.data(), int(x_in.segs.size()),
           static_cast<uint16_t*>(xin->ptr) + pc.g0 * in_group / 2,
           int(p.batch), int(p.cin), int(p.h), int(p.w), int(p.strips), int(p.strip_out), 0,
-          int(p.chunks), int(pc.g0), int(pc.ng), pw_scale, pw_shift, pw_act, pw_slope);
+          int(p.chunks), int(pc.g0), int(pc.ng));
       const double ts = now_ms();
       TORCH_CHECK(shim_bo_sync_to_device(xin->sub(pc.g0 * in_group, pc.ng * in_group)) == 0,
                   "failed to sync conv3x3w input: ", shim_last_error());
@@ -2612,13 +2823,14 @@ struct XdnaConv3x3wRuntime {
     auto start = [&](Task& t, Conv3x3wRun& run) {
       const auto& pc = *t.pc;
       ShimBo* data[3] = {xin->sub(pc.g0 * in_group, pc.ng * in_group), t.slot->bo,
-                         raw[t.nb & 1]->sub(pc.g0 * out_group, pc.ng * out_group)};
+                         raw->sub(slot_of(t.nb) * block_bytes + pc.g0 * out_group,
+                                  pc.ng * out_group)};
       run.r = shim_run_kernel_start(kernel, 3, pc.stream->instr, pc.stream->instr_words, data, 3);
       TORCH_CHECK(run.r, "conv3x3w dispatch failed: ", shim_last_error());
     };
     auto unpack = [&](const Task& t) {
       const auto& pc = *t.pc;
-      ShimBo* r = raw[t.nb & 1]->sub(pc.g0 * out_group, pc.ng * out_group);
+      ShimBo* r = raw->sub(slot_of(t.nb) * block_bytes + pc.g0 * out_group, pc.ng * out_group);
       {
         ScopedMappedCpu sync_phase("npu_conv3x3w.unpack_sync");
         const double t0 = now_ms();
@@ -2630,12 +2842,13 @@ struct XdnaConv3x3wRuntime {
       struct Acc { double& d; double t; decltype(now_ms)& f; ~Acc() { d += f() - t; } } acc{trace_unpack_ms, now_ms(), now_ms};
       const int64_t p0 = pc.g0 * kGroupOutRows;
       const int64_t p1 = std::min(m_total, (pc.g0 + pc.ng) * kGroupOutRows);
-      xdna_conv3x3w_unpack_output_strips_range_bf16(
-          static_cast<const uint16_t*>(raw[t.nb & 1]->ptr) + p0 * kN,
-          static_cast<uint16_t*>(out_cpu.data_ptr()),
+      xdna_conv3x3w_unpack_output_strips_range_stats_bf16(
+          static_cast<const uint16_t*>(raw->ptr) + slot_of(t.nb) * block_bytes / 2 + p0 * kN,
+          keep_rows ? nullptr : static_cast<uint16_t*>(out_cpu.data_ptr()),
           int(p.batch), int(p.h), int(p.w), int(p.strips), int(p.strip_out),
           int(std::min<int64_t>(kN, p.cout - t.nb * kN)), int(p.cout), int(t.nb * kN),
-          int(p0), int(p1));
+          int(p0), int(p1), stats ? stats->sum.data() + t.nb * kN : nullptr,
+          stats ? stats->sumsq.data() + t.nb * kN : nullptr);
     };
 
     // The run phase is the host wait for the NPU, i.e. what the overlapped
@@ -2659,11 +2872,27 @@ struct XdnaConv3x3wRuntime {
       if (j + 1 < tasks.size()) start(tasks[j + 1], cur);
       unpack(tasks[j]);
     }
+    if (keep_rows) {
+      auto rows = std::make_shared<XdnaConvRows>();
+      rows->base = static_cast<const uint16_t*>(raw->ptr);
+      rows->buffer = std::move(raw);
+      rows->block_stride = static_cast<int64_t>(block_bytes / 2);
+      rows->strips = p.strips;
+      rows->strip_out = p.strip_out;
+      rows->wp = p.wp;
+      rows->rows = m_total;
+      auto value = std::make_shared<XdnaVirtualValue>();
+      value->rows = std::move(rows);
+      set_virtual_value(out, std::move(value));
+      if (stats) attach_channel_stats(out, std::move(stats));
+      return out;
+    }
     if (bias.has_value() && bias->defined()) {
       ensure_host_current(*bias);
       out_cpu.add_(cpu_alias(*bias).view({1, -1, 1, 1}));
     }
     mark_host_dirty(out);
+    if (stats) attach_channel_stats(out, std::move(stats));
     return out;
   }
 
@@ -2853,18 +3082,10 @@ struct XdnaConv3x3wDwRuntime {
                     bool halo_zero) {
       if (buf) return;
       ScopedMappedCpu pack_phase("npu_conv3x3w.dw.pack");
-      // A lazy X is packed from its source, as the forward pack does.
-      const auto lazy = consumable_value_of(t);
-      at::Tensor t_cpu;
-      if (lazy) {
-        t_cpu = cpu_alias_unchecked(lazy->source);
-        g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        t_cpu = cpu_alias(t);
-        if (!t_cpu.is_contiguous()) t_cpu = t_cpu.contiguous();
-      }
+      // A lazy X is packed from its sources, as the forward pack does.
+      const auto t_in = conv_pack_input(t);
       buf = acquire_packed(static_cast<size_t>(p.groups * chunks * kGroupRows * kKStep * 2));
-      pack_conv3x3w_input(*buf, t_cpu, chunks, halo_zero, lazy.get());
+      pack_conv3x3w_input(*buf, t_in, t.sizes(), chunks, halo_zero);
     };
     pack(x_buf, input, p.chunks, false);
     pack(d_buf, grad_output, p.cochunks, true);
@@ -3544,32 +3765,325 @@ at::Tensor xdna_empty_like_layout(const at::Tensor& reference) {
 }
 
 
+// Contiguous 4-D bf16: the tensors lazy values are made of and made for.
+bool lazy_layout_ok(const at::Tensor& t) {
+  return t.scalar_type() == at::ScalarType::BFloat16 && t.dim() == 4 && t.is_contiguous() &&
+      t.numel() > 0;
+}
+
+// A tensor that is, or is a per-channel pointwise of, a tensor kept in conv
+// rows (stage 4): the rows kernels read it there.  seg (null: the rows
+// themselves) carries the pointwise; keep holds both alive.
+struct RowsOperand {
+  std::shared_ptr<XdnaConvRows> rows;
+  const XdnaLazySegment* seg = nullptr;
+  std::shared_ptr<XdnaVirtualValue> keep;
+};
+
+// A channel slice t = x[:, c0:c0+n] of a tensor x kept in rows (the cat
+// backward's narrow), as rows of its own: the same buffer from channel c0.
+// Only when the slice stays within one 128-channel block or starts at one.
+std::shared_ptr<XdnaConvRows> sliced_rows(const at::Tensor& t, const XdnaVirtualValue& value) {
+  if (!value.rows || t.dim() != 4 || value.sizes.size() != 4 ||
+      t.strides() != c10::IntArrayRef(value.strides) || t.size(0) != value.sizes[0] ||
+      t.size(2) != value.sizes[2] || t.size(3) != value.sizes[3]) {
+    return nullptr;
+  }
+  const int64_t plane = t.size(2) * t.size(3);
+  const int64_t delta = t.storage_offset() - value.storage_offset;
+  if (delta < 0 || delta % plane != 0) return nullptr;
+  const int64_t c0 = delta / plane, n = t.size(1);
+  if (c0 + n > value.sizes[1] || (c0 % 128 != 0 && c0 % 128 + n > 128)) return nullptr;
+  auto rows = std::make_shared<XdnaConvRows>(*value.rows);
+  rows->base += (c0 / 128) * rows->block_stride + c0 % 128;
+  return rows;
+}
+
+std::optional<RowsOperand> rows_operand(const at::Tensor& t, bool allow_slice = true) {
+  if (t.scalar_type() != at::ScalarType::BFloat16 || t.dim() != 4 || t.numel() == 0) {
+    return std::nullopt;
+  }
+  if (allow_slice) {
+    auto value = virtual_value_of(t);
+    if (value && value->rows) {
+      if (auto rows = sliced_rows(t, *value)) return RowsOperand{std::move(rows), nullptr, value};
+    }
+  }
+  if (!t.is_contiguous()) return std::nullopt;
+  auto value = consumable_value_of(t);
+  if (!value) return std::nullopt;
+  if (value->rows) return RowsOperand{value->rows, nullptr, value};
+  const auto* seg = single_segment(value.get());
+  if (!seg || seg->source.sizes() != t.sizes()) return std::nullopt;
+  auto rows = rows_of(seg->source);
+  if (!rows) return std::nullopt;
+  return RowsOperand{std::move(rows), seg, value};
+}
+
+// Rows of one grid share the block stride of the convs that made the grid
+// (host-written rows inherit it), so the rows kernels take one geometry.
+bool same_grid(const XdnaConvRows& a, const XdnaConvRows& b) {
+  return a.strips == b.strips && a.strip_out == b.strip_out && a.wp == b.wp &&
+      a.rows == b.rows && a.block_stride == b.block_stride;
+}
+
+XdnaRowsGeom rows_geom(const at::Tensor& t, const XdnaConvRows& r) {
+  return {int(t.size(0)), int(t.size(1)), int(t.size(2)), int(t.size(3)), int(r.strips),
+          int(r.strip_out), int(r.wp), long(r.block_stride)};
+}
+
+// The grid conv3x3w uses for B x . x H x W tensors (as its run computes it):
+// geometry only, no buffer.
+XdnaConvRows grid_for(int64_t batch, int64_t h, int64_t w) {
+  const auto t = conv3x3w_strips(w);
+  XdnaConvRows g;
+  g.strips = t.s;
+  g.strip_out = t.so;
+  g.wp = t.wg + 2;
+  g.rows = batch * t.s * (h + 2) * g.wp;
+  g.block_stride = (g.rows + 2047) / 2048 * 2048 * 128;
+  return g;
+}
+
+// A new contiguous tensor of `sizes`, kept in host-written rows on the grid of
+// `grid`; *base is where to write them.  Plain host memory: the NPU never
+// writes these buffers, so they need no coherency handling.
+at::Tensor new_rows_tensor(at::IntArrayRef sizes, const XdnaConvRows& grid, uint16_t** base) {
+  const int64_t blocks = (sizes[1] + 127) / 128;
+  auto storage = std::make_shared<at::Tensor>(
+      at::empty({blocks * grid.block_stride}, at::TensorOptions().dtype(at::kBFloat16)));
+  auto rows = std::make_shared<XdnaConvRows>(grid);
+  *base = static_cast<uint16_t*>(storage->data_ptr());
+  rows->base = *base;
+  rows->buffer = std::move(storage);
+  auto out = empty_memory_format(
+      c10::fromIntArrayRefSlow(sizes), at::ScalarType::BFloat16, at::Layout::Strided,
+      c10::Device(kXdnaType, 0), false, at::MemoryFormat::Contiguous);
+  auto value = std::make_shared<XdnaVirtualValue>();
+  value->rows = std::move(rows);
+  set_virtual_value(out, std::move(value));
+  return out;
+}
+
+const float* opt_data(const std::vector<float>& v) { return v.empty() ? nullptr : v.data(); }
+
+// Activation backward when the gradient and the activation's input are both in
+// rows of one grid: dx stays in rows (mode as xdna_rows_act_backward_bf16).
+// `want` is the activation the input's record must end with (None for
+// LeakyReLU's input, Relu for relu's result).
+at::Tensor rows_act_backward(const at::Tensor& grad, const at::Tensor& self, int mode,
+                             XdnaAct want, float slope) {
+  if (!conv_rows_enabled() || grad.sizes() != self.sizes()) return {};
+  auto g = rows_operand(grad);
+  auto x = rows_operand(self);
+  if (!g || g->seg || !x || !same_grid(*g->rows, *x->rows) ||
+      (x->seg ? x->seg->act : XdnaAct::None) != want) {
+    return {};
+  }
+  ScopedMappedCpu mapped_phase("aten::act_backward.rows");
+  uint16_t* out_base = nullptr;
+  auto out = new_rows_tensor(self.sizes(), *x->rows, &out_base);
+  const auto geom = rows_geom(self, *x->rows);
+  xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+  xdna_rows_act_backward_bf16(&geom, g->rows->base, x->rows->base, out_base,
+                              x->seg ? opt_data(x->seg->scale) : nullptr,
+                              x->seg ? opt_data(x->seg->shift) : nullptr, mode, slope);
+  g_lazy_consumed.fetch_add(2, std::memory_order_relaxed);
+  return out;
+}
+
+// A gradient accumulation of a tensor in rows (often a cat backward slice) and
+// a plain NCHW tensor: unpacks just those rows into the NCHW sum instead of
+// writing the whole tensor the slice comes from.  `into` (null: a new tensor)
+// receives the sum and may be `plain` (in-place add on it).
+at::Tensor mixed_rows_add(const at::Tensor& rows_t, const at::Tensor& plain,
+                          const at::Scalar& alpha, const at::Tensor* into) {
+  if (!conv_rows_enabled() || alpha.toDouble() != 1.0 || rows_t.sizes() != plain.sizes() ||
+      !lazy_layout_ok(plain) || virtual_value_of(plain)) {
+    return {};
+  }
+  auto r = rows_operand(rows_t);
+  if (!r || r->seg) return {};
+  ScopedMappedCpu mapped_phase("aten::add.rows_mixed");
+  sync_host(allocation_from_tensor(plain));
+  at::Tensor out = into ? *into : xdna_empty_like_layout(plain);
+  TORCH_CHECK(out.is_contiguous(), "XDNA mixed rows add expects a contiguous result");
+  auto* out_allocation = allocation_from_tensor(out);
+  materialize_dependents(out_allocation);
+  sync_host(out_allocation);
+  // Unpacked into a scratch tensor when the sum lands on `plain` itself.
+  at::Tensor unpacked = out.is_same(plain) ? at::empty_like(cpu_alias_unchecked(plain)) : cpu_alias_unchecked(out);
+  xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+  unpack_rows_into(*r->rows, static_cast<uint16_t*>(unpacked.data_ptr()), rows_t.sizes());
+  const auto* pu = static_cast<const uint16_t*>(unpacked.const_data_ptr());
+  const auto* pp = static_cast<const uint16_t*>(plain.const_data_ptr());
+  xdna_add_pw_bf16(pu, nullptr, nullptr, 0, 0.f, pp, nullptr, nullptr, 0, 0.f,
+                   static_cast<uint16_t*>(out.mutable_data_ptr()), int(out.size(0)),
+                   int(out.size(1)), long(out.size(2) * out.size(3)));
+  g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
+  mark_host_dirty(out);
+  return out;
+}
+
+// A residual add (or a gradient accumulation) of two tensors in rows of one
+// grid, or of pointwise values of such tensors: the sum stays in rows.
+at::Tensor rows_add(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha,
+                    bool in_place) {
+  if (!conv_rows_enabled() || alpha.toDouble() != 1.0 || self.sizes() != other.sizes() ||
+      other.scalar_type() != at::ScalarType::BFloat16) {
+    return {};
+  }
+  // In place, self must be the whole tensor its value describes.
+  auto a = rows_operand(self, /*allow_slice=*/!in_place);
+  auto b = a ? rows_operand(other) : std::nullopt;
+  if (!a || !b || !same_grid(*a->rows, *b->rows)) return {};
+  ScopedMappedCpu mapped_phase("aten::add.rows");
+  uint16_t* out_base = nullptr;
+  auto out = new_rows_tensor(self.sizes(), *a->rows, &out_base);
+  const auto geom = rows_geom(self, *a->rows);
+  auto pw = [](const RowsOperand& o) {
+    return std::make_tuple(o.seg ? opt_data(o.seg->scale) : nullptr,
+                           o.seg ? opt_data(o.seg->shift) : nullptr,
+                           o.seg ? int(o.seg->act) : 0, o.seg ? o.seg->slope : 0.f);
+  };
+  const auto [as, ash, aact, aslope] = pw(*a);
+  const auto [bs, bsh, bact, bslope] = pw(*b);
+  xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+  xdna_rows_add_bf16(&geom, a->rows->base, as, ash, aact, aslope, b->rows->base, bs, bsh, bact,
+                     bslope, out_base);
+  g_lazy_consumed.fetch_add(2, std::memory_order_relaxed);
+  return out;
+}
+
+// The segments of `value` with `act` added to each, or nullopt when one
+// already has an activation.  An activation applies per element, so it moves
+// into every segment of a concatenation or an upsample.
+std::optional<std::vector<XdnaLazySegment>> with_activation(
+    std::vector<XdnaLazySegment> segments, XdnaAct act, float slope) {
+  for (auto& seg : segments) {
+    if (seg.act != XdnaAct::None) return std::nullopt;
+    seg.act = act;
+    seg.slope = slope;
+  }
+  return segments;
+}
+
+// act(self) as a lazy value, or an undefined tensor when it must be eager.
+// The next conv3x3w applies it while packing its input.  On a lazy input
+// without an activation (a BatchNorm output) the two compose into one value.
+at::Tensor lazy_activation(const at::Tensor& self, XdnaAct act, float slope) {
+  if (!lazy_pointwise_enabled() || !lazy_layout_ok(self)) return {};
+  std::vector<XdnaLazySegment> segments;
+  if (virtual_value_of(self)) {
+    auto base = consumable_value_of(self);
+    if (!base) return {};
+    auto composed = with_activation(segments_of(self, *base), act, slope);
+    if (!composed) return {};
+    segments = std::move(*composed);
+  } else {
+    segments.push_back(plain_segment(self));
+    segments[0].act = act;
+    segments[0].slope = slope;
+  }
+  auto out = xdna_empty_like_layout(self);
+  if (!out.is_contiguous()) return {};
+  auto value = std::make_shared<XdnaVirtualValue>();
+  value->segments = std::move(segments);
+  set_virtual_value(out, std::move(value));
+  return out;
+}
+
+at::Tensor relu_xdna(const at::Tensor& self) {
+  if (auto out = lazy_activation(self, XdnaAct::Relu, 0.f); out.defined()) return out;
+  return at::native::call_fallback_fn<&xdna_cpu_fallback, at::_ops::relu>::call(self);
+}
+
+// In place on a lazy affine value (torchvision's BatchNorm -> ReLU(inplace=True)):
+// the activation joins the record, so the tensor stays lazy.
+at::Tensor& relu__xdna(at::Tensor& self) {
+  if (lazy_pointwise_enabled()) {
+    // Not on a conv output kept in rows: its record would read itself.
+    auto value = consumable_value_of(self);
+    auto composed = value && !value->rows
+        ? with_activation(value->segments, XdnaAct::Relu, 0.f) : std::nullopt;
+    if (composed) {
+      auto next = std::make_shared<XdnaVirtualValue>(*value);
+      next->segments = std::move(*composed);
+      auto* allocation = allocation_from_tensor(self);
+      {
+        std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
+        allocation->virtual_value = std::move(next);
+      }
+      ++allocation->write_epoch;
+      return self;
+    }
+  }
+  return at::native::call_fallback_fn<&xdna_cpu_fallback, at::_ops::relu_>::call(self);
+}
+
+// relu's backward reads its result.  When that is a lazy ReLU value, the mask
+// comes from the value's input, so the result is never written.
+at::Tensor threshold_backward_xdna(
+    const at::Tensor& grad_output,
+    const at::Tensor& self,
+    const at::Scalar& threshold) {
+  if (threshold.toDouble() == 0.0) {
+    if (auto out = rows_act_backward(grad_output, self, 2, XdnaAct::Relu, 0.f); out.defined()) {
+      return out;
+    }
+  }
+  if (threshold.toDouble() == 0.0 && grad_output.is_contiguous() && self.is_contiguous() &&
+      grad_output.sizes() == self.sizes() &&
+      grad_output.scalar_type() == at::ScalarType::BFloat16) {
+    auto value = consumable_value_of(self);
+    const auto* seg = single_segment(value.get());
+    if (seg && seg->act == XdnaAct::Relu) {
+      ScopedMappedCpu mapped_phase("aten::threshold_backward.lazy");
+      ensure_host_current(grad_output);
+      auto out = xdna_empty_like_layout(self);
+      TORCH_CHECK(out.is_contiguous(), "lazy threshold_backward expects a contiguous result");
+      const auto& x = seg->source;
+      make_source_readable(x);
+      xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+      xdna_relu_backward_pw_bf16(
+          static_cast<const uint16_t*>(grad_output.const_data_ptr()),
+          static_cast<const uint16_t*>(x.const_data_ptr()),
+          static_cast<uint16_t*>(out.mutable_data_ptr()),
+          int(x.size(0)), int(x.size(1)), long(x.size(2) * x.size(3)),
+          seg->scale.empty() ? nullptr : seg->scale.data(),
+          seg->shift.empty() ? nullptr : seg->shift.data());
+      g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
+      mark_host_dirty(out);
+      return out;
+    }
+  }
+  return at::native::call_fallback_fn<&xdna_cpu_fallback, at::_ops::threshold_backward>::call(
+      grad_output, self, threshold);
+}
+
+// A clone of a lazy value is another lazy value of the same source (the
+// ResNet block's `x_in = x.clone()`), so neither copy is written.
+at::Tensor clone_xdna(const at::Tensor& self, std::optional<at::MemoryFormat> memory_format) {
+  const auto format = memory_format.value_or(at::MemoryFormat::Preserve);
+  if (lazy_pointwise_enabled() && self.is_contiguous() &&
+      (format == at::MemoryFormat::Preserve || format == at::MemoryFormat::Contiguous)) {
+    if (auto value = consumable_value_of(self)) {
+      auto out = xdna_empty_like_layout(self);
+      if (out.is_contiguous()) {
+        set_virtual_value(out, std::make_shared<XdnaVirtualValue>(*value));
+        return out;
+      }
+    }
+  }
+  return at::native::clone(self, memory_format);
+}
+
 at::Tensor leaky_relu_xdna(
     const at::Tensor& self,
     const at::Scalar& negative_slope) {
-  if (lazy_pointwise_enabled() && self.scalar_type() == at::ScalarType::BFloat16 &&
-      self.dim() == 4 && self.is_contiguous() && self.numel() > 0) {
-    // Lazy: the next conv3x3w applies it while packing its input.  On a lazy
-    // affine input (a BatchNorm output) the two compose into one value.
-    std::shared_ptr<XdnaVirtualValue> base;
-    const bool lazy_input = static_cast<bool>(virtual_value_of(self));
-    if (lazy_input) {
-      base = consumable_value_of(self);
-      if (base && base->act) base = nullptr;
-    }
-    auto out = (!lazy_input || base) ? xdna_empty_like_layout(self) : at::Tensor();
-    if (out.defined() && out.is_contiguous()) {
-      auto value = std::make_shared<XdnaVirtualValue>();
-      value->source = base ? base->source : self;
-      if (base) {
-        value->scale = base->scale;
-        value->shift = base->shift;
-      }
-      value->act = true;
-      value->slope = negative_slope.to<float>();
-      set_virtual_value(out, std::move(value));
-      return out;
-    }
+  if (auto out = lazy_activation(self, XdnaAct::Leaky, negative_slope.to<float>());
+      out.defined()) {
+    return out;
   }
   ScopedMappedCpu mapped_phase("aten::leaky_relu");
   ensure_host_current(self);
@@ -3586,24 +4100,33 @@ at::Tensor leaky_relu_backward_xdna(
     const at::Tensor& self,
     const at::Scalar& negative_slope,
     bool self_is_result) {
+  if (!self_is_result) {
+    if (auto out = rows_act_backward(grad_output, self, 1, XdnaAct::None,
+                                     negative_slope.to<float>());
+        out.defined()) {
+      return out;
+    }
+  }
   if (!self_is_result && grad_output.is_contiguous() && grad_output.sizes() == self.sizes() &&
       grad_output.scalar_type() == at::ScalarType::BFloat16) {
     // self is a lazy affine value (BatchNorm output): take the mask from its
     // source, so it is never written.
     auto value = consumable_value_of(self);
-    if (value && !value->act && !value->scale.empty() && self.is_contiguous()) {
+    const auto* seg = single_segment(value.get());
+    if (seg && seg->act == XdnaAct::None && !seg->scale.empty() && self.is_contiguous()) {
       ScopedMappedCpu mapped_phase("aten::leaky_relu_backward.lazy");
       ensure_host_current(grad_output);
       auto out = xdna_empty_like_layout(self);
       TORCH_CHECK(out.is_contiguous(), "lazy leaky_relu_backward expects a contiguous result");
-      const auto& x = value->source;
+      const auto& x = seg->source;
+      make_source_readable(x);
       xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
       xdna_leaky_backward_pw_bf16(
           static_cast<const uint16_t*>(grad_output.const_data_ptr()),
           static_cast<const uint16_t*>(x.const_data_ptr()),
           static_cast<uint16_t*>(out.mutable_data_ptr()),
           int(x.size(0)), int(x.size(1)), long(x.size(2) * x.size(3)),
-          value->scale.data(), value->shift.data(), negative_slope.to<float>());
+          seg->scale.data(), seg->shift.data(), negative_slope.to<float>());
       g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
       mark_host_dirty(out);
       return out;
@@ -3692,10 +4215,102 @@ at::Tensor avg_pool3d_backward_xdna(
   return xdna_from_cpu(low ? res.to(dtype) : res);
 }
 
+// The lazy values read by a residual add, when it can compute them while
+// adding (bf16 NCHW contiguous, same shape, alpha 1: ATen rounds a + b once).
+// A null entry is an operand read as is.
+struct LazyAddOperands {
+  std::shared_ptr<XdnaVirtualValue> self, other;
+};
+
+std::optional<LazyAddOperands> lazy_add_operands(
+    const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha) {
+  if (!lazy_pointwise_enabled() || alpha.toDouble() != 1.0 || self.dim() != 4 ||
+      self.scalar_type() != at::ScalarType::BFloat16 ||
+      other.scalar_type() != at::ScalarType::BFloat16 || other.device() != self.device() ||
+      self.sizes() != other.sizes() || !self.is_contiguous() || !other.is_contiguous()) {
+    return std::nullopt;
+  }
+  LazyAddOperands v{consumable_value_of(self), consumable_value_of(other)};
+  if (!v.self && !v.other) return std::nullopt;
+  // A lazy operand that is not the producer's exact view, or not a single
+  // segment (a concatenation, an upsample): eager materializes it.
+  if ((!v.self && virtual_value_of(self)) || (!v.other && virtual_value_of(other)) ||
+      (v.self && !single_segment(v.self.get())) || (v.other && !single_segment(v.other.get()))) {
+    return std::nullopt;
+  }
+  return v;
+}
+
+// out = self + other, out contiguous with their shape (out may be self).
+void add_lazy_into(
+    const at::Tensor& out, const at::Tensor& self, const at::Tensor& other,
+    const LazyAddOperands& v) {
+  ScopedMappedCpu mapped_phase("aten::add.lazy");
+  // consumable_value_of synced each source; a plain operand is only read, so
+  // its own dependents may stay lazy.
+  const auto* sa = single_segment(v.self.get());
+  const auto* sb = single_segment(v.other.get());
+  auto bytes = [](const at::Tensor& t, const XdnaLazySegment* seg) {
+    if (seg) make_source_readable(seg->source);
+    else sync_host(allocation_from_tensor(t));
+    return static_cast<const uint16_t*>((seg ? seg->source : t).const_data_ptr());
+  };
+  const uint16_t* a = bytes(self, sa);
+  const uint16_t* b = bytes(other, sb);
+  // out is written: values that read it are written first (in-place add).
+  auto* out_allocation = allocation_from_tensor(out);
+  materialize_dependents(out_allocation);
+  sync_host(out_allocation);
+  auto params = [](const XdnaLazySegment* seg) {
+    const bool affine = seg && !seg->scale.empty();
+    return std::make_tuple(affine ? seg->scale.data() : nullptr,
+                           affine ? seg->shift.data() : nullptr,
+                           seg ? int(seg->act) : 0, seg ? seg->slope : 0.f);
+  };
+  const auto [as, ash, aact, aslope] = params(sa);
+  const auto [bs, bsh, bact, bslope] = params(sb);
+  xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+  xdna_add_pw_bf16(
+      a, as, ash, aact, aslope, b, bs, bsh, bact, bslope,
+      static_cast<uint16_t*>(out.mutable_data_ptr()),
+      int(self.size(0)), int(self.size(1)), long(self.size(2) * self.size(3)));
+  g_lazy_consumed.fetch_add(int(bool(v.self)) + int(bool(v.other)), std::memory_order_relaxed);
+  mark_host_dirty(out);
+}
+
+at::Tensor& add__xdna(at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha) {
+  if (auto sum = rows_add(self, other, alpha, /*in_place=*/true); sum.defined()) {
+    // In place: self takes the sum's rows.  A write, so the values that read
+    // self are written first and self's write epoch moves on.
+    auto* allocation = allocation_from_tensor(self);
+    materialize_dependents(allocation);
+    ++allocation->write_epoch;
+    set_virtual_value(self, std::make_shared<XdnaVirtualValue>(*virtual_value_of(sum)));
+    return self;
+  }
+  if (mixed_rows_add(other, self, alpha, &self).defined()) return self;
+  if (auto v = lazy_add_operands(self, other, alpha)) {
+    add_lazy_into(self, self, other, *v);
+    return self;
+  }
+  return at::native::call_fallback_fn<&xdna_cpu_fallback, at::_ops::add__Tensor>::call(
+      self, other, alpha);
+}
+
 at::Tensor add_tensor_xdna(
     const at::Tensor& self,
     const at::Tensor& other,
     const at::Scalar& alpha) {
+  if (auto out = rows_add(self, other, alpha, /*in_place=*/false); out.defined()) return out;
+  if (auto out = mixed_rows_add(self, other, alpha, nullptr); out.defined()) return out;
+  if (auto out = mixed_rows_add(other, self, alpha, nullptr); out.defined()) return out;
+  if (auto v = lazy_add_operands(self, other, alpha)) {
+    auto out = xdna_empty_like_layout(self);
+    if (out.is_contiguous()) {
+      add_lazy_into(out, self, other, *v);
+      return out;
+    }
+  }
   ScopedMappedCpu mapped_phase("aten::add.Tensor");
   ensure_host_current(self);
   ensure_host_current(other);
@@ -4170,9 +4785,45 @@ bool upsample2x_dtype_ok(at::ScalarType t) {
   return t == at::ScalarType::BFloat16 || t == at::ScalarType::Float;
 }
 
+// cat along the channels of contiguous bf16 NCHW tensors as a lazy value, or
+// an undefined tensor when it must be eager.  A conv3x3w packs it straight
+// from the inputs (lab04's U-Net decoder: cat -> upsample -> conv), so the
+// concatenation is written only if something else reads it.
+at::Tensor lazy_cat(const at::ITensorListRef& tensors, int64_t dim) {
+  if (!lazy_pointwise_enabled() || tensors.size() < 2) return {};
+  const auto first = *tensors.begin();
+  if (first.dim() != 4 || c10::maybe_wrap_dim(dim, 4) != 1) return {};
+  std::vector<XdnaLazySegment> segments;
+  int64_t channels = 0;
+  for (const auto& t : tensors) {
+    if (t.device().type() != kXdnaType || !lazy_layout_ok(t) || t.size(0) != first.size(0) ||
+        t.size(2) != first.size(2) || t.size(3) != first.size(3)) {
+      return {};
+    }
+    if (virtual_value_of(t)) {
+      auto value = consumable_value_of(t);
+      if (!value) return {};
+      const auto own = segments_of(t, *value);
+      segments.insert(segments.end(), own.begin(), own.end());
+    } else {
+      segments.push_back(plain_segment(t));
+    }
+    channels += t.size(1);
+  }
+  auto out = empty_memory_format(
+      {first.sym_size(0), c10::SymInt(channels), first.sym_size(2), first.sym_size(3)},
+      at::ScalarType::BFloat16, at::Layout::Strided, c10::Device(kXdnaType, 0), false,
+      at::MemoryFormat::Contiguous);
+  auto value = std::make_shared<XdnaVirtualValue>();
+  value->segments = std::move(segments);
+  set_virtual_value(out, std::move(value));
+  return out;
+}
+
 at::Tensor cat_xdna(
     const at::ITensorListRef& tensors,
     int64_t dim) {
+  if (auto out = lazy_cat(tensors, dim); out.defined()) return out;
   ScopedMappedCpu mapped_phase("aten::cat");
   TORCH_CHECK(tensors.size() > 0, "XDNA cat expects at least one tensor");
   const auto first = *tensors.begin();
@@ -4286,11 +4937,44 @@ at::Tensor cat_xdna(
   return out;
 }
 
+// Nearest 2x upsample of a contiguous bf16 NCHW tensor as a lazy value, or an
+// undefined tensor when it must be eager.  Every segment of a lazy input gets
+// the factor; a conv3x3w packs it from the small source.
+at::Tensor lazy_upsample2x(
+    const at::Tensor& self, c10::SymIntArrayRef output_size, std::optional<double> scales_h,
+    std::optional<double> scales_w) {
+  if (!lazy_pointwise_enabled() || !lazy_layout_ok(self) || output_size.size() != 2 ||
+      output_size[0] != 2 * self.size(2) || output_size[1] != 2 * self.size(3) ||
+      !nearest2x_scales_ok(scales_h, scales_w)) {
+    return {};
+  }
+  std::vector<XdnaLazySegment> segments;
+  if (virtual_value_of(self)) {
+    auto value = consumable_value_of(self);
+    if (!value) return {};
+    segments = segments_of(self, *value);
+  } else {
+    segments.push_back(plain_segment(self));
+  }
+  for (auto& seg : segments) seg.up *= 2;
+  auto out = empty_memory_format(
+      {self.sym_size(0), self.sym_size(1), output_size[0], output_size[1]},
+      at::ScalarType::BFloat16, at::Layout::Strided, c10::Device(kXdnaType, 0), false,
+      at::MemoryFormat::Contiguous);
+  auto value = std::make_shared<XdnaVirtualValue>();
+  value->segments = std::move(segments);
+  set_virtual_value(out, std::move(value));
+  return out;
+}
+
 at::Tensor upsample_nearest2d_xdna(
     const at::Tensor& self,
     c10::SymIntArrayRef output_size,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
+  if (auto out = lazy_upsample2x(self, output_size, scales_h, scales_w); out.defined()) {
+    return out;
+  }
   ScopedMappedCpu mapped_phase("aten::upsample_nearest2d");
   TORCH_CHECK(
       self.dim() == 4 && output_size.size() == 2,
@@ -4346,12 +5030,47 @@ at::Tensor upsample_nearest2d_xdna(
   return out;
 }
 
+// The gradient of a nearest 2x upsample when it is still in conv rows (the
+// input-gradient conv of the conv that read the upsample): the sum stays in
+// rows on the half-size grid, where the next input-gradient conv packs it.
+at::Tensor rows_upsample2x_backward(
+    const at::Tensor& grad_output, c10::SymIntArrayRef output_size, c10::SymIntArrayRef input_size,
+    std::optional<double> scales_h, std::optional<double> scales_w) {
+  if (!conv_rows_enabled() || input_size.size() != 4 || output_size.size() != 2 ||
+      grad_output.dim() != 4 || !nearest2x_scales_ok(scales_h, scales_w)) {
+    return {};
+  }
+  std::array<int64_t, 4> in{};
+  for (int i = 0; i < 4; ++i) in[i] = input_size[i].guard_int(__FILE__, __LINE__);
+  if (output_size[0] != 2 * in[2] || output_size[1] != 2 * in[3] ||
+      grad_output.sizes() != at::IntArrayRef({in[0], in[1], 2 * in[2], 2 * in[3]})) {
+    return {};
+  }
+  auto g = rows_operand(grad_output);
+  if (!g || g->seg) return {};
+  const auto small = grid_for(in[0], in[2], in[3]);
+  ScopedMappedCpu mapped_phase("aten::upsample_nearest2d_backward.rows");
+  uint16_t* base = nullptr;
+  auto out = new_rows_tensor(at::IntArrayRef(in), small, &base);
+  const auto gb = rows_geom(grad_output, *g->rows);
+  XdnaRowsGeom gs{int(in[0]), int(in[1]), int(in[2]), int(in[3]), int(small.strips),
+                  int(small.strip_out), int(small.wp), long(small.block_stride)};
+  xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+  xdna_rows_upsample2x_backward_bf16(&gb, g->rows->base, &gs, base);
+  g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
+  return out;
+}
+
 at::Tensor upsample_nearest2d_backward_xdna(
     const at::Tensor& grad_output,
     c10::SymIntArrayRef output_size,
     c10::SymIntArrayRef input_size,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
+  if (auto out = rows_upsample2x_backward(grad_output, output_size, input_size, scales_h, scales_w);
+      out.defined()) {
+    return out;
+  }
   ScopedMappedCpu mapped_phase("aten::upsample_nearest2d_backward");
   TORCH_CHECK(
       input_size.size() == 4,
@@ -4473,14 +5192,18 @@ std::optional<std::tuple<at::Tensor, at::Tensor, at::Tensor>> lazy_batch_norm_tr
       input.scalar_type() != at::ScalarType::BFloat16 || !input.is_contiguous() ||
       input.numel() == 0 || input.numel() / input.size(1) <= 1 || has_rm != has_rv ||
       !per_channel(weight) || !per_channel(bias) || !per_channel(running_mean) ||
-      !per_channel(running_var) || virtual_value_of(input)) {
+      !per_channel(running_var)) {
     return std::nullopt;
   }
+  // A lazy input only when it is a conv output kept in rows with the
+  // statistics its conv summed: the output then reads the rows (stage 4).
+  auto stats = channel_stats_of(input);
+  if (virtual_value_of(input) && !(rows_of(input) && stats)) return std::nullopt;
   auto out = xdna_empty_like_layout(input);
   if (!out.is_contiguous()) return std::nullopt;
   ScopedMappedCpu mapped_phase("aten::native_batch_norm.lazy");
   const int64_t N = input.size(0), C = input.size(1), HW = input.size(2) * input.size(3);
-  ensure_host_current(input);
+  if (!stats) ensure_host_current(input);
   auto bf16_in = [](const std::optional<at::Tensor>& t) -> const uint16_t* {
     if (!t.has_value() || !t->defined()) return nullptr;
     ensure_host_current(*t);
@@ -4491,10 +5214,20 @@ std::optional<std::tuple<at::Tensor, at::Tensor, at::Tensor>> lazy_batch_norm_tr
   uint16_t* prm = has_rm ? const_cast<uint16_t*>(bf16_in(running_mean)) : nullptr;
   uint16_t* prv = has_rv ? const_cast<uint16_t*>(bf16_in(running_var)) : nullptr;
   std::vector<float> mean(C), invstd(C), var(C);
-  xdna_region_bn_stats_bf16(
-      static_cast<const uint16_t*>(input.const_data_ptr()), nullptr, nullptr, mean.data(),
-      invstd.data(), var.data(), N, C, HW, float(eps), 0.f, 0,
-      std::max(1, at::get_num_threads()));
+  if (stats) {
+    // The conv that wrote the input summed it while unpacking (no read pass).
+    for (int64_t c = 0; c < C; ++c) {
+      const double m = stats->sum[c] / stats->count;
+      mean[c] = float(m);
+      var[c] = float(std::max(0.0, stats->sumsq[c] / stats->count - m * m));
+    }
+    g_bn_stats_reused.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    xdna_region_bn_stats_bf16(
+        static_cast<const uint16_t*>(input.const_data_ptr()), nullptr, nullptr, mean.data(),
+        invstd.data(), var.data(), N, C, HW, float(eps), 0.f, 0,
+        std::max(1, at::get_num_threads()));
+  }
   // Match ATen's CPU kernel for bf16 parameters (checked bit for bit): it keeps
   // mean and biased variance as bf16, derives invstd from the bf16 variance,
   // transforms with these saved values, and updates the running mean in bf16
@@ -4531,14 +5264,15 @@ std::optional<std::tuple<at::Tensor, at::Tensor, at::Tensor>> lazy_batch_norm_tr
 
   // ATen's affine: alpha = invstd * weight, beta = bias - mean * alpha, in fp32.
   auto value = std::make_shared<XdnaVirtualValue>();
-  value->source = input;
-  value->scale.resize(C);
-  value->shift.resize(C);
+  value->segments.push_back(plain_segment(input));
+  auto& seg = value->segments[0];
+  seg.scale.resize(C);
+  seg.shift.resize(C);
   for (int64_t c = 0; c < C; ++c) {
     const float w = pw ? float(c10::BFloat16(pw[c], c10::BFloat16::from_bits())) : 1.0f;
     const float b = pb ? float(c10::BFloat16(pb[c], c10::BFloat16::from_bits())) : 0.0f;
-    value->scale[c] = w * invstd[c];
-    value->shift[c] = b - mean[c] * value->scale[c];
+    seg.scale[c] = w * invstd[c];
+    seg.shift[c] = b - mean[c] * seg.scale[c];
   }
   set_virtual_value(out, std::move(value));
   return std::make_tuple(out, save_mean, save_invstd);
@@ -4604,6 +5338,54 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_batch_norm_xdna(
   return {out, save_mean, save_invstd};
 }
 
+// Training BatchNorm backward when the input (a conv output) and the gradient
+// (an input-gradient conv output) are both still in rows of one grid: the
+// input gradient stays in rows for the conv backward that packs it next.
+// Sums in double, so a value can differ from ATen's float sums by one bf16
+// step.
+std::optional<std::tuple<at::Tensor, at::Tensor, at::Tensor>> rows_batch_norm_backward(
+    const at::Tensor& grad_out, const at::Tensor& input, const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& save_mean, const std::optional<at::Tensor>& save_invstd,
+    bool train, std::array<bool, 3> output_mask) {
+  auto defined = [](const std::optional<at::Tensor>& t) { return t.has_value() && t->defined(); };
+  if (!conv_rows_enabled() || !train || !defined(save_mean) || !defined(save_invstd) ||
+      grad_out.sizes() != input.sizes()) {
+    return std::nullopt;
+  }
+  auto g = rows_operand(grad_out);
+  auto x = g && !g->seg ? rows_operand(input) : std::nullopt;
+  if (!x || x->seg || !same_grid(*g->rows, *x->rows)) return std::nullopt;
+  ScopedMappedCpu mapped_phase("aten::native_batch_norm_backward.rows");
+  auto floats = [](const at::Tensor& t) {
+    ensure_host_current(t);
+    auto c = cpu_alias(t).to(at::kFloat).contiguous();
+    return std::vector<float>(c.data_ptr<float>(), c.data_ptr<float>() + c.numel());
+  };
+  const int64_t C = input.size(1);
+  const auto mean = floats(*save_mean);
+  const auto invstd = floats(*save_invstd);
+  const auto w = defined(weight) ? floats(*weight) : std::vector<float>();
+  std::vector<float> dgamma(C), dbeta(C);
+  at::Tensor gi;
+  uint16_t* gi_base = nullptr;
+  if (output_mask[0]) gi = new_rows_tensor(input.sizes(), *x->rows, &gi_base);
+  const auto geom = rows_geom(input, *x->rows);
+  xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+  xdna_rows_bn_backward_bf16(&geom, g->rows->base, x->rows->base, gi_base, mean.data(),
+                             invstd.data(), opt_data(w), dgamma.data(), dbeta.data());
+  g_lazy_consumed.fetch_add(2, std::memory_order_relaxed);
+  const auto dtype = defined(weight) ? weight->scalar_type()
+                                     : batch_norm_param_dtype(input, std::nullopt, save_mean);
+  auto param_grad = [&](bool wanted, std::vector<float>& v) -> at::Tensor {
+    if (!wanted) return {};
+    auto t = xdna_empty_like_shape({c10::SymInt(C)}, dtype);
+    cpu_alias(t).copy_(at::from_blob(v.data(), {C}, at::kFloat));
+    mark_host_dirty(t);
+    return t;
+  };
+  return std::make_tuple(gi, param_grad(output_mask[1], dgamma), param_grad(output_mask[2], dbeta));
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 native_batch_norm_backward_xdna(
     const at::Tensor& grad_out,
@@ -4616,6 +5398,10 @@ native_batch_norm_backward_xdna(
     bool train,
     double eps,
     std::array<bool, 3> output_mask) {
+  if (auto rows = rows_batch_norm_backward(grad_out, input, weight, save_mean, save_invstd,
+                                           train, output_mask)) {
+    return *rows;
+  }
   ScopedMappedCpu mapped_phase("aten::native_batch_norm_backward");
   ensure_host_current(grad_out);
   ensure_host_current(input);
@@ -5383,6 +6169,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("leaky_relu", TORCH_FN(leaky_relu_xdna));
   m.impl("leaky_relu_backward", TORCH_FN(leaky_relu_backward_xdna));
   m.impl("add.Tensor", TORCH_FN(add_tensor_xdna));
+  m.impl("add_.Tensor", TORCH_FN(add__xdna));
+  m.impl("relu", TORCH_FN(relu_xdna));
+  m.impl("relu_", TORCH_FN(relu__xdna));
+  m.impl("threshold_backward", TORCH_FN(threshold_backward_xdna));
+  m.impl("clone", TORCH_FN(clone_xdna));
   m.impl("add.out", TORCH_FN(add_out_xdna));
   m.impl("mul.out", TORCH_FN(mul_out_xdna));
   m.impl("div.out", TORCH_FN(div_out_xdna));
@@ -5611,6 +6402,17 @@ void xdna_cpu_fallback(
     const c10::OperatorHandle& op,
     torch::jit::Stack* stack) {
   sync_host_threads();
+  // Name the op for record_lazy_write while it runs.
+  std::string phase_name;
+  const char* prev_phase = g_mapped_phase;
+  if (profile_mapped_cpu()) {
+    phase_name = op.schema().name();
+    g_mapped_phase = phase_name.c_str();
+  }
+  struct RestorePhase {
+    const char* prev;
+    ~RestorePhase() { g_mapped_phase = prev; }
+  } restore_phase{prev_phase};
   if (!profile_fallbacks()) {
     run_cpu_fallback(op, stack);
     return;
@@ -6055,6 +6857,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     out["lazy_created"] = pybind11::int_(g_lazy_created.load());
     out["lazy_consumed"] = pybind11::int_(g_lazy_consumed.load());
     out["lazy_materialized"] = pybind11::int_(g_lazy_materialized.load());
+    out["bn_stats_reused"] = pybind11::int_(g_bn_stats_reused.load());
     return out;
   });
   m.def("is_xrt_backed", [](const at::Tensor& tensor) {

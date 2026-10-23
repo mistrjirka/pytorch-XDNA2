@@ -6,6 +6,12 @@ Long term the same records move into the NPU conv prologue and the tensors stay
 in the NPU layout between ops. This document records stage 1 and the graph
 analysis that chooses the next stages.
 
+## Result of stages 1-4 (lab04, B64, 64x64, all-NPU mode)
+
+ABBA, 25 steps each, `XDNA_LAZY_POINTWISE=0` vs default: median 604, 606, 584
+vs 524, 518, 515 ms; min 568, 571, 536 vs 488, 502, 495 ms. About 14 % per
+step, with every forward value and most gradients bit-equal to eager.
+
 ## Stage 1: lazy pointwise values (done)
 
 - `leaky_relu` and training `BatchNorm2d` on contiguous NCHW bf16 return a lazy
@@ -30,6 +36,17 @@ LeakyReLU select) and did not vectorize. They ran at 0.4 GB/s per core and made
 the lab04 step 35 % slower (585 -> 785 ms). Branch-free bit blends made them
 7-11x faster. Any kernel on the lazy path runs as often as ATen's vectorized
 loops it replaces, so check `-fopt-info-vec` for it.
+
+Second gotcha (stage 1b): the extension builds for baseline x86-64 (SSE2),
+while ATen dispatches to AVX-512. A lazy value that a CPU op materializes
+was 2x slower than eager BN + ReLU. The hot loops now carry
+`target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")`, and their
+helpers are `always_inline`. Without that, GCC stopped inlining inside the
+clones, and affine + activation stayed at baseline speed. One core, 8M
+elements: 7.5 -> 2.1 ms. BN -> ReLU -> CPU reader is now faster lazy than
+eager (16x64x56x56: 0.40 vs 0.70 ms). The conv pack and unpack loops
+(`npu_conv3x3w.pack` / `.unpack`, about 150 ms per lab04 step) are still
+baseline-only, so they are the next candidate for the same treatment.
 
 ### Measured (ABBA, all-NPU mode, median ms per step)
 
@@ -72,29 +89,134 @@ extra. The other networks show the same shape:
 - transformer: no conv, no BatchNorm. The pointwise ops sit between matmuls
   and layer norms (`add -> native_layer_norm`, `gelu -> addmm`).
 
+## Stage 1b: ReLU, clone and the residual add (done)
+
+- `relu` is lazy. It is its own activation, not LeakyReLU with slope 0: ATen's
+  relu is `clamp_min(x, 0)`, which maps -inf to 0, while `-inf * 0` is NaN.
+- `relu_` on a lazy affine value (torchvision's `BatchNorm -> ReLU(inplace)`)
+  adds the activation to the record. On any other tensor it is eager.
+- `threshold_backward` (relu's backward reads the relu result) takes the mask
+  from the value's input with a select, so an infinite gradient stays 0.
+- `clone` of a lazy value is a new lazy value of the same source.
+- `add` and `add_` with alpha 1 on same-shape contiguous bf16 compute one or
+  two lazy operands while adding. A plain operand is only read, so the lazy
+  values that read it stay lazy.
+- Tests: the `res` block in `tests/run_lazy_pointwise.py` (conv -> BN ->
+  relu_ -> clone -> conv -> BN, + skip -> relu -> conv) is bit-equal to eager
+  XDNA and consumes 4 lazy values in forward with no materialization.
+- lab04: 81 % of lazy values are now consumed without a write (stage 1: 45 %).
+- Measured (ABBA, median ms; eager vs lazy): lab04 603, 563 vs 579, 609;
+  resnet18 46.5, 37.6, 52.3 vs 36.7, 40.4, 43.9; unet 52.7, 67.1, 56.8 vs
+  64.0, 55.1, 100.7; style_net, conv_autoencoder and vgg11_128 equal within
+  noise. The machine noise (up to 2x on unet) is larger than the effect. The
+  per-op profile of unet shows no slower op.
+
+## Stage 2: lazy cat and upsample (done)
+
+- A lazy value is now a list of channel segments. Each segment has its own
+  source, per-channel scale/shift/activation and nearest-upsample factor
+  (`XdnaLazySegment`, `conv_pack.h`).
+- `cat` along channels of contiguous bf16 NCHW tensors and nearest 2x
+  `upsample_nearest2d` return lazy values. Lazy inputs keep their segments;
+  plain inputs become segments read as they are.
+- One pack kernel (`xdna_conv3x3w_pack_segments_bf16`) reads any segment list,
+  so the conv packs `upsample(cat(leaky(bn(a)), b))` straight from `a` and `b`.
+  An activation on a cat or an upsample moves into every segment.
+- Elementwise consumers (add, the activation backwards) still need a single
+  segment and otherwise read written bytes.
+- lab04 (ABBA, median ms; eager vs lazy): 605, 576 vs 557, 510; min 557, 536
+  vs 520, 487. About 9 % per step: the decoder no longer writes its cat and
+  upsample outputs (up to 134 MB each).
+
+## Stage 3: BatchNorm statistics in the conv unpack (done)
+
+- The conv3x3w forward unpack adds every output value and its square per
+  channel (double) while the rows are in cache, and attaches the sums to the
+  output tensor with its write epoch (`XdnaChannelStats`). Not with a conv
+  bias: eager adds it after the unpack.
+- Lazy BatchNorm takes mean and variance from them when they still match, so it
+  no longer reads its input. `allocator_stats()["bn_stats_reused"]` counts it.
+- Results stay bit-equal to eager XDNA in the tests: the double sums give the
+  same bf16-rounded mean and variance as the statistics kernel.
+- lab04 (ABBA, median ms; eager vs lazy): 565, 565 vs 530, 531. BatchNorm
+  forward: 16.8 -> 1.3 ms per step; the unpack: unchanged (81 vs 82 ms).
+
+## Stage 4: keep the NPU layout between ops (done)
+
+A conv3x3w output no longer has to be unpacked to NCHW. It stays in the rows
+the NPU wrote (`XdnaConvRows`: blocks of `[grid rows][128]` on the padded
+strip grid), and the tensor is a lazy value of that kind
+(`XDNA_LAZY_CONV_ROWS`, on by default).
+
+- Forward: lazy BatchNorm takes the stage 3 sums (now from a stats-only pass
+  over the rows), LeakyReLU/ReLU/cat/upsample build records on the rows tensor,
+  and the next conv packs straight from the rows: channels are contiguous
+  there, so no transpose.
+- Backward: the input-gradient conv also keeps its output in rows. LeakyReLU
+  and ReLU backward, BatchNorm backward, upsample backward, the residual add
+  and the gradient accumulation compute on rows of one grid
+  (`xdna_rows_*` in `conv_pack.cpp`) and return rows, so the chain
+  conv -> BN -> act -> conv stays in rows in both directions. Channel slices of
+  a rows tensor (the cat backward) are read in place; an add of a rows slice
+  and an NCHW tensor unpacks only the slice into the sum.
+- Anything else unpacks the tensor once (`materialize_virtual`), which eager
+  did in the conv itself. With `XDNA_PROFILE_MAPPED_CPU=1`,
+  `lazy.write[<op>]` in `mapped_cpu_stats()` shows which ops do that, so where
+  a chain breaks.
+- Exactness: forward, activation backward, upsample backward and the adds are
+  bit-equal to eager. BatchNorm backward sums in double where ATen sums in
+  float: in the tests about 4 values per million differ by more than one bf16
+  step (relative error 7e-6).
+- Gotcha: the unpack used to run while the NPU computed the next piece. Without
+  it the NPU time shows (`dx.run` +19 ms, `fwd.run` +7 ms per lab04 step).
+  The gain is the unpack minus that.
+- lab04 per step (averages of 3 ABBA runs): unpack 90 -> 28 ms, BatchNorm
+  backward 58 -> 44 ms, net about -37 ms. Step min 568, 564, 570 vs 533, 530,
+  518 ms (medians noisier: 578, 607, 626 vs 566, 602, 547).
+- Not covered yet: the pack itself (still about 70 ms per lab04 step; from rows
+  it runs at about 10-16 GB/s against 49 GB/s for a copy), NCHW inputs from the
+  CPU convs (stride 2, 1x1), and convs with a bias (eager adds it after the
+  unpack, so they keep unpacking).
+
+## Stage 5: NPU prologue/epilogue (evaluated, not built)
+
+Measured on lab04 with stages 1-4 in place:
+
+- Prologue (BN affine + activation on the core, on the input window): the
+  pointwise is 5 % of a host pack (rows 8.71 ms, rows + affine 9.17 ms for a
+  134 MB input, 16 threads). The pack is memory-bound, so moving the
+  pointwise to the NPU saves about 3-4 ms per step. It also costs NPU time,
+  which is no longer hidden behind the unpack, and the core must re-zero the
+  padding rows (affine(0) = shift).
+- Reading the previous conv's rows directly on the NPU (no host pack): the
+  next input is the previous output shifted by W + 3 rows, so a DMA pattern can
+  read it, but only for one-strip images (W <= 36). Wider images need
+  neighbour columns from other strips. For lab04 that covers the 16x16 and
+  32x32 convs, about 12-24 ms of pack per step. The deferred dW reads the
+  forward's packed copy, so without a host pack it would pack again in backward,
+  unless the dW kernel gets the same prologue.
+- Epilogue (BatchNorm sums on the core): the host stats pass over the rows is
+  about 7 ms per step.
+- Exactness: the AIE has no IEEE fp32 multiply; x * scale + shift would not
+  round as the host does, so results would differ from eager by bf16 steps.
+- Risk: a wrong DMA pattern or lock protocol hangs the array (see the rules in
+  `_designs/conv3x3w.py`), and recovery may need a driver reload.
+
+Verdict: at most about 5 % of the step for a new kernel variant, a dW variant
+and hang risk. Not built now. Larger items first: the host pack itself (about
+70 ms per step at 10-18 GB/s, against 49 GB/s for a copy) and the NPU time
+that the removed unpack no longer hides. Revisit when the pack is near copy
+speed, or if the NPU kernel is rebuilt for other reasons.
+
 ## Next stages, by what they unblock
 
-1. **More lazy producers**: `relu`, `relu_` (in place on a lazy value just
-   adds the activation to the record), `add` of a lazy value and a tensor
-   (residual), `clone` of a lazy value (a new record on the same source).
-   Unblocks resnet18-style networks and the ResNet blocks of lab04.
-2. **Layout consumers**: `cat` and nearest `upsample` that keep lazy inputs
-   lazy, with the conv pack reading several sources. The removed
-   `XDNA_LAZY_DECODER_VALUES` did this for cat + upsample and gained nothing
-   because the conv still repacked. It pays only together with stage 4.
-3. **BatchNorm statistics in the conv unpack**: the unpack touches every
-   output element. Computing per-channel sums there removes the statistics
-   pass (20 per lab04 step).
-4. **Keep the NPU layout between ops (Option A)**: the conv writes its output
-   in the input layout, and lazy values record "bytes are in the packed
-   buffer". This targets the 147 ms of pack and unpack per lab04 step, the
-   largest item. Stages 1-3 are its building blocks: the lazy record is the
-   tag that says which form a tensor is in.
-5. **NPU prologue/epilogue**: move the pointwise record into the conv kernel
-   once the input is already packed. Budget measured on 2026-10-22: the
-   forward conv core uses 2.8 of 16 KB program memory and about 55 of 64 KB
-   data memory. Per-channel scale/shift (up to 4 KB) and statistics (1 KB) fit,
-   a streamed residual input (32 KB double-buffered) does not.
+1. ~~More lazy producers~~: done (stage 1b).
+2. ~~Layout consumers~~: done (stage 2). Unlike the removed
+   `XDNA_LAZY_DECODER_VALUES`, the conv pack reads the inputs directly, so it
+   gains without stage 4.
+3. ~~BatchNorm statistics in the conv unpack~~: done (stage 3).
+4. ~~Keep the NPU layout between ops~~: done (stage 4).
+5. ~~NPU prologue/epilogue~~: evaluated, not built (stage 5 above).
 
 ## Full graph recording (way 1): not needed yet
 

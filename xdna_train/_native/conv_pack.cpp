@@ -1,6 +1,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
+
+#include "conv_pack.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -345,10 +348,10 @@ inline void scatter_channels(const uint16_t* s, uint16_t* d, std::size_t dstride
 
 // Branch-free so the loops below vectorize (`omp simd`): these run on every
 // element of a lazy value, as often as ATen's own vectorized loops would.
-inline float bf16_to_f32(uint16_t v) { return __builtin_bit_cast(float, uint32_t(v) << 16); }
+[[gnu::always_inline]] inline float bf16_to_f32(uint16_t v) { return __builtin_bit_cast(float, uint32_t(v) << 16); }
 
 // Round to nearest even, NaN -> canonical quiet NaN (c10::BFloat16's rounding).
-inline uint16_t f32_to_bf16(float f) {
+[[gnu::always_inline]] inline uint16_t f32_to_bf16(float f) {
   const uint32_t u = __builtin_bit_cast(uint32_t, f);
   const uint32_t r = (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
   const uint32_t nan = 0u - uint32_t((u & 0x7fffffffu) > 0x7f800000u);  // all ones for NaN
@@ -358,11 +361,22 @@ inline uint16_t f32_to_bf16(float f) {
 // ATen's CPU leaky_relu for bf16: in fp32, x > 0 ? x : x * slope (NaN stays NaN).
 // Written as a multiply by a selected factor, which is the same for every x.
 // The factor is a bit blend, not a branch, so the loops vectorize.
-inline float leaky_factor(float x, float slope) {
+[[gnu::always_inline]] inline float leaky_factor(float x, float slope) {
   const uint32_t m = 0u - uint32_t(x > 0.f);
   return __builtin_bit_cast(float, (0x3f800000u & m) | (__builtin_bit_cast(uint32_t, slope) & ~m));
 }
-inline float leaky(float x, float slope) { return x * leaky_factor(x, slope); }
+[[gnu::always_inline]] inline float leaky(float x, float slope) { return x * leaky_factor(x, slope); }
+
+// ATen's CPU relu is clamp_min(x, 0), vectorized as max(0, x) = 0 > x ? 0 : x:
+// NaN and -0 pass through, -inf becomes 0.  LeakyReLU with slope 0 differs
+// (-inf * 0 is NaN), so ReLU is its own activation.
+[[gnu::always_inline]] inline float relu(float x) {
+  const uint32_t keep = 0u - uint32_t(!(x < 0.f));
+  return __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, x) & keep);
+}
+
+// Activation codes shared with torch_xdna_device.cpp (XdnaAct).
+constexpr int kActNone = 0, kActLeaky = 1, kActRelu = 2;
 
 // A lazy per-channel pointwise value, y = act(x * scale + shift).  The pack,
 // the materialize kernel and the LeakyReLU backward share pointwise_one, so
@@ -370,24 +384,25 @@ inline float leaky(float x, float slope) { return x * leaky_factor(x, slope); }
 struct Pointwise {
   const float* scale;  // per channel, nullptr: no affine
   const float* shift;
-  int act;             // LeakyReLU (slope 0 is ReLU)
+  int act;             // kActNone, kActLeaky (with slope) or kActRelu
   float slope;
 };
 
-template <bool Affine, bool Act>
-inline uint16_t pointwise_one(uint16_t v, float scale, float shift, float slope) {
+template <bool Affine, int Act>
+[[gnu::always_inline]] inline uint16_t pointwise_one(uint16_t v, float scale, float shift, float slope) {
   float x = bf16_to_f32(v);
   // Eager BatchNorm writes a bf16 tensor before the activation reads it, so
   // round between the two steps to match it.
   if constexpr (Affine) x = bf16_to_f32(f32_to_bf16(x * scale + shift));
-  if constexpr (Act) x = leaky(x, slope);
+  if constexpr (Act == kActLeaky) x = leaky(x, slope);
+  if constexpr (Act == kActRelu) x = relu(x);
   return f32_to_bf16(x);
 }
 
 // v[i] = value of v[i] in channel c0 + i * cstep (cstep 1: a pixel's channels,
 // 0: one channel's plane), i < n.  src may equal dst.
-template <bool Affine, bool Act>
-inline void pointwise_span(const uint16_t* src, uint16_t* dst, long n, const Pointwise& pw, int c0,
+template <bool Affine, int Act>
+[[gnu::always_inline]] inline void pointwise_span(const uint16_t* src, uint16_t* dst, long n, const Pointwise& pw, int c0,
                            int cstep) {
   if (cstep == 0) {
     const float sc = Affine ? pw.scale[c0] : 0.f, sh = Affine ? pw.shift[c0] : 0.f;
@@ -402,12 +417,215 @@ inline void pointwise_span(const uint16_t* src, uint16_t* dst, long n, const Poi
   }
 }
 
-inline void apply_pointwise(const uint16_t* src, uint16_t* dst, long n, const Pointwise& pw, int c0,
-                            int cstep) {
-  if (pw.scale && pw.act) pointwise_span<true, true>(src, dst, n, pw, c0, cstep);
-  else if (pw.scale) pointwise_span<true, false>(src, dst, n, pw, c0, cstep);
-  else if (pw.act) pointwise_span<false, true>(src, dst, n, pw, c0, cstep);
-  else if (src != dst) std::memcpy(dst, src, std::size_t(n) * sizeof(uint16_t));
+// The extension builds for baseline x86-64 (SSE2, 4 floats per instruction),
+// while ATen's pointwise kernels dispatch to AVX2/AVX-512 at run time.  The
+// hot lazy-value loops get the same: one clone per level, picked at load time.
+// The helpers they call are always_inline: inside the large cloned function
+// GCC otherwise stopped inlining them and the affine+activation loops ran at
+// baseline speed (7.5 ms vs 2.1 ms for 8M elements on one core).
+// No FMA contraction (-std=c++20 implies -ffp-contract=off): a*b+c rounds
+// twice, as in the eager kernels these results must match bit for bit.
+#define XDNA_SIMD_CLONES \
+  __attribute__((target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")))
+
+XDNA_SIMD_CLONES
+void apply_pointwise(const uint16_t* src, uint16_t* dst, long n, const Pointwise& pw, int c0,
+                     int cstep) {
+  if (pw.scale) {
+    if (pw.act == kActLeaky) pointwise_span<true, kActLeaky>(src, dst, n, pw, c0, cstep);
+    else if (pw.act == kActRelu) pointwise_span<true, kActRelu>(src, dst, n, pw, c0, cstep);
+    else pointwise_span<true, kActNone>(src, dst, n, pw, c0, cstep);
+  } else if (pw.act == kActLeaky) {
+    pointwise_span<false, kActLeaky>(src, dst, n, pw, c0, cstep);
+  } else if (pw.act == kActRelu) {
+    pointwise_span<false, kActRelu>(src, dst, n, pw, c0, cstep);
+  } else if (src != dst) {
+    std::memcpy(dst, src, std::size_t(n) * sizeof(uint16_t));
+  }
+}
+
+XDNA_SIMD_CLONES
+void leaky_backward_plane(const uint16_t* dy, const uint16_t* src, uint16_t* dx, long n, float sc,
+                          float sh, float slope) {
+#pragma omp simd
+  for (long i = 0; i < n; ++i) {
+    const float z = bf16_to_f32(pointwise_one<true, kActNone>(src[i], sc, sh, 0.f));
+    dx[i] = f32_to_bf16(bf16_to_f32(dy[i]) * leaky_factor(z, slope));
+  }
+}
+
+XDNA_SIMD_CLONES
+void relu_backward_plane(const uint16_t* dy, const uint16_t* src, uint16_t* dx, long n,
+                         const float* sc, const float* sh) {
+  auto keep = [](uint16_t z) { return uint16_t(0u - uint32_t(!(bf16_to_f32(z) <= 0.f))); };
+  if (sc) {
+    const float a = *sc, b = *sh;
+#pragma omp simd
+    for (long i = 0; i < n; ++i) dx[i] = dy[i] & keep(pointwise_one<true, kActNone>(src[i], a, b, 0.f));
+  } else {
+#pragma omp simd
+    for (long i = 0; i < n; ++i) dx[i] = dy[i] & keep(src[i]);
+  }
+}
+
+XDNA_SIMD_CLONES
+void add_bf16_span(const uint16_t* a, const uint16_t* b, uint16_t* out, long n) {
+#pragma omp simd
+  for (long i = 0; i < n; ++i) out[i] = f32_to_bf16(bf16_to_f32(a[i]) + bf16_to_f32(b[i]));
+}
+
+// sum[n] += x, sumsq[n] += x * x over nrows rows of kN channels (n < nv), in
+// double: exact enough that BatchNorm's bf16-rounded mean and variance come
+// out as from the region kernel's two-level sum.
+// One pixel's channels [c0, c0 + n) of the rows backward kernels.
+XDNA_SIMD_CLONES
+void act_backward_span(const uint16_t* dy, const uint16_t* x, uint16_t* dx, int n,
+                       const float* scale, const float* shift, int mode, float slope) {
+  if (mode == 1) {
+    if (scale) {
+#pragma omp simd
+      for (int i = 0; i < n; ++i) {
+        const float z = bf16_to_f32(pointwise_one<true, kActNone>(x[i], scale[i], shift[i], 0.f));
+        dx[i] = f32_to_bf16(bf16_to_f32(dy[i]) * leaky_factor(z, slope));
+      }
+    } else {
+#pragma omp simd
+      for (int i = 0; i < n; ++i)
+        dx[i] = f32_to_bf16(bf16_to_f32(dy[i]) * leaky_factor(bf16_to_f32(x[i]), slope));
+    }
+  } else {
+    auto keep = [](uint16_t z) { return uint16_t(0u - uint32_t(!(bf16_to_f32(z) <= 0.f))); };
+    if (scale) {
+#pragma omp simd
+      for (int i = 0; i < n; ++i)
+        dx[i] = dy[i] & keep(pointwise_one<true, kActNone>(x[i], scale[i], shift[i], 0.f));
+    } else {
+#pragma omp simd
+      for (int i = 0; i < n; ++i) dx[i] = dy[i] & keep(x[i]);
+    }
+  }
+}
+
+XDNA_SIMD_CLONES
+void bn_backward_sums_span(const uint16_t* dy, const uint16_t* x, int n, const float* mean,
+                           double* sum, double* dotp) {
+#pragma omp simd
+  for (int i = 0; i < n; ++i) {
+    const double g = bf16_to_f32(dy[i]);
+    sum[i] += g;
+    dotp[i] += (double(bf16_to_f32(x[i])) - double(mean[i])) * g;
+  }
+}
+
+XDNA_SIMD_CLONES
+void bn_backward_dx_span(const uint16_t* dy, const uint16_t* x, uint16_t* dx, int n,
+                         const float* mean, const float* k, const float* grad_mean,
+                         const float* invstd, const float* w) {
+#pragma omp simd
+  for (int i = 0; i < n; ++i) {
+    const float t = (bf16_to_f32(x[i]) - mean[i]) * k[i];
+    dx[i] = f32_to_bf16((bf16_to_f32(dy[i]) - grad_mean[i] - t) * invstd[i] * w[i]);
+  }
+}
+
+XDNA_SIMD_CLONES
+void sum4_span(const uint16_t* a, const uint16_t* b, const uint16_t* c, const uint16_t* d,
+               uint16_t* out, int n) {
+#pragma omp simd
+  for (int i = 0; i < n; ++i) {
+    float acc = 0.f;
+    acc += bf16_to_f32(a[i]);
+    acc += bf16_to_f32(b[i]);
+    acc += bf16_to_f32(c[i]);
+    acc += bf16_to_f32(d[i]);
+    out[i] = f32_to_bf16(acc);
+  }
+}
+
+XDNA_SIMD_CLONES
+void accumulate_channel_stats(const uint16_t* rows, long nrows, int nv, double* sum,
+                              double* sumsq) {
+  for (long r = 0; r < nrows; ++r) {
+    const uint16_t* row = rows + r * kN;
+#pragma omp simd
+    for (int n = 0; n < nv; ++n) {
+      const double v = bf16_to_f32(row[n]);
+      sum[n] += v;
+      sumsq[n] += v * v;
+    }
+  }
+}
+
+// tile[xi][off + k] = channel k0 + k of segment sg at target pixel (b, y, x0 + xi),
+// for xi < nx (<= 8), k < n, with the segment's pointwise applied.
+inline void gather_segment(const XdnaPackSegment& sg, int b, int y, int x0, int nx, int k0, int n,
+                           int H, int W, uint16_t (*tile)[kKStep], int off) {
+  const int up = sg.up;
+  const int Hs = H / up, Ws = W / up;
+  auto* t = reinterpret_cast<uint16_t (*)[kKStep]>(&tile[0][off]);
+  if (sg.rows) {
+    // Channels are contiguous in a row: copies, no transpose.
+    const int sy = y / up;
+    for (int xi = 0; xi < nx; ++xi) {
+      const int sx = (x0 + xi) / up;
+      std::size_t row;
+      if (sg.rows_s == 1) {
+        row = (std::size_t(b) * (Hs + 2) + sy) * sg.rows_wp + sx;
+      } else {
+        const int strip = sx / sg.rows_so;
+        row = ((std::size_t(b) * sg.rows_s + strip) * (Hs + 2) + sy) * sg.rows_wp + 1 +
+              (sx - strip * sg.rows_so);
+      }
+      for (int k = k0; k < k0 + n;) {
+        const int blk = k / kN, col = k % kN;
+        const int cnt = kN - col < k0 + n - k ? kN - col : k0 + n - k;
+        std::memcpy(t[xi] + (k - k0), sg.rows + blk * sg.block_stride + row * kN + col,
+                    std::size_t(cnt) * sizeof(uint16_t));
+        k += cnt;
+      }
+    }
+  } else if (up == 1) {
+    const std::size_t hw = std::size_t(Hs) * Ws;
+    const uint16_t* s = sg.src + ((std::size_t(b) * sg.channels + k0) * Hs + y / up) * Ws;
+    gather_pixels(s + x0, hw, n, nx, t);
+  } else {
+    const std::size_t hw = std::size_t(Hs) * Ws;
+    const uint16_t* s = sg.src + ((std::size_t(b) * sg.channels + k0) * Hs + y / up) * Ws;
+    // The source columns under the nx target columns, gathered once.
+    const int sa = x0 / up, sb = (x0 + nx - 1) / up + 1;
+    uint16_t src_tile[8][kKStep];
+    gather_pixels(s + sa, hw, n, sb - sa, src_tile);
+    for (int xi = 0; xi < nx; ++xi)
+      std::memcpy(t[xi], src_tile[(x0 + xi) / up - sa], std::size_t(n) * sizeof(uint16_t));
+  }
+  if (sg.scale || sg.act) {
+    const Pointwise pw{sg.scale, sg.shift, sg.act, sg.slope};
+    for (int xi = 0; xi < nx; ++xi) apply_pointwise(t[xi], t[xi], n, pw, k0, 1);
+  }
+}
+
+// Grid row of image pixel (b, y, x) of grid g.
+inline std::size_t row_of(const XdnaRowsGeom& g, int b, int y, int x) {
+  if (g.S == 1) return (std::size_t(b) * (g.H + 2) + y) * g.wp + x;
+  const int s = x / g.So;
+  return ((std::size_t(b) * g.S + s) * (g.H + 2) + y) * g.wp + 1 + (x - s * g.So);
+}
+
+// f(row, b, y, x0, cols) for every run of valid output pixels of grid g: grid
+// rows [row, row + cols) hold image pixels (b, y, x0 .. x0 + cols).
+template <class F>
+void for_valid_rows(const XdnaRowsGeom& g, F&& f) {
+  const int Bv = g.B * g.S;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int vb = 0; vb < Bv; ++vb) {
+    for (int y = 0; y < g.H; ++y) {
+      const int b = vb / g.S, sidx = vb % g.S;
+      const long base = long(std::size_t(vb) * (g.H + 2) + y) * g.wp;
+      const long first = g.S == 1 ? 0 : 1;
+      const int cols = g.S == 1 ? g.W : (g.W - sidx * g.So < g.So ? g.W - sidx * g.So : g.So);
+      if (cols > 0) f(base + first, b, y, g.S == 1 ? 0 : sidx * g.So, cols);
+    }
+  }
 }
 }  // namespace
 
@@ -693,13 +911,14 @@ void xdna_conv3x3w_unpack_output_range_bf16(
 // source columns [s*So - 1, s*So + So + 1), zero outside [0, W).
 
 // Groups [g0, g0+ng) of the packed input of the strip layout (see
-// xdna_conv3x3w_pack_input_range_bf16 for the buffer contract).  halo_zero
-// writes zeros in the two halo data columns instead of the neighbours (the
-// layout dY needs for the weight gradient).  scale/shift/act/slope apply a lazy
-// pointwise value (see Pointwise) to every real pixel while packing it; the
-// zero padding stays zero.
-void xdna_conv3x3w_pack_input_strips_range_pw_bf16(
-    const uint16_t* src,
+// xdna_conv3x3w_pack_input_range_bf16 for the buffer contract), for the value
+// the segments describe (conv_pack.h).  halo_zero writes zeros in the two halo
+// data columns instead of the neighbours (the layout dY needs for the weight
+// gradient).  A segment's pointwise applies to every real pixel while packing
+// it; the zero padding stays zero.
+void xdna_conv3x3w_pack_segments_bf16(
+    const XdnaPackSegment* segs,
+    int nsegs,
     uint16_t* dst,
     int B,
     int C,
@@ -710,13 +929,7 @@ void xdna_conv3x3w_pack_input_strips_range_pw_bf16(
     int halo_zero,
     int chunks,
     int g0,
-    int ng,
-    const float* scale,
-    const float* shift,
-    int act,
-    float slope) {
-  const Pointwise pw{scale, shift, act, slope};
-  const bool transform = scale != nullptr || act != 0;
+    int ng) {
   const int Wg = S == 1 ? W : So + 2;
   const int wp = Wg + 2;
   const int Bv = B * S;
@@ -731,7 +944,8 @@ void xdna_conv3x3w_pack_input_strips_range_pw_bf16(
   for (int vb = v0; vb < v1; ++vb) {
     for (int chunk = 0; chunk < chunks; ++chunk) {
       for (int y = 0; y < H; ++y) {
-        const int cc = C - chunk * kKStep < kKStep ? C - chunk * kKStep : kKStep;
+        const int cbase = chunk * kKStep;
+        const int cc = C - cbase < kKStep ? C - cbase : kKStep;
         const int b = vb / S, sidx = vb % S;
         const int xs0 = S == 1 ? 0 : sidx * So - 1;  // source column of data column 0
         const std::size_t pr = (std::size_t(vb) * (H + 2) + y + 1) * wp + 1;
@@ -744,15 +958,15 @@ void xdna_conv3x3w_pack_input_strips_range_pw_bf16(
         const int j1 = pr + Wg > phi ? int(phi - pr) : Wg;
         if (ja < j0) ja = j0;
         if (jb > j1) jb = j1;
-        const uint16_t* s =
-            src + ((std::size_t(b) * C + chunk * kKStep) * H + y) * W + xs0;
         for (int xb = ja; xb < jb; xb += 8) {
           const int nx = jb - xb < 8 ? jb - xb : 8;
           uint16_t tile[8][kKStep];
-          gather_pixels(s + xb, std::size_t(H) * W, cc, nx, tile);
-          if (transform)
-            for (int xi = 0; xi < nx; ++xi)
-              apply_pointwise(tile[xi], tile[xi], cc, pw, chunk * kKStep, 1);
+          for (int si = 0; si < nsegs; ++si) {
+            const XdnaPackSegment& sg = segs[si];
+            const int lo = sg.c0 > cbase ? sg.c0 : cbase;
+            const int hi = sg.c0 + sg.channels < cbase + cc ? sg.c0 + sg.channels : cbase + cc;
+            if (lo < hi) gather_segment(sg, b, y, xs0 + xb, nx, lo - sg.c0, hi - lo, H, W, tile, lo - cbase);
+          }
           for (int xi = 0; xi < nx; ++xi) {
             const int j = xb + xi;
             if (halo_zero && S > 1 && (j == 0 || j == Wg - 1))
@@ -780,22 +994,36 @@ void xdna_conv3x3w_pack_input_strips_range_pw_bf16(
 void xdna_conv3x3w_pack_input_strips_range_bf16(
     const uint16_t* src, uint16_t* dst, int B, int C, int H, int W, int S, int So,
     int halo_zero, int chunks, int g0, int ng) {
-  xdna_conv3x3w_pack_input_strips_range_pw_bf16(
-      src, dst, B, C, H, W, S, So, halo_zero, chunks, g0, ng, nullptr, nullptr, 0, 0.f);
+  const XdnaPackSegment seg{src, 0, C, 1, nullptr, nullptr, kActNone, 0.f, nullptr, 0, 0, 0, 0};
+  xdna_conv3x3w_pack_segments_bf16(&seg, 1, dst, B, C, H, W, S, So, halo_zero, chunks, g0, ng);
 }
 
-// dst = the lazy pointwise value of src (both contiguous NCHW bf16), with the
-// same math as the pack above.
-void xdna_pointwise_channel_bf16(
-    const uint16_t* src, uint16_t* dst, int B, int C, long HW,
-    const float* scale, const float* shift, int act, float slope) {
-  const Pointwise pw{scale, shift, act, slope};
+// With the same math as the pack above, so every reader sees the same bytes.
+void xdna_lazy_segments_write_bf16(
+    const XdnaPackSegment* segs, int nsegs, uint16_t* dst, int B, int C, int H, int W) {
+  const std::size_t hw = std::size_t(H) * W;
+  for (int si = 0; si < nsegs; ++si) {
+    const XdnaPackSegment& sg = segs[si];
+    const Pointwise pw{sg.scale, sg.shift, sg.act, sg.slope};
+    const int up = sg.up;
+    const int Hs = H / up, Ws = W / up;
 #pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
-  for (int b = 0; b < B; ++b)
-    for (int c = 0; c < C; ++c) {
-      const std::size_t off = (std::size_t(b) * C + c) * std::size_t(HW);
-      apply_pointwise(src + off, dst + off, HW, pw, c, 0);
-    }
+    for (int b = 0; b < B; ++b)
+      for (int k = 0; k < sg.channels; ++k) {
+        const uint16_t* sp = sg.src + (std::size_t(b) * sg.channels + k) * Hs * Ws;
+        uint16_t* dp = dst + (std::size_t(b) * C + sg.c0 + k) * hw;
+        if (up == 1) {
+          apply_pointwise(sp, dp, long(hw), pw, k, 0);
+          continue;
+        }
+        for (int y = 0; y < H; ++y) {
+          const uint16_t* srow = sp + std::size_t(y / up) * Ws;
+          uint16_t* drow = dp + std::size_t(y) * W;
+          for (int x = 0; x < W; ++x) drow[x] = srow[x / up];
+          apply_pointwise(drow, drow, W, pw, k, 0);
+        }
+      }
+  }
 }
 
 // dx = leaky_relu_backward(dy, z) where z is the lazy affine value of src (no
@@ -808,12 +1036,49 @@ void xdna_leaky_backward_pw_bf16(
   for (int b = 0; b < B; ++b)
     for (int c = 0; c < C; ++c) {
       const std::size_t off = (std::size_t(b) * C + c) * std::size_t(HW);
-      const float sc = scale[c], sh = shift[c];
-#pragma omp simd
-      for (long i = 0; i < HW; ++i) {
-        const float z = bf16_to_f32(pointwise_one<true, false>(src[off + i], sc, sh, 0.f));
-        const float g = bf16_to_f32(dy[off + i]);
-        dx[off + i] = f32_to_bf16(g * leaky_factor(z, slope));
+      leaky_backward_plane(dy + off, src + off, dx + off, HW, scale[c], shift[c], slope);
+    }
+}
+
+// dx = threshold_backward(dy, relu(z), 0) where z is the lazy value's input
+// (src, or its affine when scale is set), so relu(z) is never written.
+// ATen: relu(z) <= 0 ? 0 : dy, which keeps dy where z > 0 or z is NaN.  A
+// select, not a multiply: an infinite dy times 0 would be NaN.
+void xdna_relu_backward_pw_bf16(
+    const uint16_t* dy, const uint16_t* src, uint16_t* dx, int B, int C, long HW,
+    const float* scale, const float* shift) {
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int b = 0; b < B; ++b)
+    for (int c = 0; c < C; ++c) {
+      const std::size_t off = (std::size_t(b) * C + c) * std::size_t(HW);
+      relu_backward_plane(dy + off, src + off, dx + off, HW, scale ? scale + c : nullptr,
+                          scale ? shift + c : nullptr);
+    }
+}
+
+// out = a + b for contiguous NCHW bf16, where a and b may each be a lazy
+// pointwise value of its src (pw_a / pw_b with no scale and no act: the bytes
+// themselves).  ATen's bf16 add with alpha 1: fp32 sum of the two bf16 values,
+// rounded once.  Per plane in L1-sized chunks, so each step vectorizes.
+void xdna_add_pw_bf16(
+    const uint16_t* a, const float* a_scale, const float* a_shift, int a_act, float a_slope,
+    const uint16_t* b, const float* b_scale, const float* b_shift, int b_act, float b_slope,
+    uint16_t* out, int B, int C, long HW) {
+  const Pointwise pa{a_scale, a_shift, a_act, a_slope};
+  const Pointwise pb{b_scale, b_shift, b_act, b_slope};
+  constexpr long kChunk = 2048;
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int n = 0; n < B; ++n)
+    for (int c = 0; c < C; ++c) {
+      const std::size_t off = (std::size_t(n) * C + c) * std::size_t(HW);
+      alignas(64) uint16_t ta[kChunk], tb[kChunk];
+      for (long i0 = 0; i0 < HW; i0 += kChunk) {
+        const long m = HW - i0 < kChunk ? HW - i0 : kChunk;
+        const uint16_t* va = a + off + i0;
+        const uint16_t* vb = b + off + i0;
+        if (pa.scale || pa.act) { apply_pointwise(va, ta, m, pa, c, 0); va = ta; }
+        if (pb.scale || pb.act) { apply_pointwise(vb, tb, m, pb, c, 0); vb = tb; }
+        add_bf16_span(va, vb, out + off + i0, m);
       }
     }
 }
@@ -822,7 +1087,12 @@ void xdna_leaky_backward_pw_bf16(
 // points at row p0) -> channel slice [c_start, c_start + cout_valid) of an
 // NCHW [B][C_total][H][W] tensor.  Strip s's output column t sits at grid row
 // base + 1 + t and lands at image column s*So + t.
-void xdna_conv3x3w_unpack_output_strips_range_bf16(
+// As xdna_conv3x3w_unpack_output_strips_range_bf16, and when sum / sumsq are
+// set, adds each valid output's value and square per channel to them
+// (cout_valid entries each) while the rows are in cache: the statistics a
+// following BatchNorm needs (stage 3 of docs/fusion-analysis.md).  dst may be
+// null: statistics only.
+void xdna_conv3x3w_unpack_output_strips_range_stats_bf16(
     const uint16_t* c,
     uint16_t* dst,
     int B,
@@ -834,7 +1104,9 @@ void xdna_conv3x3w_unpack_output_strips_range_bf16(
     int C_total,
     int c_start,
     int p0,
-    int p1) {
+    int p1,
+    double* sum,
+    double* sumsq) {
   const int Wg = S == 1 ? W : So + 2;
   const int wp = Wg + 2;
   const int Bv = B * S;
@@ -842,23 +1114,151 @@ void xdna_conv3x3w_unpack_output_strips_range_bf16(
   if (p1 <= p0) return;
   const int v0 = int(std::size_t(p0) / img);
   const int v1 = int((std::size_t(p1) - 1) / img) + 1 < Bv ? int((std::size_t(p1) - 1) / img) + 1 : Bv;
-#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
-  for (int vb = v0; vb < v1; ++vb) {
-    for (int y = 0; y < H; ++y) {
-      const int b = vb / S, sidx = vb % S;
-      const long base = long(std::size_t(vb) * (H + 2) + y) * wp;
-      const long first = S == 1 ? 0 : 1;           // grid offset of output column 0
-      const int cols = S == 1 ? W : (W - sidx * So < So ? W - sidx * So : So);
-      const long ta = p0 - (base + first) > 0 ? p0 - (base + first) : 0;
-      const long tb = p1 - (base + first) < cols ? p1 - (base + first) : cols;
-      if (tb <= ta) continue;
-      const int x0 = (S == 1 ? 0 : sidx * So);
-      const uint16_t* s = c + (base + first + ta - p0) * kN;
-      scatter_channels(
-          s, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W + x0 + ta,
-          std::size_t(H) * W, int(tb - ta), cout_valid);
+#pragma omp parallel num_threads(g_pack_threads)
+  {
+    double local[2 * kN] = {};
+#pragma omp for collapse(2) schedule(static)
+    for (int vb = v0; vb < v1; ++vb) {
+      for (int y = 0; y < H; ++y) {
+        const int b = vb / S, sidx = vb % S;
+        const long base = long(std::size_t(vb) * (H + 2) + y) * wp;
+        const long first = S == 1 ? 0 : 1;           // grid offset of output column 0
+        const int cols = S == 1 ? W : (W - sidx * So < So ? W - sidx * So : So);
+        const long ta = p0 - (base + first) > 0 ? p0 - (base + first) : 0;
+        const long tb = p1 - (base + first) < cols ? p1 - (base + first) : cols;
+        if (tb <= ta) continue;
+        const int x0 = (S == 1 ? 0 : sidx * So);
+        const uint16_t* s = c + (base + first + ta - p0) * kN;
+        if (sum) accumulate_channel_stats(s, tb - ta, cout_valid, local, local + kN);
+        if (dst)
+          scatter_channels(
+              s, dst + ((std::size_t(b) * C_total + c_start) * H + y) * W + x0 + ta,
+              std::size_t(H) * W, int(tb - ta), cout_valid);
+      }
+    }
+    if (sum) {
+#pragma omp critical(xdna_unpack_stats)
+      for (int n = 0; n < cout_valid; ++n) {
+        sum[n] += local[n];
+        sumsq[n] += local[kN + n];
+      }
     }
   }
+}
+
+void xdna_conv3x3w_unpack_output_strips_range_bf16(
+    const uint16_t* c, uint16_t* dst, int B, int H, int W, int S, int So, int cout_valid,
+    int C_total, int c_start, int p0, int p1) {
+  xdna_conv3x3w_unpack_output_strips_range_stats_bf16(
+      c, dst, B, H, W, S, So, cout_valid, C_total, c_start, p0, p1, nullptr, nullptr);
+}
+
+void xdna_rows_act_backward_bf16(
+    const XdnaRowsGeom* g, const uint16_t* dy, const uint16_t* x, uint16_t* dx,
+    const float* scale, const float* shift, int mode, float slope) {
+  for_valid_rows(*g, [&](long row, int, int, int, int cols) {
+    for (int nb = 0; nb * kN < g->C; ++nb) {
+      const int nv = g->C - nb * kN < kN ? g->C - nb * kN : kN;
+      const std::size_t off = std::size_t(nb) * g->block_stride + std::size_t(row) * kN;
+      for (int t = 0; t < cols; ++t)
+        act_backward_span(dy + off + t * kN, x + off + t * kN, dx + off + t * kN, nv,
+                          scale ? scale + nb * kN : nullptr, shift ? shift + nb * kN : nullptr,
+                          mode, slope);
+    }
+  });
+}
+
+void xdna_rows_bn_backward_bf16(
+    const XdnaRowsGeom* g, const uint16_t* dy, const uint16_t* x, uint16_t* dx,
+    const float* mean, const float* invstd, const float* w, float* dgamma, float* dbeta) {
+  const int C = g->C;
+  std::vector<double> sum(C, 0.0), dotp(C, 0.0);
+  const int Bv = g->B * g->S;
+#pragma omp parallel num_threads(g_pack_threads)
+  {
+    std::vector<double> ls(C, 0.0), ld(C, 0.0);
+#pragma omp for collapse(2) schedule(static)
+    for (int vb = 0; vb < Bv; ++vb) {
+      for (int y = 0; y < g->H; ++y) {
+        const int sidx = vb % g->S;
+        const long row = long(std::size_t(vb) * (g->H + 2) + y) * g->wp + (g->S == 1 ? 0 : 1);
+        const int cols = g->S == 1 ? g->W : (g->W - sidx * g->So < g->So ? g->W - sidx * g->So : g->So);
+        for (int nb = 0; nb * kN < C; ++nb) {
+          const int nv = C - nb * kN < kN ? C - nb * kN : kN;
+          const std::size_t off = std::size_t(nb) * g->block_stride + std::size_t(row) * kN;
+          for (int t = 0; t < cols; ++t)
+            bn_backward_sums_span(dy + off + t * kN, x + off + t * kN, nv, mean + nb * kN,
+                                  ls.data() + nb * kN, ld.data() + nb * kN);
+        }
+      }
+    }
+#pragma omp critical(xdna_rows_bn_backward)
+    for (int c = 0; c < C; ++c) {
+      sum[c] += ls[c];
+      dotp[c] += ld[c];
+    }
+  }
+  const double n = double(g->B) * g->H * g->W;
+  std::vector<float> k(C), grad_mean(C), ones(C, 1.0f);
+  for (int c = 0; c < C; ++c) {
+    const float fs = float(sum[c]), fd = float(dotp[c]);
+    k[c] = float(fd * invstd[c] * invstd[c] / float(n));
+    grad_mean[c] = float(fs / float(n));
+    if (dgamma) dgamma[c] = fd * invstd[c];
+    if (dbeta) dbeta[c] = fs;
+  }
+  if (!dx) return;
+  const float* wv = w ? w : ones.data();
+  for_valid_rows(*g, [&](long row, int, int, int, int cols) {
+    for (int nb = 0; nb * kN < C; ++nb) {
+      const int nv = C - nb * kN < kN ? C - nb * kN : kN;
+      const std::size_t off = std::size_t(nb) * g->block_stride + std::size_t(row) * kN;
+      for (int t = 0; t < cols; ++t)
+        bn_backward_dx_span(dy + off + t * kN, x + off + t * kN, dx + off + t * kN, nv,
+                            mean + nb * kN, k.data() + nb * kN, grad_mean.data() + nb * kN,
+                            invstd + nb * kN, wv + nb * kN);
+    }
+  });
+}
+
+void xdna_rows_add_bf16(
+    const XdnaRowsGeom* g, const uint16_t* a, const float* a_scale, const float* a_shift,
+    int a_act, float a_slope, const uint16_t* b, const float* b_scale, const float* b_shift,
+    int b_act, float b_slope, uint16_t* out) {
+  const Pointwise pa{a_scale, a_shift, a_act, a_slope};
+  const Pointwise pb{b_scale, b_shift, b_act, b_slope};
+  for_valid_rows(*g, [&](long row, int, int, int, int cols) {
+    uint16_t ta[kN], tb[kN];
+    for (int nb = 0; nb * kN < g->C; ++nb) {
+      const int nv = g->C - nb * kN < kN ? g->C - nb * kN : kN;
+      const std::size_t off = std::size_t(nb) * g->block_stride + std::size_t(row) * kN;
+      for (int t = 0; t < cols; ++t) {
+        const uint16_t* va = a + off + t * kN;
+        const uint16_t* vb = b + off + t * kN;
+        if (pa.scale || pa.act) { apply_pointwise(va, ta, nv, pa, nb * kN, 1); va = ta; }
+        if (pb.scale || pb.act) { apply_pointwise(vb, tb, nv, pb, nb * kN, 1); vb = tb; }
+        add_bf16_span(va, vb, out + off + t * kN, nv);
+      }
+    }
+  });
+}
+
+void xdna_rows_upsample2x_backward_bf16(
+    const XdnaRowsGeom* gb, const uint16_t* go, const XdnaRowsGeom* gs, uint16_t* gi) {
+  for_valid_rows(*gs, [&](long row, int b, int y, int x0, int cols) {
+    for (int t = 0; t < cols; ++t) {
+      const int x = x0 + t;
+      const std::size_t r00 = row_of(*gb, b, 2 * y, 2 * x), r01 = row_of(*gb, b, 2 * y, 2 * x + 1);
+      const std::size_t r10 = row_of(*gb, b, 2 * y + 1, 2 * x);
+      const std::size_t r11 = row_of(*gb, b, 2 * y + 1, 2 * x + 1);
+      for (int nb = 0; nb * kN < gs->C; ++nb) {
+        const int nv = gs->C - nb * kN < kN ? gs->C - nb * kN : kN;
+        const uint16_t* src = go + std::size_t(nb) * gb->block_stride;
+        sum4_span(src + r00 * kN, src + r01 * kN, src + r10 * kN, src + r11 * kN,
+                  gi + std::size_t(nb) * gs->block_stride + (std::size_t(row) + t) * kN, nv);
+      }
+    }
+  });
 }
 
 }  // extern "C"

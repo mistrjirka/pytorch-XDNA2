@@ -33,7 +33,8 @@ def build_native():
         _NATIVE / "conv_pack.cpp",
         _NATIVE / "region_kernels.cpp",
     ]
-    hash_inputs = sources + [_SHIM / "xrt_shim.cpp", _SHIM / "xrt_shim.h", Path(__file__)]
+    hash_inputs = sources + [_NATIVE / "conv_pack.h", _SHIM / "xrt_shim.cpp", _SHIM / "xrt_shim.h",
+                            Path(__file__)]
     xrt_include, xrt_lib = find_xrt_paths()
     if xrt_include is None or xrt_lib is None:
         raise RuntimeError("XRT development headers/libraries are missing. Run torch-xdna2-doctor; see docs/system-dependencies.md.")
