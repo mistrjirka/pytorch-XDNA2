@@ -342,6 +342,73 @@ inline void scatter_channels(const uint16_t* s, uint16_t* d, std::size_t dstride
   for (; x < nx; ++x)
     for (int n = 0; n < nv; ++n) d[std::size_t(n) * dstride + x] = s[std::size_t(x) * kN + n];
 }
+
+// Branch-free so the loops below vectorize (`omp simd`): these run on every
+// element of a lazy value, as often as ATen's own vectorized loops would.
+inline float bf16_to_f32(uint16_t v) { return __builtin_bit_cast(float, uint32_t(v) << 16); }
+
+// Round to nearest even, NaN -> canonical quiet NaN (c10::BFloat16's rounding).
+inline uint16_t f32_to_bf16(float f) {
+  const uint32_t u = __builtin_bit_cast(uint32_t, f);
+  const uint32_t r = (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+  const uint32_t nan = 0u - uint32_t((u & 0x7fffffffu) > 0x7f800000u);  // all ones for NaN
+  return uint16_t((r & ~nan) | (0x7fc0u & nan));
+}
+
+// ATen's CPU leaky_relu for bf16: in fp32, x > 0 ? x : x * slope (NaN stays NaN).
+// Written as a multiply by a selected factor, which is the same for every x.
+// The factor is a bit blend, not a branch, so the loops vectorize.
+inline float leaky_factor(float x, float slope) {
+  const uint32_t m = 0u - uint32_t(x > 0.f);
+  return __builtin_bit_cast(float, (0x3f800000u & m) | (__builtin_bit_cast(uint32_t, slope) & ~m));
+}
+inline float leaky(float x, float slope) { return x * leaky_factor(x, slope); }
+
+// A lazy per-channel pointwise value, y = act(x * scale + shift).  The pack,
+// the materialize kernel and the LeakyReLU backward share pointwise_one, so
+// every consumer of a lazy value sees the same bytes.
+struct Pointwise {
+  const float* scale;  // per channel, nullptr: no affine
+  const float* shift;
+  int act;             // LeakyReLU (slope 0 is ReLU)
+  float slope;
+};
+
+template <bool Affine, bool Act>
+inline uint16_t pointwise_one(uint16_t v, float scale, float shift, float slope) {
+  float x = bf16_to_f32(v);
+  // Eager BatchNorm writes a bf16 tensor before the activation reads it, so
+  // round between the two steps to match it.
+  if constexpr (Affine) x = bf16_to_f32(f32_to_bf16(x * scale + shift));
+  if constexpr (Act) x = leaky(x, slope);
+  return f32_to_bf16(x);
+}
+
+// v[i] = value of v[i] in channel c0 + i * cstep (cstep 1: a pixel's channels,
+// 0: one channel's plane), i < n.  src may equal dst.
+template <bool Affine, bool Act>
+inline void pointwise_span(const uint16_t* src, uint16_t* dst, long n, const Pointwise& pw, int c0,
+                           int cstep) {
+  if (cstep == 0) {
+    const float sc = Affine ? pw.scale[c0] : 0.f, sh = Affine ? pw.shift[c0] : 0.f;
+#pragma omp simd
+    for (long i = 0; i < n; ++i) dst[i] = pointwise_one<Affine, Act>(src[i], sc, sh, pw.slope);
+  } else {
+    const float* sc = Affine ? pw.scale + c0 : nullptr;
+    const float* sh = Affine ? pw.shift + c0 : nullptr;
+#pragma omp simd
+    for (long i = 0; i < n; ++i)
+      dst[i] = pointwise_one<Affine, Act>(src[i], Affine ? sc[i] : 0.f, Affine ? sh[i] : 0.f, pw.slope);
+  }
+}
+
+inline void apply_pointwise(const uint16_t* src, uint16_t* dst, long n, const Pointwise& pw, int c0,
+                            int cstep) {
+  if (pw.scale && pw.act) pointwise_span<true, true>(src, dst, n, pw, c0, cstep);
+  else if (pw.scale) pointwise_span<true, false>(src, dst, n, pw, c0, cstep);
+  else if (pw.act) pointwise_span<false, true>(src, dst, n, pw, c0, cstep);
+  else if (src != dst) std::memcpy(dst, src, std::size_t(n) * sizeof(uint16_t));
+}
 }  // namespace
 
 extern "C" {
@@ -628,8 +695,10 @@ void xdna_conv3x3w_unpack_output_range_bf16(
 // Groups [g0, g0+ng) of the packed input of the strip layout (see
 // xdna_conv3x3w_pack_input_range_bf16 for the buffer contract).  halo_zero
 // writes zeros in the two halo data columns instead of the neighbours (the
-// layout dY needs for the weight gradient).
-void xdna_conv3x3w_pack_input_strips_range_bf16(
+// layout dY needs for the weight gradient).  scale/shift/act/slope apply a lazy
+// pointwise value (see Pointwise) to every real pixel while packing it; the
+// zero padding stays zero.
+void xdna_conv3x3w_pack_input_strips_range_pw_bf16(
     const uint16_t* src,
     uint16_t* dst,
     int B,
@@ -641,7 +710,13 @@ void xdna_conv3x3w_pack_input_strips_range_bf16(
     int halo_zero,
     int chunks,
     int g0,
-    int ng) {
+    int ng,
+    const float* scale,
+    const float* shift,
+    int act,
+    float slope) {
+  const Pointwise pw{scale, shift, act, slope};
+  const bool transform = scale != nullptr || act != 0;
   const int Wg = S == 1 ? W : So + 2;
   const int wp = Wg + 2;
   const int Bv = B * S;
@@ -675,6 +750,9 @@ void xdna_conv3x3w_pack_input_strips_range_bf16(
           const int nx = jb - xb < 8 ? jb - xb : 8;
           uint16_t tile[8][kKStep];
           gather_pixels(s + xb, std::size_t(H) * W, cc, nx, tile);
+          if (transform)
+            for (int xi = 0; xi < nx; ++xi)
+              apply_pointwise(tile[xi], tile[xi], cc, pw, chunk * kKStep, 1);
           for (int xi = 0; xi < nx; ++xi) {
             const int j = xb + xi;
             if (halo_zero && S > 1 && (j == 0 || j == Wg - 1))
@@ -697,6 +775,47 @@ void xdna_conv3x3w_pack_input_strips_range_bf16(
       }
     }
   }
+}
+
+void xdna_conv3x3w_pack_input_strips_range_bf16(
+    const uint16_t* src, uint16_t* dst, int B, int C, int H, int W, int S, int So,
+    int halo_zero, int chunks, int g0, int ng) {
+  xdna_conv3x3w_pack_input_strips_range_pw_bf16(
+      src, dst, B, C, H, W, S, So, halo_zero, chunks, g0, ng, nullptr, nullptr, 0, 0.f);
+}
+
+// dst = the lazy pointwise value of src (both contiguous NCHW bf16), with the
+// same math as the pack above.
+void xdna_pointwise_channel_bf16(
+    const uint16_t* src, uint16_t* dst, int B, int C, long HW,
+    const float* scale, const float* shift, int act, float slope) {
+  const Pointwise pw{scale, shift, act, slope};
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int b = 0; b < B; ++b)
+    for (int c = 0; c < C; ++c) {
+      const std::size_t off = (std::size_t(b) * C + c) * std::size_t(HW);
+      apply_pointwise(src + off, dst + off, HW, pw, c, 0);
+    }
+}
+
+// dx = leaky_relu_backward(dy, z) where z is the lazy affine value of src (no
+// activation), computed as the pack computes it, so z is never written.  All
+// contiguous NCHW bf16.  ATen: in fp32, z > 0 ? dy : dy * slope.
+void xdna_leaky_backward_pw_bf16(
+    const uint16_t* dy, const uint16_t* src, uint16_t* dx, int B, int C, long HW,
+    const float* scale, const float* shift, float slope) {
+#pragma omp parallel for num_threads(g_pack_threads) collapse(2) schedule(static)
+  for (int b = 0; b < B; ++b)
+    for (int c = 0; c < C; ++c) {
+      const std::size_t off = (std::size_t(b) * C + c) * std::size_t(HW);
+      const float sc = scale[c], sh = shift[c];
+#pragma omp simd
+      for (long i = 0; i < HW; ++i) {
+        const float z = bf16_to_f32(pointwise_one<true, false>(src[off + i], sc, sh, 0.f));
+        const float g = bf16_to_f32(dy[off + i]);
+        dx[off + i] = f32_to_bf16(g * leaky_factor(z, slope));
+      }
+    }
 }
 
 // Rows [p0, p1) of the strip layout's output (rows of 128 channels, `c`

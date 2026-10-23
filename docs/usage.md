@@ -258,6 +258,21 @@ per 40-step window). `XDNA_REGIONS=0` disables them.
 A fused model can be `copy.deepcopy`'d (copy a paired norm and activation together) and its `state_dict` is
 unchanged; `torch.save(model)` of the whole object is not supported. The regions are once-differentiable.
 
+## Lazy pointwise values
+
+Automatic, no model change. On contiguous NCHW bf16 tensors, `leaky_relu` (ReLU is slope 0) and training
+`BatchNorm2d` return a tensor whose bytes are not written yet. A following NPU 3x3 conv applies the
+per-channel `act(x * scale + shift)` while it packs its input, its NPU weight gradient does the same, and
+`leaky_relu_backward` takes its mask from the BatchNorm input. Any other reader (print, `.cpu()`, a CPU op, a
+view, an in-place write) writes the bytes first, so results never depend on who reads. Results equal the eager
+XDNA path bit for bit, except the BatchNorm running variance (within one bf16 step, eval mode only).
+
+- `XDNA_LAZY_POINTWISE=0` computes these ops eagerly.
+- Writing the input of a lazy value without reading it first (e.g. an `out=` op on a BatchNorm output that a
+  LeakyReLU already used) raises an error instead of returning stale data.
+- `xdna_train.allocator_stats()` counts `lazy_created`, `lazy_consumed` (applied by a consumer) and
+  `lazy_materialized` (written because something else read it).
+
 ## Deferred gradients and timing
 
 NPU convolution weight gradients can be returned before their computation runs.

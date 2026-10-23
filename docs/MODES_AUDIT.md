@@ -79,6 +79,7 @@ workloads listed in section 4; "default" means default env, warm conv3x3w stream
 | `XDNA_CONV3X3W_NPU_OVERHEAD_MS`, `_NPU_GMACS`, `_HOST_GBS`, `_CPU_GMACS`, `_MARGIN` | 0.5, 5.5, 20, 0.9, 0.8 | cost-model constants | cpp:2313-2326 | tuning | log (cost model rows), `run_conv3x3w_costmodel.py` | KEEP | kept |
 | `XDNA_CONV3X3W_PIECES` | auto (1/2/4) | pipelined piece count | cpp:2484 | tuning | log: pipelined dispatch 147 -> 129 ms | KEEP-BUT-DOCUMENT | kept |
 | `XDNA_CONV3X3W_TRACE` | 0 | per-conv trace | cpp:2527,2913 | debug | log | KEEP | kept |
+| `XDNA_LAZY_POINTWISE` | 1 | `0` computes `leaky_relu` and training `BatchNorm2d` eagerly instead of as lazy values the conv3x3w pack applies | cpp `lazy_pointwise_enabled` | core/debug | `tests/run_lazy_pointwise.py` (bit-equal to eager); docs/usage.md | KEEP | new |
 | `XDNA_CONV3X3W_WEIGHT_CACHE` | 1 | `0` disables the weight cache | cpp:2413 | debug | `tests/run_conv3x3w_torch.py` | KEEP | kept |
 | `XDNA_ENABLE_PATCH_CONV` | 1 | register the patch conv family | device.py:207 | dead at default | see family table | REMOVE | removed |
 | `XDNA_PATCH_CONV_ARTIFACT_DIR` | bundled | alternative artifact dir | device.py:202 | dead | -- | REMOVE | removed |

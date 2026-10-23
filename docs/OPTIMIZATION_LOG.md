@@ -70,6 +70,8 @@ upsample, mul) ~25-30 ms. Profile is flat; remaining wins are each 1-3 %.
 
 ## Open items
 
+- Fusion stages after lazy pointwise values: see `docs/fusion-analysis.md`.
+
 - Older NPU conv families still write outputs into recycled allocator memory (same coherency bug risk).
 - `w.data.add_` does not bump the version counter (weight cache may go stale; optimizers are fine).
 - Global `set_swap_module_params_on_conversion(True)` breaks LSTM `load_state_dict`; LSTM cell unoptimized (0.29x in model zoo).

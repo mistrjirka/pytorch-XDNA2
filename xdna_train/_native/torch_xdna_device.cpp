@@ -85,6 +85,9 @@ extern "C" void xdna_region_relu_bwd_bf16(
 extern "C" void xdna_region_bn_fwd_bf16(
     const uint16_t*, const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, uint16_t*, float*,
     float*, int64_t, int64_t, int64_t, float, float, float, int, int);
+extern "C" void xdna_region_bn_stats_bf16(
+    const uint16_t*, uint16_t*, uint16_t*, float*, float*, float*, int64_t, int64_t, int64_t,
+    float, float, int, int);
 extern "C" void xdna_region_bn_bwd_bf16(
     const uint16_t*, const uint16_t*, const uint16_t*, const uint16_t*, const float*, const float*,
     uint16_t*, uint16_t*, uint16_t*, int64_t, int64_t, int64_t, float, int, int);
@@ -122,6 +125,14 @@ extern "C" void xdna_conv3x3w_unpack_output_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int);
 extern "C" void xdna_conv3x3w_pack_input_strips_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
+extern "C" void xdna_conv3x3w_pack_input_strips_range_pw_bf16(
+    const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int,
+    const float*, const float*, int, float);
+extern "C" void xdna_pointwise_channel_bf16(
+    const uint16_t*, uint16_t*, int, int, long, const float*, const float*, int, float);
+extern "C" void xdna_leaky_backward_pw_bf16(
+    const uint16_t*, const uint16_t*, uint16_t*, int, int, long, const float*, const float*,
+    float);
 extern "C" void xdna_conv3x3w_unpack_output_strips_range_bf16(
     const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int, int, int);
 extern "C" int shim_dispatch_poisoned(void);
@@ -481,6 +492,25 @@ void async_dw_maybe_kick() {
   if (k > 0 && policy.epoch_dx.load() >= k) DeferredJobLauncher::instance().kick();
 }
 
+// A lazy value (XDNA_LAZY_POINTWISE): y = act(source * scale + shift) per
+// channel, not written yet.  A consumer that reads every element anyway (the
+// conv3x3w pack) applies it while reading the source; any other access writes
+// the bytes first (materialize_virtual).  Only for contiguous NCHW bf16.
+struct XdnaVirtualValue {
+  at::Tensor source;            // contiguous NCHW bf16, never lazy itself
+  uint64_t source_epoch = 0;    // write_epoch of source when recorded
+  std::vector<float> scale, shift;  // per channel, empty: no affine
+  bool act = false;             // LeakyReLU with `slope` (0: ReLU)
+  float slope = 0.f;
+  // The producer's view, so it can be materialized from the storage alone (an
+  // alias with other sizes, a storage resize, a dependent of another storage).
+  std::vector<int64_t> sizes, strides;
+  int64_t storage_offset = 0;
+  caffe2::TypeMeta dtype;
+};
+
+std::atomic<uint64_t> g_lazy_created{0}, g_lazy_consumed{0}, g_lazy_materialized{0};
+
 struct XdnaAllocation {
   uint64_t magic = kXdnaAllocationMagic;
   ShimBo* bo = nullptr;
@@ -502,6 +532,13 @@ struct XdnaAllocation {
   std::mutex packed_mutex;
   std::shared_ptr<void> packed;
   std::array<int64_t, 12> packed_tag{};
+
+  // This storage's own lazy value, and the storages whose lazy values read
+  // this one.  Any access to this storage materializes those dependents first:
+  // a write would change their input.  Both guarded by virtual_mutex.
+  std::mutex virtual_mutex;
+  std::shared_ptr<XdnaVirtualValue> virtual_value;
+  std::vector<c10::weak_intrusive_ptr<c10::StorageImpl>> dependents;
 };
 
 ShimDevice* xdna_device() {
@@ -576,11 +613,8 @@ void set_pending_host_write(
   ++allocation->write_epoch;
 }
 
-void ensure_host_current(const at::Tensor& tensor) {
-  if (!tensor.defined() || tensor.device().type() != kXdnaType) {
-    return;
-  }
-  auto* allocation = allocation_from_tensor(tensor);
+// Coherency only: the finished bytes of `allocation`, current for the CPU.
+void sync_host(XdnaAllocation* allocation) {
   wait_pending_host_write(allocation);
   if (allocation->coherency == XdnaCoherency::DeviceDirty) {
     TORCH_CHECK(
@@ -591,11 +625,132 @@ void ensure_host_current(const at::Tensor& tensor) {
   }
 }
 
+XdnaAllocation* xdna_allocation_of(c10::StorageImpl* storage);
+
+bool lazy_pointwise_enabled() {
+  static const bool on = [] {
+    const char* raw = std::getenv("XDNA_LAZY_POINTWISE");
+    return raw == nullptr || raw[0] == 0 || std::strcmp(raw, "0") != 0;
+  }();
+  return on;
+}
+
+std::shared_ptr<XdnaVirtualValue> virtual_value_of(const at::Tensor& tensor) {
+  if (!tensor.defined() || tensor.device().type() != kXdnaType) return nullptr;
+  auto* allocation = allocation_from_tensor(tensor);
+  std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
+  return allocation->virtual_value;
+}
+
+// The lazy value of `tensor` when `tensor` is exactly the view it was created
+// with, so a consumer can read value->source in its place.
+std::shared_ptr<XdnaVirtualValue> consumable_value_of(const at::Tensor& tensor) {
+  auto value = virtual_value_of(tensor);
+  if (!value || tensor.sizes() != c10::IntArrayRef(value->sizes) ||
+      tensor.strides() != c10::IntArrayRef(value->strides) ||
+      tensor.storage_offset() != value->storage_offset) {
+    return nullptr;
+  }
+  auto* src = allocation_from_tensor(value->source);
+  TORCH_CHECK(src->write_epoch.load() == value->source_epoch,
+              "XDNA: the input of a lazy value was modified after the value was created "
+              "(set XDNA_LAZY_POINTWISE=0 to compute such ops eagerly)");
+  sync_host(src);
+  return value;
+}
+
+void set_virtual_value(const at::Tensor& tensor, std::shared_ptr<XdnaVirtualValue> value) {
+  auto* allocation = allocation_from_tensor(tensor);
+  value->sizes.assign(tensor.sizes().begin(), tensor.sizes().end());
+  value->strides.assign(tensor.strides().begin(), tensor.strides().end());
+  value->storage_offset = tensor.storage_offset();
+  value->dtype = tensor.dtype();
+  auto* src = allocation_from_tensor(value->source);
+  value->source_epoch = src->write_epoch.load();
+  {
+    std::lock_guard<std::mutex> guard(src->virtual_mutex);
+    auto& deps = src->dependents;
+    deps.erase(std::remove_if(deps.begin(), deps.end(),
+                              [](const auto& w) { return w.expired(); }),
+               deps.end());
+    deps.push_back(tensor.storage().getWeakStorageImpl());
+  }
+  // Keep the coherency state: a recycled buffer may hold CPU-dirty lines, and
+  // if this value is dropped unread the buffer must return to the cache dirty.
+  std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
+  allocation->virtual_value = std::move(value);
+  g_lazy_created.fetch_add(1, std::memory_order_relaxed);
+}
+
+void clear_virtual_value(XdnaAllocation* allocation) {
+  std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
+  allocation->virtual_value.reset();
+}
+
+// Writes the lazy value of `storage`, if any, through the producer's recorded
+// view: the access that triggers it may come through any alias of the storage.
+void materialize_virtual(c10::StorageImpl* storage, XdnaAllocation* allocation) {
+  std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
+  auto value = allocation->virtual_value;
+  if (!value) return;
+  auto* src = allocation_from_tensor(value->source);
+  TORCH_CHECK(src->write_epoch.load() == value->source_epoch,
+              "XDNA: the input of a lazy value was modified after the value was created "
+              "(set XDNA_LAZY_POINTWISE=0 to compute such ops eagerly)");
+  sync_host(src);
+  auto impl = c10::make_intrusive<c10::TensorImpl>(
+      c10::TensorImpl::VIEW,
+      c10::Storage(c10::intrusive_ptr<c10::StorageImpl>::reclaim_copy(storage)),
+      c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), value->dtype);
+  impl->set_sizes_and_strides(value->sizes, value->strides);
+  impl->set_storage_offset(value->storage_offset);
+  auto out = at::Tensor(std::move(impl));
+  const auto& x = value->source;
+  xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+  xdna_pointwise_channel_bf16(
+      static_cast<const uint16_t*>(x.const_data_ptr()),
+      static_cast<uint16_t*>(out.mutable_data_ptr()),
+      int(x.size(0)), int(x.size(1)), long(x.size(2) * x.size(3)),
+      value->scale.empty() ? nullptr : value->scale.data(),
+      value->shift.empty() ? nullptr : value->shift.data(),
+      value->act ? 1 : 0, value->slope);
+  allocation->virtual_value.reset();
+  allocation->coherency = XdnaCoherency::HostDirty;
+  g_lazy_materialized.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Before any access to `allocation`: materialize the lazy values that read it.
+void materialize_dependents(XdnaAllocation* allocation) {
+  std::vector<c10::weak_intrusive_ptr<c10::StorageImpl>> deps;
+  {
+    std::lock_guard<std::mutex> guard(allocation->virtual_mutex);
+    if (allocation->dependents.empty()) return;
+    deps.swap(allocation->dependents);
+  }
+  for (auto& weak : deps) {
+    auto storage = weak.lock();
+    if (!storage) continue;
+    if (auto* dep = xdna_allocation_of(storage.get())) materialize_virtual(storage.get(), dep);
+  }
+}
+
+void ensure_host_current(const at::Tensor& tensor) {
+  if (!tensor.defined() || tensor.device().type() != kXdnaType) {
+    return;
+  }
+  auto* allocation = allocation_from_tensor(tensor);
+  materialize_dependents(allocation);
+  materialize_virtual(tensor.storage().unsafeGetStorageImpl(), allocation);
+  sync_host(allocation);
+}
+
 void ensure_device_current(const at::Tensor& tensor) {
   if (!tensor.defined() || tensor.device().type() != kXdnaType) {
     return;
   }
   auto* allocation = allocation_from_tensor(tensor);
+  materialize_dependents(allocation);
+  materialize_virtual(tensor.storage().unsafeGetStorageImpl(), allocation);
   wait_pending_host_write(allocation);
   if (allocation->coherency == XdnaCoherency::HostDirty) {
     TORCH_CHECK(
@@ -616,6 +771,7 @@ void prepare_npu_output(const at::Tensor& tensor) {
 void mark_host_dirty(const at::Tensor& tensor) {
   if (tensor.defined() && tensor.device().type() == kXdnaType) {
     auto* allocation = allocation_from_tensor(tensor);
+    clear_virtual_value(allocation);
     allocation->coherency = XdnaCoherency::HostDirty;
     ++allocation->write_epoch;
   }
@@ -624,6 +780,7 @@ void mark_host_dirty(const at::Tensor& tensor) {
 void mark_device_dirty(const at::Tensor& tensor) {
   if (tensor.defined() && tensor.device().type() == kXdnaType) {
     auto* allocation = allocation_from_tensor(tensor);
+    clear_virtual_value(allocation);
     allocation->coherency = XdnaCoherency::DeviceDirty;
     ++allocation->write_epoch;
   }
@@ -714,6 +871,13 @@ struct XdnaAllocator final : c10::Allocator {
 };
 
 XdnaAllocator g_xdna_allocator;
+
+XdnaAllocation* xdna_allocation_of(c10::StorageImpl* storage) {
+  if (storage == nullptr || storage->data_ptr().get_deleter() != &XdnaAllocator::deleter)
+    return nullptr;
+  auto* a = static_cast<XdnaAllocation*>(storage->data_ptr().get_context());
+  return a != nullptr && a->magic == kXdnaAllocationMagic ? a : nullptr;
+}
 
 // Output adoption for host compute.
 //
@@ -938,9 +1102,11 @@ void resize_xdna_storage(c10::StorageImpl* storage, size_t newsize) {
   if (oldsize != 0 && storage->data() != nullptr) {
     // Move the finished bytes: a deferred dW or a device write may still be
     // outstanding for the old allocation, and it is released right below.
-    auto* old = static_cast<XdnaAllocation*>(storage->data_ptr().get_context());
-    if (storage->data_ptr().get_deleter() == &XdnaAllocator::deleter &&
-        old != nullptr && old->magic == kXdnaAllocationMagic) {
+    if (auto* old = xdna_allocation_of(storage)) {
+      // The copy below must see a lazy value's bytes, and lazy values reading
+      // this storage must be written before it moves.
+      materialize_dependents(old);
+      materialize_virtual(storage, old);
       wait_pending_host_write(old);
       if (old->coherency == XdnaCoherency::DeviceDirty) {
         TORCH_CHECK(
@@ -1938,8 +2104,9 @@ Conv3x3wStrips conv3x3w_strips(int64_t w) {
 
 // x (host NCHW bf16, contiguous) -> buf, then sync to the device.  halo_zero:
 // zero halo columns (dY for the weight gradient) when the image is tiled.
+// pw: a lazy value to apply while packing (x_cpu is then its source).
 void pack_conv3x3w_input(Conv3x3wPacked& buf, const at::Tensor& x_cpu, int64_t chunks,
-                         bool halo_zero = false) {
+                         bool halo_zero = false, const XdnaVirtualValue* pw = nullptr) {
   const std::array<int64_t, 5> shape = {
       x_cpu.size(0), x_cpu.size(1), x_cpu.size(2), x_cpu.size(3), chunks};
   if (buf.shape != shape) {
@@ -1948,11 +2115,14 @@ void pack_conv3x3w_input(Conv3x3wPacked& buf, const at::Tensor& x_cpu, int64_t c
   }
   const auto g = conv3x3w_strips(shape[3]);
   const int64_t groups = (shape[0] * g.s * (shape[2] + 2) * (g.wg + 2) + 2047) / 2048;
-  xdna_conv3x3w_pack_input_strips_range_bf16(
+  xdna_conv3x3w_pack_input_strips_range_pw_bf16(
       static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
       static_cast<uint16_t*>(buf.ptr),
       int(shape[0]), int(shape[1]), int(shape[2]), int(shape[3]), int(g.s), int(g.so),
-      halo_zero ? 1 : 0, int(chunks), 0, int(groups));
+      halo_zero ? 1 : 0, int(chunks), 0, int(groups),
+      pw && !pw->scale.empty() ? pw->scale.data() : nullptr,
+      pw && !pw->shift.empty() ? pw->shift.data() : nullptr,
+      pw && pw->act ? 1 : 0, pw ? pw->slope : 0.f);
   TORCH_CHECK(shim_bo_sync_to_device(buf.bo) == 0,
               "failed to sync conv3x3w input: ", shim_last_error());
 }
@@ -2330,20 +2500,33 @@ struct XdnaConv3x3wRuntime {
     }();
     const auto trace_t0 = std::chrono::steady_clock::now();
     double trace_wait_ms = 0.0, trace_pack_ms = 0.0, trace_unpack_ms = 0.0, trace_sync_ms = 0.0;
+    double trace_psync_ms = 0.0;  // part of pack: cache flush of the packed input
     auto now_ms = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     struct TraceOut {
       bool on; const char* phase; const Conv3x3wPlan& p; std::chrono::steady_clock::time_point t0; double& wait;
-      double& pack; double& unpack; double& sync;
+      double& pack; double& unpack; double& sync; double& psync;
       ~TraceOut() {
         if (!on) return;
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr, "TRACE %s B%ld %ldx%ld cin%ld cout%ld groups%ld total %.3f wait %.3f pack %.3f unpack %.3f sync %.3f ms\n",
-                     phase, long(p.batch), long(p.h), long(p.w), long(p.cin), long(p.cout), long(p.groups), ms, wait, pack, unpack, sync);
+        std::fprintf(stderr, "TRACE %s B%ld %ldx%ld cin%ld cout%ld groups%ld total %.3f wait %.3f pack %.3f unpack %.3f sync %.3f psync %.3f ms\n",
+                     phase, long(p.batch), long(p.h), long(p.w), long(p.cin), long(p.cout), long(p.groups), ms, wait, pack, unpack, sync, psync);
       }
-    } trace_out{trace, phase, p, trace_t0, trace_wait_ms, trace_pack_ms, trace_unpack_ms, trace_sync_ms};
-    ensure_host_current(x);
-    auto x_cpu = cpu_alias(x);
-    if (!x_cpu.is_contiguous()) x_cpu = x_cpu.contiguous();
+    } trace_out{trace, phase, p, trace_t0, trace_wait_ms, trace_pack_ms, trace_unpack_ms, trace_sync_ms, trace_psync_ms};
+    // A lazy input is packed from its source with the pointwise value applied:
+    // its own bytes are never written unless something else reads them.
+    const auto lazy = consumable_value_of(x);
+    at::Tensor x_cpu;
+    if (lazy) {
+      x_cpu = cpu_alias_unchecked(lazy->source);
+      g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      x_cpu = cpu_alias(x);
+      if (!x_cpu.is_contiguous()) x_cpu = x_cpu.contiguous();
+    }
+    const float* pw_scale = lazy && !lazy->scale.empty() ? lazy->scale.data() : nullptr;
+    const float* pw_shift = lazy && !lazy->shift.empty() ? lazy->shift.data() : nullptr;
+    const int pw_act = lazy && lazy->act ? 1 : 0;
+    const float pw_slope = lazy ? lazy->slope : 0.f;
     auto out = empty_memory_format(
         {c10::SymInt(p.batch), c10::SymInt(p.cout), c10::SymInt(p.h), c10::SymInt(p.w)},
         at::ScalarType::BFloat16, at::Layout::Strided, c10::Device(kXdnaType, 0),
@@ -2374,13 +2557,15 @@ struct XdnaConv3x3wRuntime {
     auto pack_piece = [&](const Conv3x3wPiece& pc) {
       ScopedMappedCpu pack_phase("npu_conv3x3w.pack");
       struct Acc { double& d; double t; decltype(now_ms)& f; ~Acc() { d += f() - t; } } acc{trace_pack_ms, now_ms(), now_ms};
-      xdna_conv3x3w_pack_input_strips_range_bf16(
+      xdna_conv3x3w_pack_input_strips_range_pw_bf16(
           static_cast<const uint16_t*>(x_cpu.const_data_ptr()),
           static_cast<uint16_t*>(xin->ptr) + pc.g0 * in_group / 2,
           int(p.batch), int(p.cin), int(p.h), int(p.w), int(p.strips), int(p.strip_out), 0,
-          int(p.chunks), int(pc.g0), int(pc.ng));
+          int(p.chunks), int(pc.g0), int(pc.ng), pw_scale, pw_shift, pw_act, pw_slope);
+      const double ts = now_ms();
       TORCH_CHECK(shim_bo_sync_to_device(xin->sub(pc.g0 * in_group, pc.ng * in_group)) == 0,
                   "failed to sync conv3x3w input: ", shim_last_error());
+      trace_psync_ms += now_ms() - ts;
     };
     if (keep_input) *keep_input = xin;
     std::lock_guard<std::mutex> guard(mutex);
@@ -2668,11 +2853,18 @@ struct XdnaConv3x3wDwRuntime {
                     bool halo_zero) {
       if (buf) return;
       ScopedMappedCpu pack_phase("npu_conv3x3w.dw.pack");
-      ensure_host_current(t);
-      auto t_cpu = cpu_alias(t);
-      if (!t_cpu.is_contiguous()) t_cpu = t_cpu.contiguous();
+      // A lazy X is packed from its source, as the forward pack does.
+      const auto lazy = consumable_value_of(t);
+      at::Tensor t_cpu;
+      if (lazy) {
+        t_cpu = cpu_alias_unchecked(lazy->source);
+        g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        t_cpu = cpu_alias(t);
+        if (!t_cpu.is_contiguous()) t_cpu = t_cpu.contiguous();
+      }
       buf = acquire_packed(static_cast<size_t>(p.groups * chunks * kGroupRows * kKStep * 2));
-      pack_conv3x3w_input(*buf, t_cpu, chunks, halo_zero);
+      pack_conv3x3w_input(*buf, t_cpu, chunks, halo_zero, lazy.get());
     };
     pack(x_buf, input, p.chunks, false);
     pack(d_buf, grad_output, p.cochunks, true);
@@ -3355,6 +3547,30 @@ at::Tensor xdna_empty_like_layout(const at::Tensor& reference) {
 at::Tensor leaky_relu_xdna(
     const at::Tensor& self,
     const at::Scalar& negative_slope) {
+  if (lazy_pointwise_enabled() && self.scalar_type() == at::ScalarType::BFloat16 &&
+      self.dim() == 4 && self.is_contiguous() && self.numel() > 0) {
+    // Lazy: the next conv3x3w applies it while packing its input.  On a lazy
+    // affine input (a BatchNorm output) the two compose into one value.
+    std::shared_ptr<XdnaVirtualValue> base;
+    const bool lazy_input = static_cast<bool>(virtual_value_of(self));
+    if (lazy_input) {
+      base = consumable_value_of(self);
+      if (base && base->act) base = nullptr;
+    }
+    auto out = (!lazy_input || base) ? xdna_empty_like_layout(self) : at::Tensor();
+    if (out.defined() && out.is_contiguous()) {
+      auto value = std::make_shared<XdnaVirtualValue>();
+      value->source = base ? base->source : self;
+      if (base) {
+        value->scale = base->scale;
+        value->shift = base->shift;
+      }
+      value->act = true;
+      value->slope = negative_slope.to<float>();
+      set_virtual_value(out, std::move(value));
+      return out;
+    }
+  }
   ScopedMappedCpu mapped_phase("aten::leaky_relu");
   ensure_host_current(self);
   auto out = xdna_empty_like_layout(self);
@@ -3370,6 +3586,29 @@ at::Tensor leaky_relu_backward_xdna(
     const at::Tensor& self,
     const at::Scalar& negative_slope,
     bool self_is_result) {
+  if (!self_is_result && grad_output.is_contiguous() && grad_output.sizes() == self.sizes() &&
+      grad_output.scalar_type() == at::ScalarType::BFloat16) {
+    // self is a lazy affine value (BatchNorm output): take the mask from its
+    // source, so it is never written.
+    auto value = consumable_value_of(self);
+    if (value && !value->act && !value->scale.empty() && self.is_contiguous()) {
+      ScopedMappedCpu mapped_phase("aten::leaky_relu_backward.lazy");
+      ensure_host_current(grad_output);
+      auto out = xdna_empty_like_layout(self);
+      TORCH_CHECK(out.is_contiguous(), "lazy leaky_relu_backward expects a contiguous result");
+      const auto& x = value->source;
+      xdna_conv_set_threads(std::max(1, g_host_threads.load(std::memory_order_relaxed)));
+      xdna_leaky_backward_pw_bf16(
+          static_cast<const uint16_t*>(grad_output.const_data_ptr()),
+          static_cast<const uint16_t*>(x.const_data_ptr()),
+          static_cast<uint16_t*>(out.mutable_data_ptr()),
+          int(x.size(0)), int(x.size(1)), long(x.size(2) * x.size(3)),
+          value->scale.data(), value->shift.data(), negative_slope.to<float>());
+      g_lazy_consumed.fetch_add(1, std::memory_order_relaxed);
+      mark_host_dirty(out);
+      return out;
+    }
+  }
   ScopedMappedCpu mapped_phase("aten::leaky_relu_backward");
   ensure_host_current(grad_output);
   ensure_host_current(self);
@@ -4211,6 +4450,100 @@ at::ScalarType batch_norm_param_dtype(
   return input.scalar_type();
 }
 
+// Training BatchNorm2d on contiguous NCHW bf16: the statistics now (one read
+// pass, the region kernel's math), the output as a lazy affine value that the
+// next LeakyReLU and conv3x3w fold in.  nullopt: not eligible, run eagerly.
+std::optional<std::tuple<at::Tensor, at::Tensor, at::Tensor>> lazy_batch_norm_training(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& running_mean,
+    const std::optional<at::Tensor>& running_var,
+    bool training,
+    double momentum,
+    double eps) {
+  auto per_channel = [&](const std::optional<at::Tensor>& t) {
+    return !t.has_value() || !t->defined() ||
+        (t->device().type() == kXdnaType && t->scalar_type() == at::ScalarType::BFloat16 &&
+         t->is_contiguous() && t->dim() == 1 && t->size(0) == input.size(1));
+  };
+  const bool has_rm = running_mean.has_value() && running_mean->defined();
+  const bool has_rv = running_var.has_value() && running_var->defined();
+  if (!lazy_pointwise_enabled() || !training || input.dim() != 4 ||
+      input.scalar_type() != at::ScalarType::BFloat16 || !input.is_contiguous() ||
+      input.numel() == 0 || input.numel() / input.size(1) <= 1 || has_rm != has_rv ||
+      !per_channel(weight) || !per_channel(bias) || !per_channel(running_mean) ||
+      !per_channel(running_var) || virtual_value_of(input)) {
+    return std::nullopt;
+  }
+  auto out = xdna_empty_like_layout(input);
+  if (!out.is_contiguous()) return std::nullopt;
+  ScopedMappedCpu mapped_phase("aten::native_batch_norm.lazy");
+  const int64_t N = input.size(0), C = input.size(1), HW = input.size(2) * input.size(3);
+  ensure_host_current(input);
+  auto bf16_in = [](const std::optional<at::Tensor>& t) -> const uint16_t* {
+    if (!t.has_value() || !t->defined()) return nullptr;
+    ensure_host_current(*t);
+    return static_cast<const uint16_t*>(t->const_data_ptr());
+  };
+  const uint16_t* pw = bf16_in(weight);
+  const uint16_t* pb = bf16_in(bias);
+  uint16_t* prm = has_rm ? const_cast<uint16_t*>(bf16_in(running_mean)) : nullptr;
+  uint16_t* prv = has_rv ? const_cast<uint16_t*>(bf16_in(running_var)) : nullptr;
+  std::vector<float> mean(C), invstd(C), var(C);
+  xdna_region_bn_stats_bf16(
+      static_cast<const uint16_t*>(input.const_data_ptr()), nullptr, nullptr, mean.data(),
+      invstd.data(), var.data(), N, C, HW, float(eps), 0.f, 0,
+      std::max(1, at::get_num_threads()));
+  // Match ATen's CPU kernel for bf16 parameters (checked bit for bit): it keeps
+  // mean and biased variance as bf16, derives invstd from the bf16 variance,
+  // transforms with these saved values, and updates the running mean in bf16
+  // arithmetic.
+  // TODO: the running variance can still differ from ATen by one bf16 step (its
+  // rounding order is not reproduced).  It only affects eval mode.  Revisit if
+  // eval results must match eager exactly.
+  auto bf = [](float v) { return float(c10::BFloat16(v)); };
+  const float mom = bf(float(momentum));
+  const double M = double(N) * double(HW);
+  for (int64_t c = 0; c < C; ++c) {
+    mean[c] = bf(mean[c]);
+    var[c] = bf(var[c]);
+    invstd[c] = bf(1.0f / std::sqrt(var[c] + float(eps)));
+    if (has_rm) {
+      const float rm = float(c10::BFloat16(prm[c], c10::BFloat16::from_bits()));
+      const float rv = float(c10::BFloat16(prv[c], c10::BFloat16::from_bits()));
+      const float unbiased = M > 1.0 ? float(double(var[c]) * M / (M - 1.0)) : var[c];
+      prm[c] = c10::BFloat16(bf(bf(mom * mean[c]) + bf(bf(1.0f - mom) * rm))).x;
+      prv[c] = c10::BFloat16(bf(bf(mom * unbiased) + bf(bf(1.0f - mom) * rv))).x;
+    }
+  }
+  if (has_rm) {
+    mark_host_dirty(*running_mean);
+    mark_host_dirty(*running_var);
+  }
+  const auto stat_dtype = batch_norm_param_dtype(input, weight, running_mean);
+  auto save_mean = xdna_empty_like_shape(std::vector<c10::SymInt>{c10::SymInt(C)}, stat_dtype);
+  auto save_invstd = xdna_empty_like_shape(std::vector<c10::SymInt>{c10::SymInt(C)}, stat_dtype);
+  cpu_alias(save_mean).copy_(at::from_blob(mean.data(), {C}, at::kFloat));
+  cpu_alias(save_invstd).copy_(at::from_blob(invstd.data(), {C}, at::kFloat));
+  mark_host_dirty(save_mean);
+  mark_host_dirty(save_invstd);
+
+  // ATen's affine: alpha = invstd * weight, beta = bias - mean * alpha, in fp32.
+  auto value = std::make_shared<XdnaVirtualValue>();
+  value->source = input;
+  value->scale.resize(C);
+  value->shift.resize(C);
+  for (int64_t c = 0; c < C; ++c) {
+    const float w = pw ? float(c10::BFloat16(pw[c], c10::BFloat16::from_bits())) : 1.0f;
+    const float b = pb ? float(c10::BFloat16(pb[c], c10::BFloat16::from_bits())) : 0.0f;
+    value->scale[c] = w * invstd[c];
+    value->shift[c] = b - mean[c] * value->scale[c];
+  }
+  set_virtual_value(out, std::move(value));
+  return std::make_tuple(out, save_mean, save_invstd);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> native_batch_norm_xdna(
     const at::Tensor& input,
     const std::optional<at::Tensor>& weight,
@@ -4220,6 +4553,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> native_batch_norm_xdna(
     bool training,
     double momentum,
     double eps) {
+  if (auto lazy = lazy_batch_norm_training(input, weight, bias, running_mean, running_var,
+                                           training, momentum, eps)) {
+    return *lazy;
+  }
   ScopedMappedCpu mapped_phase("aten::native_batch_norm");
   TORCH_CHECK(input.dim() >= 2, "XDNA BatchNorm expects rank >= 2 input");
   ensure_host_current(input);
@@ -5713,6 +6050,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     out["max_cached_bytes"] = pybind11::int_(cache.max_cached_bytes);
     out["fresh_allocations"] = pybind11::int_(cache.fresh_allocations);
     out["reuses"] = pybind11::int_(cache.reuses);
+    // Lazy pointwise values: created, applied by a consumer without writing
+    // them, and written because something else read them.
+    out["lazy_created"] = pybind11::int_(g_lazy_created.load());
+    out["lazy_consumed"] = pybind11::int_(g_lazy_consumed.load());
+    out["lazy_materialized"] = pybind11::int_(g_lazy_materialized.load());
     return out;
   });
   m.def("is_xrt_backed", [](const at::Tensor& tensor) {

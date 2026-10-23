@@ -340,13 +340,13 @@ inline void plane_mean_m2(const uint16_t* x, int64_t hw, float& mean, float& m2)
 
 extern "C" {
 
-// Forward.  w and b may be null (affine=False).  If update != 0 the running
-// statistics (bf16) move by `factor` towards the batch mean and the unbiased
-// batch variance.  mean_out / invstd_out are fp32 [C] for the backward pass.
-void xdna_region_bn_fwd_bf16(const uint16_t* x, const uint16_t* w, const uint16_t* b,
-                             uint16_t* rm, uint16_t* rv, uint16_t* y, float* mean_out,
-                             float* invstd_out, int64_t N, int64_t C, int64_t HW, float eps,
-                             float slope, float factor, int update, int threads) {
+// Training statistics only.  If update != 0 the running statistics (bf16)
+// move by `factor` towards the batch mean and the unbiased batch variance.
+// mean_out / invstd_out are fp32 [C]; var_out (may be null) gets the biased
+// variance.
+void xdna_region_bn_stats_bf16(const uint16_t* x, uint16_t* rm, uint16_t* rv, float* mean_out,
+                               float* invstd_out, float* var_out, int64_t N, int64_t C,
+                               int64_t HW, float eps, float factor, int update, int threads) {
   float* pm = new float[size_t(N * C) * 2];
   float* pq = pm + N * C;
 #pragma omp parallel for num_threads(threads) schedule(static)
@@ -364,6 +364,7 @@ void xdna_region_bn_fwd_bf16(const uint16_t* x, const uint16_t* w, const uint16_
     }
     const double var = m2 / M;
     mean_out[c] = float(mean);
+    if (var_out) var_out[c] = float(var);
     invstd_out[c] = float(1.0 / std::sqrt(var + double(eps)));
     if (update) {
       const double unbiased = M > 1.0 ? var * M / (M - 1.0) : var;
@@ -372,6 +373,16 @@ void xdna_region_bn_fwd_bf16(const uint16_t* x, const uint16_t* w, const uint16_
     }
   }
   delete[] pm;
+}
+
+// Forward.  w and b may be null (affine=False).  Statistics and running update
+// as xdna_region_bn_stats_bf16.
+void xdna_region_bn_fwd_bf16(const uint16_t* x, const uint16_t* w, const uint16_t* b,
+                             uint16_t* rm, uint16_t* rv, uint16_t* y, float* mean_out,
+                             float* invstd_out, int64_t N, int64_t C, int64_t HW, float eps,
+                             float slope, float factor, int update, int threads) {
+  xdna_region_bn_stats_bf16(x, rm, rv, mean_out, invstd_out, nullptr, N, C, HW, eps, factor,
+                            update, threads);
 #pragma omp parallel for num_threads(threads) schedule(static)
   for (int64_t pl = 0; pl < N * C; ++pl) {
     const int64_t c = pl % C;
